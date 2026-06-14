@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# Test / coverage
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Runtime artifacts (keep the directories via .gitkeep)
+workspace/*
+data/*
+logs/*
+!workspace/.gitkeep
+!data/.gitkeep
+!logs/.gitkeep
+
+# OS
+.DS_Store

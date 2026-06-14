@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "corax-agent"
+version = "0.1.0"
+description = "Corax Agent — minimal agent scaffold (runtime, config, settings menu, extension points)."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Corax" }]
+keywords = ["agent", "scaffold", "runtime", "cli"]
+dependencies = []
+
+[project.optional-dependencies]
+# YAML config support. The scaffold runs without it (falls back to a
+# minimal built-in YAML reader/writer or to JSON config), but PyYAML is
+# recommended for full YAML fidelity.
+yaml = ["pyyaml>=6.0"]
+# Tooling for the test/coverage workflow.
+dev = ["pytest>=7.0", "pytest-cov>=4.0"]
+
+[project.scripts]
+corax-agent = "main:main"
+
+[tool.setuptools]
+py-modules = ["main"]
+
+[tool.setuptools.packages.find]
+include = ["corax_agent*"]
+
+[tool.pytest.ini_options]
+testpaths = ["corax_agent/tests"]
+addopts = "-q"
+
+[tool.coverage.run]
+source = ["corax_agent"]
+omit = ["corax_agent/tests/*"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
