@@ -44,7 +44,12 @@ class CoraxApp:
         self.log = setup_logging(self.config.runtime.log_level, self.paths.logs)
         self.log.debug("config loaded from %s", self.config_path)
 
-        self.runtime = CoraxRuntime(self.config, logging.getLogger("corax.runtime"))
+        self.runtime = CoraxRuntime(
+            self.config,
+            logging.getLogger("corax.runtime"),
+            root_path=self.paths.root,
+            workspace_path=self.paths.workspace,
+        )
         await self.runtime.start()
 
         if self._first_run:

@@ -62,6 +62,7 @@ class ProviderSpec:
     enabled: bool = True
     type: str = "provider"
     description: str = ""
+    path: str = ""
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ProviderSpec":
@@ -69,10 +70,18 @@ class ProviderSpec:
             enabled=bool(data.get("enabled", True)),
             type=str(data.get("type", "provider")),
             description=str(data.get("description", "")),
+            path=str(data.get("path", "")),
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return {"enabled": self.enabled, "type": self.type, "description": self.description}
+        data = {
+            "enabled": self.enabled,
+            "type": self.type,
+            "description": self.description,
+        }
+        if self.path:
+            data["path"] = self.path
+        return data
 
 
 @dataclass
@@ -182,12 +191,30 @@ def default_config() -> AgentConfig:
             },
         ),
         capabilities=CapabilitiesConfig(
-            enabled=["stub.echo"],
+            enabled=["stub.echo", "filesystem", "editor", "shell"],
             available={
                 "stub.echo": ProviderSpec(
                     enabled=True, type="tool",
                     description="Stub echo capability",
-                )
+                ),
+                "filesystem": ProviderSpec(
+                    enabled=True,
+                    type="tool",
+                    description="Workspace-confined filesystem capability",
+                    path="../corax-filesystem-capability",
+                ),
+                "editor": ProviderSpec(
+                    enabled=True,
+                    type="tool",
+                    description="Workspace-confined text editor capability",
+                    path="../corax-editor-capability",
+                ),
+                "shell": ProviderSpec(
+                    enabled=True,
+                    type="tool",
+                    description="Guarded local shell command capability",
+                    path="../corax-shell-capability",
+                ),
             },
         ),
         security=SecurityConfig(

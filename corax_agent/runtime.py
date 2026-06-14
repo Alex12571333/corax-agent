@@ -1,10 +1,8 @@
 """Corax runtime.
 
-Owns the four registries and populates them from config — using only
-stubs. There is deliberately **no** Telegram / OpenAI / MCP / Qdrant /
-shell code here. When real implementations exist, the only change is the
-factory tables below (``_PLANNER_FACTORIES`` etc.): the start/stop/status
-lifecycle stays identical.
+Owns the four registries and populates them from config. Planner, memory and
+connectors are still stub-backed; capabilities can now be either local stubs or
+standalone SDK packages loaded from their root ``capability.json`` manifests.
 """
 
 from __future__ import annotations
@@ -12,7 +10,10 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable
+
+from agent_sdk import CapabilityManifest, load_instance, validate_manifest
 
 from .config import AgentConfig
 from .registries import (
@@ -77,11 +78,24 @@ class RuntimeStatus:
 
 
 class CoraxRuntime:
-    """Lifecycle owner for the agent's registries (stub-backed)."""
+    """Lifecycle owner for the agent's registries."""
 
-    def __init__(self, config: AgentConfig, logger: logging.Logger | None = None) -> None:
+    def __init__(
+        self,
+        config: AgentConfig,
+        logger: logging.Logger | None = None,
+        *,
+        root_path: str | Path | None = None,
+        workspace_path: str | Path | None = None,
+        core_version: str = "0.1.0",
+    ) -> None:
         self.config = config
         self.log = logger or logging.getLogger("corax.runtime")
+        self.root_path = Path(root_path or Path.cwd()).resolve()
+        self.workspace_path = Path(
+            workspace_path or self.root_path / config.runtime.workspace_path
+        ).resolve()
+        self.core_version = core_version
 
         self.connectors = ConnectorRegistry()
         self.memory = MemoryRegistry()
@@ -96,7 +110,7 @@ class CoraxRuntime:
         if self._running:
             self.log.debug("runtime already running")
             return
-        self.log.info("starting runtime (stub mode)")
+        self.log.info("starting runtime")
         self._populate_registries()
         self._running = True
         self._started_at = datetime.now(timezone.utc)
@@ -183,13 +197,13 @@ class CoraxRuntime:
                 self.connectors.register(cid, item)
 
         # Capabilities (list of enabled ids).
-        for cap in self.config.capabilities.enabled:
-            spec = self.config.capabilities.available.get(cap)
+        for cap_id in self.config.capabilities.enabled:
+            spec = self.config.capabilities.available.get(cap_id)
             if spec is not None and not spec.enabled:
                 continue
-            item = self._build(_CAPABILITY_FACTORIES, cap, "capability")
+            item = self._build_capability(cap_id)
             if item is not None:
-                self.capabilities.register(cap, item)
+                self.capabilities.register(cap_id, item)
 
     def _build(self, factories: dict[str, Callable[[], Any]], id: str, role: str) -> Any:
         factory = factories.get(id)
@@ -201,6 +215,59 @@ class CoraxRuntime:
             )
             return None
         return factory()
+
+    def _build_capability(self, id: str) -> Any:
+        factory = _CAPABILITY_FACTORIES.get(id)
+        if factory is not None:
+            return factory()
+
+        spec = self.config.capabilities.available.get(id)
+        if spec is None or not spec.path:
+            self.log.warning(
+                "no capability package path configured for '%s' — skipping",
+                id,
+            )
+            return None
+
+        package_path = self._resolve_package_path(spec.path)
+        try:
+            manifest = CapabilityManifest.load(package_path)
+            result = validate_manifest(manifest, core_version=self.core_version)
+            if not result.ok:
+                self.log.warning(
+                    "invalid capability manifest for '%s': %s",
+                    id,
+                    "; ".join(result.errors),
+                )
+                return None
+            if manifest.id != id:
+                self.log.warning(
+                    "capability id mismatch for '%s': manifest declares '%s'",
+                    id,
+                    manifest.id,
+                )
+                return None
+            kwargs = self._capability_kwargs(id)
+            return load_instance(
+                manifest,
+                package_path,
+                core_version=self.core_version,
+                kwargs=kwargs,
+            )
+        except Exception as exc:  # noqa: BLE001 - startup should report and continue
+            self.log.warning("failed loading capability '%s': %s", id, exc)
+            return None
+
+    def _resolve_package_path(self, value: str) -> Path:
+        candidate = Path(value).expanduser()
+        if not candidate.is_absolute():
+            candidate = self.root_path / candidate
+        return candidate.resolve()
+
+    def _capability_kwargs(self, id: str) -> dict[str, Any]:
+        if id in {"filesystem", "editor"}:
+            return {"workspace_root": self.workspace_path}
+        return {}
 
     def _clear_registries(self) -> None:
         self.connectors.clear()

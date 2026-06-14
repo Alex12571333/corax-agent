@@ -15,9 +15,10 @@ later **without changing this structure**.
 2. Reads / writes config (`agent.yaml`, JSON fallback).
 3. Shows a terminal settings menu.
 4. Persists settings.
-5. Builds a runtime from **stubs** only.
-6. Lists capabilities / connectors / memory / providers from config.
-7. Exposes clear extension points (registries) for future modules.
+5. Builds a runtime from stubs plus standalone SDK capability packages.
+6. Loads `filesystem`, `editor`, and `shell` capabilities from sibling repos.
+7. Lists capabilities / connectors / memory / providers from config.
+8. Exposes clear extension points (registries) for future modules.
 
 ## Requirements
 
@@ -39,6 +40,18 @@ python main.py --status   # print runtime status and exit
 python main.py --init     # create config + workspace/data/logs and exit
 python main.py --config ./agent.yaml
 ```
+
+## Capability integration
+
+The default `agent.yaml` enables:
+
+* `filesystem` from `../corax-filesystem-capability`
+* `editor` from `../corax-editor-capability`
+* `shell` from `../corax-shell-capability`
+
+Each package is loaded through `agent-sdk` from its root `capability.json` and
+`main.py` entrypoint. The runtime passes the agent workspace to filesystem and
+editor so their sandbox is the same `workspace/` directory the agent manages.
 
 ### Acceptance checks
 

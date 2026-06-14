@@ -39,11 +39,29 @@ connectors:
 capabilities:
   enabled:
     - stub.echo
+    - filesystem
+    - editor
+    - shell
   available:
     stub.echo:
       enabled: true
       type: tool
       description: "Stub echo capability"
+    filesystem:
+      enabled: true
+      type: tool
+      description: "Workspace-confined filesystem capability"
+      path: ../corax-filesystem-capability
+    editor:
+      enabled: true
+      type: tool
+      description: "Workspace-confined text editor capability"
+      path: ../corax-editor-capability
+    shell:
+      enabled: true
+      type: tool
+      description: "Guarded local shell command capability"
+      path: ../corax-shell-capability
 
 security:
   mode: normal
