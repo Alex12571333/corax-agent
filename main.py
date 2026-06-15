@@ -16,10 +16,10 @@ import asyncio
 import sys
 from pathlib import Path
 
-from corax_agent import config as config_mod
-from corax_agent.app import CoraxApp
-from corax_agent.paths import default_config_path, ensure_paths
-from corax_agent.ui.terminal import BANNER
+from corax import config as config_mod
+from corax.app import CoraxApp
+from corax.paths import default_config_path, ensure_paths
+from corax.ui.banner import BANNER
 
 
 def build_parser() -> argparse.ArgumentParser:

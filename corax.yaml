@@ -1,0 +1,87 @@
+agent:
+  name: corax
+  profile: default
+  mode: local
+  first_run: true
+
+runtime:
+  autostart: false
+  log_level: INFO
+  workspace_path: ./workspace
+  data_path: ./data
+  logs_path: ./logs
+
+planner:
+  active: stub
+  providers:
+    stub:
+      enabled: true
+      type: planner
+      description: "Local stub planner for scaffold testing"
+
+memory:
+  active: none
+  providers:
+    none:
+      enabled: true
+      type: memory
+      description: "No persistent memory yet"
+
+connectors:
+  active:
+    - terminal
+  providers:
+    terminal:
+      enabled: true
+      type: connector
+      description: "Terminal connector placeholder"
+
+capabilities:
+  enabled:
+    - echo
+    - filesystem
+    - editor
+    - shell
+  available:
+    echo:
+      enabled: true
+      type: tool
+      description: "Built-in echo capability"
+    filesystem:
+      enabled: true
+      type: tool
+      description: "Workspace-confined filesystem capability"
+      path: ../corax-filesystem-capability
+    editor:
+      enabled: true
+      type: tool
+      description: "Workspace-confined text editor capability"
+      path: ../corax-editor-capability
+    shell:
+      enabled: true
+      type: tool
+      description: "Guarded local shell command capability"
+      path: ../corax-shell-capability
+
+security:
+  mode: normal
+  core_readonly: true
+  allow_shell: false
+  allow_file_write: false
+  blocked_paths:
+    - ../corax-core
+    - ../corax-sdk
+    - ~/.ssh
+    - .env
+
+limits:
+  max_parallel_tasks: 4
+  max_plan_tasks: 30
+  max_tasks_per_correlation: 50
+  task_timeout_seconds: 60
+  max_payload_mb: 20
+
+ui:
+  theme: terminal
+  mascot: corax
+  show_banner: true

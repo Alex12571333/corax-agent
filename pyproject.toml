@@ -34,15 +34,15 @@ corax-agent = "main:main"
 py-modules = ["main"]
 
 [tool.setuptools.packages.find]
-include = ["corax_agent*"]
+include = ["corax*"]
 
 [tool.pytest.ini_options]
-testpaths = ["corax_agent/tests"]
+testpaths = ["tests"]
 addopts = "-q"
 
 [tool.coverage.run]
-source = ["corax_agent"]
-omit = ["corax_agent/tests/*"]
+source = ["corax"]
+omit = ["tests/*"]
 
 [tool.coverage.report]
 show_missing = true

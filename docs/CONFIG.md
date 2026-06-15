@@ -1,8 +1,8 @@
 # Configuration
 
-Config is stored as `agent.yaml` (or `agent.json` if you prefer / lack PyYAML).
-It is loaded into a tree of dataclasses (`corax_agent/config.py`) and mutated
-only through `corax_agent/settings.py`.
+Config is stored as `corax.yaml` (or `corax.json` if you prefer / lack PyYAML).
+It is loaded into a tree of dataclasses (`corax/config.py`) and mutated
+only through `corax/settings.py`.
 
 ## Format selection
 
@@ -10,9 +10,9 @@ only through `corax_agent/settings.py`.
   minimal block-YAML reader/writer that covers exactly this file's shape.
 * `*.json` → JSON (stdlib).
 
-`default_config_path()` looks for `agent.yaml`, `agent.yml`, `agent.json`,
-`config.json` in order, then defaults to `agent.yaml` (or `agent.json` when
-PyYAML is absent).
+`default_config_path()` looks for `corax.yaml`, `corax.yml`, `corax.json`, then
+the legacy `agent.yaml`, `agent.yml`, `agent.json`, `config.json` in order, and
+defaults to `corax.yaml` (or `corax.json` when PyYAML is absent).
 
 ## Sections
 
@@ -34,7 +34,7 @@ PyYAML is absent).
 ## Settings API
 
 ```python
-from corax_agent import settings
+from corax import settings
 
 settings.get_setting(config, "security.allow_shell")          # -> False
 settings.set_setting(config, "runtime.log_level", "DEBUG")    # coerces by type
