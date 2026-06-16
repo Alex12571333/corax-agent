@@ -1,34 +1,29 @@
-"""Telegram chat gateway.
+"""Telegram chat gateway with tool-calling.
 
-A platform-agnostic-ish loop that turns a Telegram chat into a conversation with
-the agent: it polls for updates, dispatches slash commands, and streams the
-model's reply back token-by-token by editing the message in place.
+Turns a Telegram chat into an agent: it polls for updates, dispatches slash
+commands, and answers messages by running a tool-calling loop — the model may
+call **any** of the agent's capabilities (filesystem, editor, shell, and any
+future one), each executed **through the agent-core kernel**, with the result
+fed back to the model until it produces a final answer.
 
-The loop logic here is **pure** — every side effect goes through two injected
-async callables, so it unit-tests without a kernel, a network, or a real clock:
-
-* ``run_capability(cap_id, payload, *, session_id=None) -> dict`` — execute a
-  connector capability through the agent-core kernel and return its payload
-  (read back from the core session state). Raises :class:`GatewayError` on a
-  non-success task.
-* ``stream_llm(payload, *, session_id) -> AsyncIterator[str]`` — stream the
-  model's reply as text deltas (the one streaming path that goes straight to the
-  ``llm.local`` instance, since the one-shot kernel cannot stream tokens).
-
-Everything else — poll, send, the live edits — is routed through
-``run_capability`` (i.e. through the core).
+The loop logic is pure: every side effect goes through one injected async
+callable ``run_capability(cap_id, payload, *, session_id=None) -> dict`` (a
+kernel ``invoke``), so it unit-tests without a kernel or network. Capabilities
+exposed as tools are built from the injected ``capabilities`` list — so new
+capabilities become available automatically, with no per-tool wiring.
 """
 
 from __future__ import annotations
 
-import asyncio
+import json
 import logging
-import time
+import re
 import uuid
-from typing import Any, AsyncIterator, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Iterable
 
 RunCapability = Callable[..., Awaitable[dict]]
-StreamLLM = Callable[..., AsyncIterator[str]]
+
+_SAFE_TOOL_NAME = re.compile(r"[^a-zA-Z0-9_-]")
 
 
 class GatewayError(RuntimeError):
@@ -36,36 +31,59 @@ class GatewayError(RuntimeError):
 
 
 class CoraxTelegramGateway:
-    """Poll Telegram, dispatch commands, and stream model replies — via the core."""
+    """Poll Telegram, dispatch commands, and answer with a tool-calling loop."""
 
     def __init__(
         self,
         *,
         run_capability: RunCapability,
-        stream_llm: StreamLLM,
+        capabilities: Iterable[dict] = (),
         llm_id: str = "llm.local",
         telegram_id: str = "telegram.connector",
         model: str | None = None,
-        edit_interval_ms: int = 700,
         poll_timeout: int = 30,
         idle_sleep: float = 1.0,
+        max_tool_iterations: int = 6,
+        max_tool_result_chars: int = 4000,
         log: logging.Logger | None = None,
         new_session: Callable[[], str] | None = None,
-        clock: Callable[[], float] | None = None,
         sleep: Callable[[float], Awaitable[None]] | None = None,
     ) -> None:
         self._run = run_capability
-        self._stream_llm = stream_llm
         self.llm_id = llm_id
         self.telegram_id = telegram_id
         self.model = model
-        self.edit_interval_ms = edit_interval_ms
         self.poll_timeout = poll_timeout
         self.idle_sleep = idle_sleep
+        self.max_tool_iterations = max_tool_iterations
+        self.max_tool_result_chars = max_tool_result_chars
         self.log = log or logging.getLogger("corax.gateway")
         self._new_session = new_session or (lambda: f"chat-{uuid.uuid4().hex[:8]}")
-        self._now = clock or time.monotonic
-        self._sleep = sleep or asyncio.sleep
+        self._sleep = sleep or _async_sleep
+
+        # Build the tool catalogue from the registered capabilities, excluding
+        # the chat infrastructure itself (the LLM and the Telegram connector).
+        self._tool_specs: list[dict] = []
+        self._tool_to_cap: dict[str, str] = {}
+        for cap in capabilities:
+            cap_id = cap.get("id")
+            if not cap_id or cap_id in (llm_id, telegram_id):
+                continue
+            name = _SAFE_TOOL_NAME.sub("_", cap_id)
+            self._tool_to_cap[name] = cap_id
+            params = cap.get("input_schema") or {}
+            if not params:
+                params = {"type": "object", "properties": {}}
+            self._tool_specs.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": cap.get("description") or cap_id,
+                        "parameters": params,
+                    },
+                }
+            )
 
         self._sessions: dict[Any, str] = {}
         self._offset: int | None = None
@@ -149,50 +167,63 @@ class CoraxTelegramGateway:
 
     async def _handle_chat(self, chat_id: Any, text: str) -> None:
         session_id = self._session_for(chat_id)
-        payload: dict[str, Any] = {"prompt": text}
-        if self.model:
-            payload["model"] = self.model
+        messages: list[dict[str, Any]] = [{"role": "user", "content": text}]
+        final_text = ""
+        for _ in range(self.max_tool_iterations):
+            generate: dict[str, Any] = {
+                "operation": "generate",
+                "messages": messages,
+                "tool_choice": "auto",
+            }
+            if self._tool_specs:
+                generate["tools"] = self._tool_specs
+            if self.model:
+                generate["model"] = self.model
+            response = await self._run(self.llm_id, generate, session_id=session_id)
+            tool_calls = response.get("tool_calls") or []
+            if not tool_calls:
+                final_text = response.get("text") or ""
+                break
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": response.get("text") or None,
+                    "tool_calls": tool_calls,
+                }
+            )
+            for tool_call in tool_calls:
+                await self._run_tool(messages, tool_call)
+        else:
+            final_text = "⚠️ Stopped: too many tool steps."
+        await self._send(chat_id, final_text or "(no response)")
 
-        message_id: Any = None
-        accumulated = ""
-        last_sent = ""
-        last_edit = self._now()
+    async def _run_tool(self, messages: list[dict], tool_call: dict) -> None:
+        function = tool_call.get("function") or {}
+        name = function.get("name")
+        cap_id = self._tool_to_cap.get(name)
         try:
-            async for chunk in self._stream_llm(payload, session_id=session_id):
-                accumulated += chunk
-                now = self._now()
-                due = (now - last_edit) * 1000.0 >= self.edit_interval_ms
-                if due and accumulated != last_sent:
-                    message_id = await self._flush(
-                        chat_id, message_id, accumulated, last_sent, done=False
-                    )
-                    last_sent = accumulated
-                    last_edit = now
-        except Exception as exc:  # noqa: BLE001 - never let one bad turn kill the loop
-            self.log.warning("generation failed for chat %s: %s", chat_id, exc)
-            accumulated = accumulated or "⚠️ generation failed"
+            args = json.loads(function.get("arguments") or "{}")
+            if not isinstance(args, dict):
+                args = {}
+        except (ValueError, TypeError):
+            args = {}
 
-        await self._flush(
-            chat_id, message_id, accumulated or "(no response)", last_sent, done=True
-        )
+        if cap_id is None:
+            result: dict[str, Any] = {"error": f"unknown tool {name!r}"}
+        else:
+            self.log.info("tool call: %s(%s)", cap_id, args)
+            try:
+                result = await self._run(cap_id, args)
+            except Exception as exc:  # noqa: BLE001 - a failed tool feeds the error back
+                result = {"error": str(exc)}
 
-    # -- side effects (all through the kernel) --------------------------- #
-    async def _flush(
-        self, chat_id: Any, message_id: Any, text: str, last_sent: str, *, done: bool
-    ) -> Any:
-        payload = await self._run(
-            self.telegram_id,
+        messages.append(
             {
-                "operation": "stream",
-                "chat_id": chat_id,
-                "message_id": message_id,
-                "text": text,
-                "last_sent_text": last_sent,
-                "elapsed_ms": self.edit_interval_ms,
-                "done": done,
-            },
+                "role": "tool",
+                "tool_call_id": tool_call.get("id"),
+                "content": json.dumps(result)[: self.max_tool_result_chars],
+            }
         )
-        return payload.get("message_id", message_id)
 
     async def _send(self, chat_id: Any, text: str) -> None:
         await self._run(
@@ -205,3 +236,9 @@ class CoraxTelegramGateway:
             session = self._new_session()
             self._sessions[chat_id] = session
         return session
+
+
+async def _async_sleep(seconds: float) -> None:
+    import asyncio
+
+    await asyncio.sleep(seconds)
