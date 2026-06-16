@@ -45,6 +45,8 @@ class CoraxTelegramGateway:
         idle_sleep: float = 1.0,
         max_tool_iterations: int = 6,
         max_tool_result_chars: int = 4000,
+        reveal_chunk: int = 64,
+        reveal_delay: float = 0.2,
         log: logging.Logger | None = None,
         new_session: Callable[[], str] | None = None,
         sleep: Callable[[float], Awaitable[None]] | None = None,
@@ -57,6 +59,8 @@ class CoraxTelegramGateway:
         self.idle_sleep = idle_sleep
         self.max_tool_iterations = max_tool_iterations
         self.max_tool_result_chars = max_tool_result_chars
+        self.reveal_chunk = reveal_chunk
+        self.reveal_delay = reveal_delay
         self.log = log or logging.getLogger("corax.gateway")
         self._new_session = new_session or (lambda: f"chat-{uuid.uuid4().hex[:8]}")
         self._sleep = sleep or _async_sleep
@@ -170,6 +174,7 @@ class CoraxTelegramGateway:
         messages: list[dict[str, Any]] = [{"role": "user", "content": text}]
         final_text = ""
         for _ in range(self.max_tool_iterations):
+            await self._typing(chat_id)  # show "typing…" while the agent works
             generate: dict[str, Any] = {
                 "operation": "generate",
                 "messages": messages,
@@ -195,7 +200,44 @@ class CoraxTelegramGateway:
                 await self._run_tool(messages, tool_call)
         else:
             final_text = "⚠️ Stopped: too many tool steps."
-        await self._send(chat_id, final_text or "(no response)")
+        await self._reveal(chat_id, final_text or "(no response)")
+
+    async def _typing(self, chat_id: Any) -> None:
+        """Best-effort 'typing…' chat action; never let it break a turn."""
+        try:
+            await self._run(self.telegram_id, {"operation": "chat_action", "chat_id": chat_id})
+        except Exception as exc:  # noqa: BLE001
+            self.log.debug("chat action failed: %s", exc)
+
+    async def _reveal(self, chat_id: Any, text: str) -> None:
+        """Stream the final answer in by progressively editing one message."""
+        if len(text) <= self.reveal_chunk:
+            await self._send(chat_id, text)
+            return
+        message_id: Any = None
+        last_sent = ""
+        cut = self.reveal_chunk
+        while cut < len(text):
+            message_id = await self._stream_edit(chat_id, message_id, text[:cut], last_sent, done=False)
+            last_sent = text[:cut]
+            await self._sleep(self.reveal_delay)
+            cut += self.reveal_chunk
+        await self._stream_edit(chat_id, message_id, text, last_sent, done=True)
+
+    async def _stream_edit(self, chat_id: Any, message_id: Any, text: str, last_sent: str, *, done: bool) -> Any:
+        payload = await self._run(
+            self.telegram_id,
+            {
+                "operation": "stream",
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "text": text,
+                "last_sent_text": last_sent,
+                "elapsed_ms": 10 ** 9,  # force the connector to flush this edit
+                "done": done,
+            },
+        )
+        return payload.get("message_id", message_id)
 
     async def _run_tool(self, messages: list[dict], tool_call: dict) -> None:
         function = tool_call.get("function") or {}
