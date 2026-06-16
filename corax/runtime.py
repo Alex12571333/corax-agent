@@ -9,6 +9,7 @@ SDK packages loaded through :class:`~corax.loader.CapabilityLoader`.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -133,6 +134,7 @@ class CoraxRuntime:
             self.log.debug("runtime already running")
             return
         self.log.info("starting runtime")
+        self._apply_llm_environment()
         self._populate_registries()
         self._running = True
         self._started_at = datetime.now(timezone.utc)
@@ -226,6 +228,22 @@ class CoraxRuntime:
             )
 
     # -- internals ------------------------------------------------------- #
+    def _apply_llm_environment(self) -> None:
+        """Export the menu-driven LLM setup so the ``llm.local`` connector reads it.
+
+        The standalone connector resolves its endpoint, model and enabled input
+        modalities from ``CORAX_LLM_*`` environment variables. Mirroring the
+        config here keeps the runtime menu the single place an operator picks
+        modalities, with no per-capability constructor wiring.
+        """
+        llm = getattr(self.config, "llm", None)
+        if llm is None:
+            return
+        os.environ["CORAX_LLM_BASE_URL"] = llm.base_url
+        os.environ["CORAX_LLM_MODEL"] = llm.model
+        os.environ["CORAX_LLM_ENABLE_IMAGE"] = "true" if llm.enable_image else "false"
+        os.environ["CORAX_LLM_ENABLE_VIDEO"] = "true" if llm.enable_video else "false"
+
     def _populate_registries(self) -> None:
         self._clear_registries()
 

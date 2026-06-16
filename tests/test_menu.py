@@ -92,6 +92,21 @@ class TestMenuFlows(unittest.TestCase):
         menu.run()
         self.assertIn("workspace", capture.text)
 
+    def test_llm_section_toggles_modalities(self) -> None:
+        # L -> toggle image (3) -> toggle video (4) -> unknown -> back -> exit
+        menu, capture = _menu(["L", "3", "4", "zzz", "", "0"])
+        self.assertEqual(menu.run(), "discarded")
+        self.assertTrue(menu.config.llm.enable_image)
+        self.assertTrue(menu.config.llm.enable_video)
+        self.assertTrue(menu.changed)
+        self.assertIn("unknown field", capture.text)
+
+    def test_llm_section_edits_endpoint(self) -> None:
+        menu, _ = _menu(["l", "1", "http://192.168.0.10:1234/v1", "", "0"])
+        menu.run()
+        self.assertEqual(menu.config.llm.base_url, "http://192.168.0.10:1234/v1")
+        self.assertTrue(menu.changed)
+
 
 class TestAppLifecycle(unittest.TestCase):
     def test_boot_creates_config_and_paths(self) -> None:
