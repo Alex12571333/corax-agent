@@ -15,7 +15,6 @@ import argparse
 import asyncio
 import os
 import sys
-import uuid
 from pathlib import Path
 
 from corax import config as config_mod
@@ -66,13 +65,27 @@ async def _run(args: argparse.Namespace) -> int:
     return 0
 
 
-async def _run_chat(app: "CoraxApp", config_path: Path) -> int:
-    """Run the Telegram gateway: route connectors through the agent-core kernel.
+def _tool_capability_specs(runtime) -> list[dict]:
+    """Describe the kernel-executable capabilities as tool specs for the model."""
+    from corax.loader.core import _as_pairs
 
-    Every connector call (poll, send, the live streaming edits) goes through the
-    kernel under a permissive gateway policy; only the LLM token stream itself is
-    read straight from the ``llm.local`` instance (the one-shot kernel cannot
-    stream tokens).
+    specs: list[dict] = []
+    for cap_id, item in _as_pairs(runtime.capabilities):
+        if not runtime.core.is_executable(item):
+            continue
+        specs.append(
+            {
+                "id": cap_id,
+                "description": getattr(item, "description", "") or "",
+                "input_schema": getattr(item, "input_schema", {}) or {},
+            }
+        )
+    return specs
+
+
+async def _run_chat(app: "CoraxApp", config_path: Path) -> int:
+    """Run the Telegram gateway as an agent: the model can call every capability
+    through the agent-core kernel (tool-calling), with results fed back to it.
     """
     runtime = app.runtime
     if not runtime.core.available:
@@ -81,50 +94,38 @@ async def _run_chat(app: "CoraxApp", config_path: Path) -> int:
     if not (os.getenv("CORAX_TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")):
         print("Set CORAX_TELEGRAM_BOT_TOKEN before running --chat.")
         return 1
-
-    from agent_core import CapabilityRequest
+    if "llm.local" not in runtime.capabilities:
+        print("llm.local capability is not loaded; cannot run the chat.")
+        return 1
 
     from corax.gateway import CoraxTelegramGateway
     from corax.gateway.policy import GatewayPolicyEngine
-    from corax.loader.core import KernelInvocationError
 
-    llm = runtime.capabilities.get("llm.local")
-    if llm is None or not hasattr(llm, "stream_generate"):
-        print("llm.local capability is not loaded; cannot stream replies.")
-        return 1
+    specs = _tool_capability_specs(runtime)
+    tool_ids = [s["id"] for s in specs if s["id"] not in ("llm.local", "telegram.connector")]
+    if not app.config.telegram.allowed_chats:
+        print(
+            "⚠️  SECURITY: no CORAX_TELEGRAM_ALLOWED_CHATS set — anyone who can "
+            "message the bot can drive these tools (incl. shell). Set an allow-list."
+        )
+    print(f"Tools exposed to the model: {', '.join(tool_ids) or '(none)'}")
 
     while True:
         async with runtime.core.session(
             runtime.capabilities, policy=GatewayPolicyEngine()
         ) as kernel:
-
-            async def stream_llm(payload: dict, *, session_id: str):
-                request = CapabilityRequest(
-                    task_id=f"gw-{uuid.uuid4().hex[:8]}",
-                    session_id=session_id,
-                    input=payload,
-                )
-                async for chunk in llm.stream_generate(request):
-                    yield chunk
-
-            # All connector calls flow through the shared, through-the-core
-            # primitive ``kernel.invoke``; only the LLM token stream is read
-            # straight from the instance (the one-shot kernel cannot stream).
             gateway = CoraxTelegramGateway(
                 run_capability=kernel.invoke,
-                stream_llm=stream_llm,
+                capabilities=specs,
                 model=app.config.llm.model,
             )
             print("Corax Telegram gateway is running (Ctrl-C to stop).")
-            try:
-                outcome = await gateway.run()
-            except KernelInvocationError as exc:
-                print(f"gateway stopped: {exc}")
-                return 1
+            outcome = await gateway.run()
 
         if outcome == "reload":
             print("Reloading agent…")
             await runtime.reload_config(config_mod.load_config(config_path))
+            specs = _tool_capability_specs(runtime)
             continue
         return 0
 

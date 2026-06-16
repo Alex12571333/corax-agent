@@ -34,6 +34,57 @@ class KernelInvocationError(RuntimeError):
     """A capability invoked through the kernel did not complete successfully."""
 
 
+_DECLARATION_ATTRS = (
+    "id", "name", "description", "version", "tags", "permission_level",
+    "required_scopes", "risk_level", "side_effects", "input_schema", "output_schema",
+)
+_echo_wrapper_cache: dict[int, type] = {}
+
+
+def _echo_wrapper_class(ac: Any) -> type:
+    """Build (once) a Capability subclass that auto-echoes its result to state.
+
+    The agent-core Executor only surfaces a capability's output through
+    ``state_patch`` -> ``StateManager``; the Task itself carries no result. So a
+    kernel-driven caller (:meth:`RunningCore.invoke`) can only read a result a
+    capability chose to echo. Wrapping every capability with this adapter makes
+    that echo *automatic and universal* -- any capability, current or future,
+    third-party or ours, returns its payload (and, on failure, its error)
+    through the core without changing the capability itself. Off unless the
+    caller supplies a ``state_key``.
+    """
+    cached = _echo_wrapper_cache.get(id(ac))
+    if cached is not None:
+        return cached
+
+    class _StateEchoCapability(ac.Capability):
+        def __init__(self, inner: Any) -> None:
+            self._inner = inner
+            for attr in _DECLARATION_ATTRS:
+                setattr(self, attr, getattr(inner, attr))
+
+        async def execute(self, request: Any) -> Any:
+            result = await self._inner.execute(request)
+            key = request.input.get("state_key")
+            if isinstance(key, str) and key and not result.state_patch:
+                if result.is_success:
+                    result.state_patch = {key: result.payload}
+                elif result.error is not None:
+                    result.state_patch = {
+                        key: {
+                            "_error": result.error.message,
+                            "_details": result.error.details,
+                        }
+                    }
+            return result
+
+        async def health_check(self) -> Any:
+            return await self._inner.health_check()
+
+    _echo_wrapper_cache[id(ac)] = _StateEchoCapability
+    return _StateEchoCapability
+
+
 def _as_pairs(capabilities: Any) -> list[tuple[str, Any]]:
     """Normalise a capability collection to ``(id, instance)`` pairs.
 
@@ -245,11 +296,14 @@ class CoreEngine:
         )
 
         adopted: list[str] = []
+        echo_cls = _echo_wrapper_class(ac)
         for cap_id, item in _as_pairs(capabilities):
             if not isinstance(item, ac.Capability):
                 continue
             try:
-                await registry.register(item)
+                # Register a wrapper that auto-echoes the result to session state,
+                # so every capability's output round-trips through the core.
+                await registry.register(echo_cls(item))
             except Exception as exc:  # noqa: BLE001 - one bad cap must not abort the kernel
                 self.log.warning("core rejected capability '%s': %s", cap_id, exc)
             else:
