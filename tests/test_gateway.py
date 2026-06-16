@@ -34,11 +34,12 @@ class FakeBackend:
         self.calls: list[tuple[str, dict]] = []
         self.sends: list[str] = []
         self.fail_capability: str | None = None
+        self.fail_operation: str | None = None
         self._mid = 0
 
     async def run_capability(self, cap_id, payload, *, session_id=None):
         self.calls.append((payload.get("operation"), payload))
-        if cap_id == self.fail_capability:
+        if cap_id == self.fail_capability or payload.get("operation") == self.fail_operation:
             raise GatewayError("boom")
         op = payload.get("operation")
         if op == "poll":
@@ -245,12 +246,21 @@ class GatewayLoopTests(unittest.IsolatedAsyncioTestCase):
         poll_calls = [p for op, p in backend.calls if op == "poll"]
         self.assertEqual(poll_calls[1]["offset"], 999)  # offset from first poll reused
 
-    async def test_run_capability_failure_propagates(self) -> None:
+    async def test_poll_failure_is_logged_not_fatal(self) -> None:
+        # Every connector call fails — the gateway must log and survive, not crash.
         backend = FakeBackend(poll_batches=[[_text_update(5, "hi")]])
         backend.fail_capability = "telegram.connector"
         gw = _gateway(backend)
-        with self.assertRaises(GatewayError):
-            await gw.run(max_iterations=1)
+        outcome = await gw.run(max_iterations=1)
+        self.assertEqual(outcome, "stopped")  # did not raise
+
+    async def test_update_handling_failure_is_logged_not_fatal(self) -> None:
+        # Poll succeeds, but delivering the reply fails — survive and keep going.
+        backend = FakeBackend(poll_batches=[[_cmd_update(5, "help", reply="x")]])
+        backend.fail_operation = "send"
+        gw = _gateway(backend)
+        outcome = await gw.run(max_iterations=1)
+        self.assertEqual(outcome, "stopped")  # did not raise
 
 
 class GatewayCoreRoundTripTests(unittest.IsolatedAsyncioTestCase):
@@ -291,14 +301,16 @@ class GatewayCoreRoundTripTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(output["count"], 1)
         self.assertEqual(output["updates"][0]["command"]["command"], "new_session")
 
-    async def test_invoke_raises_on_failed_task(self) -> None:
+    async def test_invoke_raises_with_reason_on_failure(self) -> None:
         from corax.loader.core import KernelInvocationError
 
         async with self.runtime.core.session(
             self.runtime.capabilities, policy=GatewayPolicyEngine()
         ) as kernel:
-            with self.assertRaises(KernelInvocationError):
+            with self.assertRaises(KernelInvocationError) as ctx:
                 await kernel.invoke("telegram.connector", {"operation": "nope"}, wait_timeout=10)
+        # the connector's echoed error reason is surfaced, not just "failed"
+        self.assertIn("unsupported operation", str(ctx.exception))
 
 
 if __name__ == "__main__":
