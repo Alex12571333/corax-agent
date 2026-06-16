@@ -47,6 +47,10 @@ class Menu:
             "7": self.security_section,
             "8": self.limits_section,
             "9": self.paths_section,
+            "l": self.llm_section,
+            "L": self.llm_section,
+            "t": self.telegram_section,
+            "T": self.telegram_section,
         }
 
     # -- main loop ------------------------------------------------------- #
@@ -172,6 +176,38 @@ class Menu:
                 self.term.write(f"  unknown field: {choice!r}")
                 continue
             self._edit_scalar(key, key.split(".")[-1])
+
+    def llm_section(self) -> None:
+        while True:
+            self.term.header("LLM Local Connector")
+            self.term.lines(screens.llm_screen(self.config))
+            choice = self.term.read("edit # (enter to go back)> ")
+            if not choice:
+                return
+            if choice == "1":
+                self._edit_scalar("llm.base_url", "endpoint base url")
+            elif choice == "2":
+                self._edit_scalar("llm.model", "model id")
+            elif choice == "3":
+                self._toggle("llm.enable_image")
+            elif choice == "4":
+                self._toggle("llm.enable_video")
+            else:
+                self.term.write(f"  unknown field: {choice!r}")
+
+    def telegram_section(self) -> None:
+        while True:
+            self.term.header("Telegram Connector")
+            self.term.lines(screens.telegram_screen(self.config))
+            choice = self.term.read("edit # (enter to go back)> ")
+            if not choice:
+                return
+            if choice == "1":
+                self._edit_scalar("telegram.base_url", "telegram api base url")
+            elif choice == "2":
+                self._edit_scalar("telegram.allowed_chats", "allowed chat ids (comma)")
+            else:
+                self.term.write(f"  unknown field: {choice!r}")
 
     def paths_section(self) -> None:
         self.term.header("Paths")

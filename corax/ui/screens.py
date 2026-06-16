@@ -24,6 +24,8 @@ MAIN_MENU = [
     "  7. Security",
     "  8. Limits",
     "  9. Paths",
+    "  L. LLM Connector (Spark / modalities)",
+    "  T. Telegram Connector",
     " 10. Save and Exit",
     "  0. Exit without saving",
     "",
@@ -97,6 +99,34 @@ def limits_screen(config: AgentConfig) -> list[str]:
         f"  3. max_tasks_per_correlation  : {lim.max_tasks_per_correlation}",
         f"  4. task_timeout_seconds       : {lim.task_timeout_seconds}",
         f"  5. max_payload_mb             : {lim.max_payload_mb}",
+    ]
+
+
+def llm_screen(config: AgentConfig) -> list[str]:
+    llm = config.llm
+    return [
+        "LLM Local Connector (Spark)",
+        "",
+        f"  1. base_url     : {llm.base_url}",
+        f"  2. model        : {llm.model}",
+        f"  3. image input  : {_mark(llm.enable_image)}",
+        f"  4. video input  : {_mark(llm.enable_video)}",
+        "",
+        "  text input is always enabled; toggle image/video for multimodal input.",
+        "  applied to CORAX_LLM_* on the next runtime start.",
+    ]
+
+
+def telegram_screen(config: AgentConfig) -> list[str]:
+    tg = config.telegram
+    return [
+        "Telegram Connector",
+        "",
+        f"  1. base_url      : {tg.base_url}",
+        f"  2. allowed_chats : {tg.allowed_chats or '(any)'}",
+        "",
+        "  bot token is read from CORAX_TELEGRAM_BOT_TOKEN (never stored in config).",
+        "  applied to CORAX_TELEGRAM_* on the next runtime start.",
     ]
 
 

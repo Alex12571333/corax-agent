@@ -86,6 +86,57 @@ class TestRoundTrip(unittest.TestCase):
             self.assertIn("../corax-sdk", loaded.security.blocked_paths)
 
 
+class TestLLMConfig(unittest.TestCase):
+    def test_default_llm_section_and_registration(self) -> None:
+        config = cfg.default_config()
+        self.assertEqual(config.llm.base_url, "http://192.168.0.10:8000/v1")
+        self.assertEqual(config.llm.model, "google/gemma-4-12B-it")
+        self.assertFalse(config.llm.enable_image)
+        self.assertFalse(config.llm.enable_video)
+        # The connector is registered as an installable, enabled capability.
+        self.assertIn("llm.local", config.capabilities.enabled)
+        self.assertIn("llm.local", config.capabilities.available)
+        self.assertEqual(
+            config.capabilities.available["llm.local"].path,
+            "../corax-llm-local-connector",
+        )
+
+    def test_llm_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "agent.yaml"
+            original = cfg.default_config()
+            original.llm.enable_image = True
+            original.llm.model = "qwen3.6-35b-a3b"
+            cfg.save_config(original, path)
+            loaded = cfg.load_config(path)
+            self.assertTrue(loaded.llm.enable_image)
+            self.assertFalse(loaded.llm.enable_video)
+            self.assertEqual(loaded.llm.model, "qwen3.6-35b-a3b")
+            self.assertEqual(loaded.to_dict(), original.to_dict())
+
+
+class TestTelegramConfig(unittest.TestCase):
+    def test_default_telegram_section_and_registration(self) -> None:
+        config = cfg.default_config()
+        self.assertEqual(config.telegram.base_url, "https://api.telegram.org")
+        self.assertEqual(config.telegram.allowed_chats, "")
+        self.assertIn("telegram.connector", config.capabilities.enabled)
+        self.assertEqual(
+            config.capabilities.available["telegram.connector"].path,
+            "../corax-telegram-connector",
+        )
+
+    def test_telegram_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "agent.yaml"
+            original = cfg.default_config()
+            original.telegram.allowed_chats = "100,200"
+            cfg.save_config(original, path)
+            loaded = cfg.load_config(path)
+            self.assertEqual(loaded.telegram.allowed_chats, "100,200")
+            self.assertEqual(loaded.to_dict(), original.to_dict())
+
+
 class TestBlockedPathGuard(unittest.TestCase):
     """The agent must never be allowed to write into corax-core / corax-sdk."""
 

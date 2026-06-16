@@ -34,6 +34,8 @@ REQUIRED_SECTIONS = (
     "security",
     "limits",
     "ui",
+    "llm",
+    "telegram",
 )
 
 
@@ -134,6 +136,36 @@ class UIConfig:
 
 
 @dataclass
+class LLMConfig:
+    """Setup for the local LLM connector capability (``llm.local``).
+
+    Edited in the runtime menu and exported to ``CORAX_LLM_*`` environment
+    variables when the runtime starts, so the standalone connector picks up the
+    operator's choices without any per-capability wiring. ``enable_image`` /
+    ``enable_video`` are the multimodality selection; text input is always on.
+    """
+
+    base_url: str = "http://192.168.0.10:8000/v1"
+    model: str = "google/gemma-4-12B-it"
+    enable_image: bool = False
+    enable_video: bool = False
+
+
+@dataclass
+class TelegramConfig:
+    """Setup for the Telegram connector capability (``telegram.connector``).
+
+    Edited in the runtime menu and exported to ``CORAX_TELEGRAM_*`` when the
+    runtime starts. The bot **token is never stored here** — it is read from the
+    ``CORAX_TELEGRAM_BOT_TOKEN`` environment variable. ``allowed_chats`` is a
+    comma-separated allow-list (empty means allow any chat).
+    """
+
+    base_url: str = "https://api.telegram.org"
+    allowed_chats: str = ""
+
+
+@dataclass
 class AgentConfig:
     agent: AgentMeta = field(default_factory=AgentMeta)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
@@ -144,6 +176,8 @@ class AgentConfig:
     security: SecurityConfig = field(default_factory=SecurityConfig)
     limits: LimitsConfig = field(default_factory=LimitsConfig)
     ui: UIConfig = field(default_factory=UIConfig)
+    llm: LLMConfig = field(default_factory=LLMConfig)
+    telegram: TelegramConfig = field(default_factory=TelegramConfig)
 
     def to_dict(self) -> dict[str, Any]:
         return config_to_dict(self)
@@ -191,7 +225,7 @@ def default_config() -> AgentConfig:
             },
         ),
         capabilities=CapabilitiesConfig(
-            enabled=["echo", "filesystem", "editor", "shell"],
+            enabled=["echo", "filesystem", "editor", "shell", "llm.local", "telegram.connector"],
             available={
                 "echo": ProviderSpec(
                     enabled=True, type="tool",
@@ -215,6 +249,18 @@ def default_config() -> AgentConfig:
                     description="Guarded local shell command capability",
                     path="../corax-shell-capability",
                 ),
+                "llm.local": ProviderSpec(
+                    enabled=True,
+                    type="connector",
+                    description="Local Spark LLM connector (text + optional image/video)",
+                    path="../corax-llm-local-connector",
+                ),
+                "telegram.connector": ProviderSpec(
+                    enabled=True,
+                    type="connector",
+                    description="Telegram chat connector (streaming, commands, HTML formatting)",
+                    path="../corax-telegram-connector",
+                ),
             },
         ),
         security=SecurityConfig(
@@ -232,6 +278,16 @@ def default_config() -> AgentConfig:
             max_payload_mb=20,
         ),
         ui=UIConfig(theme="terminal", mascot="corax", show_banner=True),
+        llm=LLMConfig(
+            base_url="http://192.168.0.10:8000/v1",
+            model="google/gemma-4-12B-it",
+            enable_image=False,
+            enable_video=False,
+        ),
+        telegram=TelegramConfig(
+            base_url="https://api.telegram.org",
+            allowed_chats="",
+        ),
     )
 
 
@@ -296,6 +352,16 @@ def config_to_dict(config: AgentConfig) -> dict[str, Any]:
             "mascot": config.ui.mascot,
             "show_banner": config.ui.show_banner,
         },
+        "llm": {
+            "base_url": config.llm.base_url,
+            "model": config.llm.model,
+            "enable_image": config.llm.enable_image,
+            "enable_video": config.llm.enable_video,
+        },
+        "telegram": {
+            "base_url": config.telegram.base_url,
+            "allowed_chats": config.telegram.allowed_chats,
+        },
     }
 
 
@@ -310,6 +376,8 @@ def config_from_dict(data: dict[str, Any]) -> AgentConfig:
     security = data.get("security", {}) or {}
     limits = data.get("limits", {}) or {}
     ui = data.get("ui", {}) or {}
+    llm = data.get("llm", {}) or {}
+    telegram = data.get("telegram", {}) or {}
 
     defaults = default_config()
     return AgentConfig(
@@ -362,6 +430,16 @@ def config_from_dict(data: dict[str, Any]) -> AgentConfig:
             theme=str(ui.get("theme", defaults.ui.theme)),
             mascot=str(ui.get("mascot", defaults.ui.mascot)),
             show_banner=bool(ui.get("show_banner", defaults.ui.show_banner)),
+        ),
+        llm=LLMConfig(
+            base_url=str(llm.get("base_url", defaults.llm.base_url)),
+            model=str(llm.get("model", defaults.llm.model)),
+            enable_image=bool(llm.get("enable_image", defaults.llm.enable_image)),
+            enable_video=bool(llm.get("enable_video", defaults.llm.enable_video)),
+        ),
+        telegram=TelegramConfig(
+            base_url=str(telegram.get("base_url", defaults.telegram.base_url)),
+            allowed_chats=str(telegram.get("allowed_chats", defaults.telegram.allowed_chats)),
         ),
     )
 

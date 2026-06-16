@@ -67,7 +67,7 @@ class TestRuntime(unittest.TestCase):
         self.assertEqual(status.connectors_active, ["terminal"])
         self.assertEqual(
             status.capabilities_enabled,
-            ["echo", "filesystem", "editor", "shell"],
+            ["echo", "filesystem", "editor", "shell", "llm.local", "telegram.connector"],
         )
         self.assertEqual(status.registry_counts["providers"], 1)
         self.assertIn("RUNNING", status.render())
@@ -98,6 +98,38 @@ class TestRuntime(unittest.TestCase):
         asyncio.run(self.runtime.start())
         self.assertFalse(self.runtime.providers.has("openai"))
         self.assertEqual(len(self.runtime.providers), 0)
+
+    def test_start_exports_llm_environment(self) -> None:
+        import os
+
+        config = cfg.default_config()
+        config.llm.base_url = "http://192.168.0.10:9999/v1"
+        config.llm.model = "google/gemma-4-12B-it"
+        config.llm.enable_image = True
+        config.llm.enable_video = False
+        runtime = CoraxRuntime(config)
+        asyncio.run(runtime.start())
+        try:
+            self.assertEqual(os.environ["CORAX_LLM_BASE_URL"], "http://192.168.0.10:9999/v1")
+            self.assertEqual(os.environ["CORAX_LLM_MODEL"], "google/gemma-4-12B-it")
+            self.assertEqual(os.environ["CORAX_LLM_ENABLE_IMAGE"], "true")
+            self.assertEqual(os.environ["CORAX_LLM_ENABLE_VIDEO"], "false")
+        finally:
+            asyncio.run(runtime.stop())
+
+    def test_start_exports_telegram_environment(self) -> None:
+        import os
+
+        config = cfg.default_config()
+        config.telegram.base_url = "https://tg.example/api"
+        config.telegram.allowed_chats = "100,200"
+        runtime = CoraxRuntime(config)
+        asyncio.run(runtime.start())
+        try:
+            self.assertEqual(os.environ["CORAX_TELEGRAM_BASE_URL"], "https://tg.example/api")
+            self.assertEqual(os.environ["CORAX_TELEGRAM_ALLOWED_CHATS"], "100,200")
+        finally:
+            asyncio.run(runtime.stop())
 
 
 class TestCapabilityIntegration(unittest.TestCase):
