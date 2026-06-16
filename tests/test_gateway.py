@@ -43,17 +43,24 @@ class FakeBackend:
         self.sends: list[str] = []
         self.tools_run: list = []
         self.fail_capability: str | None = None
+        self.fail_operation: str | None = None
 
     async def run_capability(self, cap_id, payload, *, session_id=None):
         op = payload.get("operation")
         self.calls.append((cap_id, op, payload))
-        if cap_id == self.fail_capability:
+        if cap_id == self.fail_capability or (self.fail_operation is not None and op == self.fail_operation):
             raise GatewayError("boom")
         if op == "poll":
             return {"updates": self.poll_batches.pop(0) if self.poll_batches else [], "next_offset": 999}
+        if op == "chat_action":
+            return {"ok": True}
         if op == "send":
             self.sends.append(payload["text"])
             return {"message_id": 1}
+        if op == "stream":  # progressive reveal of the final answer
+            if payload.get("done"):
+                self.sends.append(payload["text"])
+            return {"message_id": payload.get("message_id") or 1}
         if cap_id == "llm.local" and op == "generate":
             resp = self.llm_responses.pop(0) if self.llm_responses else {"text": "(default)"}
             tcs = resp.get("tool_calls") or []
@@ -198,6 +205,28 @@ class ChatToolLoopTests(unittest.IsolatedAsyncioTestCase):
         gw = _gateway(backend)
         await gw.run(max_iterations=1)
         self.assertIn("(no response)", backend.sends)
+
+    async def test_typing_sent_before_generate(self) -> None:
+        backend = FakeBackend(poll_batches=[[_text_update(5, "hi")]], llm_responses=[{"text": "ok"}])
+        await _gateway(backend).run(max_iterations=1)
+        self.assertTrue(any(op == "chat_action" for _c, op, _p in backend.calls))
+
+    async def test_typing_failure_is_ignored(self) -> None:
+        backend = FakeBackend(poll_batches=[[_text_update(5, "hi")]], llm_responses=[{"text": "ok"}])
+        backend.fail_operation = "chat_action"  # typing fails — turn must still complete
+        await _gateway(backend).run(max_iterations=1)
+        self.assertIn("ok", backend.sends)
+
+    async def test_long_answer_is_revealed_progressively(self) -> None:
+        long_text = "word " * 60  # > reveal_chunk -> progressive edits
+        backend = FakeBackend(poll_batches=[[_text_update(5, "hi")]],
+                              llm_responses=[{"text": long_text}])
+        await _gateway(backend, reveal_chunk=64).run(max_iterations=1)
+        stream_calls = [p for _c, op, p in backend.calls if op == "stream"]
+        self.assertGreater(len(stream_calls), 1)          # multiple progressive edits
+        self.assertTrue(stream_calls[-1]["done"])          # last one finalizes
+        self.assertEqual(stream_calls[-1]["text"], long_text)
+        self.assertIn(long_text, backend.sends)
 
 
 class CommandTests(unittest.IsolatedAsyncioTestCase):
