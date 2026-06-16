@@ -135,6 +135,7 @@ class CoraxRuntime:
             return
         self.log.info("starting runtime")
         self._apply_llm_environment()
+        self._apply_telegram_environment()
         self._populate_registries()
         self._running = True
         self._started_at = datetime.now(timezone.utc)
@@ -243,6 +244,19 @@ class CoraxRuntime:
         os.environ["CORAX_LLM_MODEL"] = llm.model
         os.environ["CORAX_LLM_ENABLE_IMAGE"] = "true" if llm.enable_image else "false"
         os.environ["CORAX_LLM_ENABLE_VIDEO"] = "true" if llm.enable_video else "false"
+
+    def _apply_telegram_environment(self) -> None:
+        """Export the menu-driven Telegram setup so the connector reads it.
+
+        Only the non-secret settings are mirrored here; the bot token is read by
+        the connector straight from ``CORAX_TELEGRAM_BOT_TOKEN`` and is never
+        stored in the agent config.
+        """
+        telegram = getattr(self.config, "telegram", None)
+        if telegram is None:
+            return
+        os.environ["CORAX_TELEGRAM_BASE_URL"] = telegram.base_url
+        os.environ["CORAX_TELEGRAM_ALLOWED_CHATS"] = telegram.allowed_chats
 
     def _populate_registries(self) -> None:
         self._clear_registries()

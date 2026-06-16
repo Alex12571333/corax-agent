@@ -67,7 +67,7 @@ class TestRuntime(unittest.TestCase):
         self.assertEqual(status.connectors_active, ["terminal"])
         self.assertEqual(
             status.capabilities_enabled,
-            ["echo", "filesystem", "editor", "shell", "llm.local"],
+            ["echo", "filesystem", "editor", "shell", "llm.local", "telegram.connector"],
         )
         self.assertEqual(status.registry_counts["providers"], 1)
         self.assertIn("RUNNING", status.render())
@@ -114,6 +114,20 @@ class TestRuntime(unittest.TestCase):
             self.assertEqual(os.environ["CORAX_LLM_MODEL"], "google/gemma-4-12B-it")
             self.assertEqual(os.environ["CORAX_LLM_ENABLE_IMAGE"], "true")
             self.assertEqual(os.environ["CORAX_LLM_ENABLE_VIDEO"], "false")
+        finally:
+            asyncio.run(runtime.stop())
+
+    def test_start_exports_telegram_environment(self) -> None:
+        import os
+
+        config = cfg.default_config()
+        config.telegram.base_url = "https://tg.example/api"
+        config.telegram.allowed_chats = "100,200"
+        runtime = CoraxRuntime(config)
+        asyncio.run(runtime.start())
+        try:
+            self.assertEqual(os.environ["CORAX_TELEGRAM_BASE_URL"], "https://tg.example/api")
+            self.assertEqual(os.environ["CORAX_TELEGRAM_ALLOWED_CHATS"], "100,200")
         finally:
             asyncio.run(runtime.stop())
 

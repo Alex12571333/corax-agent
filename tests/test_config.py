@@ -115,6 +115,28 @@ class TestLLMConfig(unittest.TestCase):
             self.assertEqual(loaded.to_dict(), original.to_dict())
 
 
+class TestTelegramConfig(unittest.TestCase):
+    def test_default_telegram_section_and_registration(self) -> None:
+        config = cfg.default_config()
+        self.assertEqual(config.telegram.base_url, "https://api.telegram.org")
+        self.assertEqual(config.telegram.allowed_chats, "")
+        self.assertIn("telegram.connector", config.capabilities.enabled)
+        self.assertEqual(
+            config.capabilities.available["telegram.connector"].path,
+            "../corax-telegram-connector",
+        )
+
+    def test_telegram_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "agent.yaml"
+            original = cfg.default_config()
+            original.telegram.allowed_chats = "100,200"
+            cfg.save_config(original, path)
+            loaded = cfg.load_config(path)
+            self.assertEqual(loaded.telegram.allowed_chats, "100,200")
+            self.assertEqual(loaded.to_dict(), original.to_dict())
+
+
 class TestBlockedPathGuard(unittest.TestCase):
     """The agent must never be allowed to write into corax-core / corax-sdk."""
 
