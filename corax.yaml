@@ -43,6 +43,7 @@ capabilities:
     - editor
     - shell
     - llm.local
+    - telegram.connector
   available:
     echo:
       enabled: true
@@ -68,6 +69,11 @@ capabilities:
       type: connector
       description: "Local Spark LLM connector (text + optional image/video)"
       path: ../corax-llm-local-connector
+    telegram.connector:
+      enabled: true
+      type: connector
+      description: "Telegram chat connector (streaming, commands, HTML formatting)"
+      path: ../corax-telegram-connector
 
 security:
   mode: normal
@@ -100,3 +106,11 @@ llm:
   model: google/gemma-4-12B-it
   enable_image: false
   enable_video: false
+
+telegram:
+  # Telegram connector setup. Exported to CORAX_TELEGRAM_* at runtime start.
+  # Edit here or via the runtime menu (option "T"). The bot token is read from
+  # the CORAX_TELEGRAM_BOT_TOKEN environment variable and is NOT stored here.
+  # allowed_chats is a comma-separated allow-list (empty = any chat).
+  base_url: https://api.telegram.org
+  allowed_chats: ""

@@ -107,6 +107,19 @@ class TestMenuFlows(unittest.TestCase):
         self.assertEqual(menu.config.llm.base_url, "http://192.168.0.10:1234/v1")
         self.assertTrue(menu.changed)
 
+    def test_telegram_section_edits(self) -> None:
+        # T -> set allowed_chats (2) -> unknown -> back -> exit
+        menu, capture = _menu(["T", "2", "100,200", "zzz", "", "0"])
+        self.assertEqual(menu.run(), "discarded")
+        self.assertEqual(menu.config.telegram.allowed_chats, "100,200")
+        self.assertTrue(menu.changed)
+        self.assertIn("unknown field", capture.text)
+
+    def test_telegram_section_edits_base_url(self) -> None:
+        menu, _ = _menu(["t", "1", "https://tg.example/api", "", "0"])
+        menu.run()
+        self.assertEqual(menu.config.telegram.base_url, "https://tg.example/api")
+
 
 class TestAppLifecycle(unittest.TestCase):
     def test_boot_creates_config_and_paths(self) -> None:
