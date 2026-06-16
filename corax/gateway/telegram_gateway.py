@@ -79,9 +79,16 @@ class CoraxTelegramGateway:
         self._stop = False
         iterations = 0
         while not self._stop and not self._reload:
-            updates = await self.poll_once()
+            try:
+                updates = await self.poll_once()
+            except Exception as exc:  # noqa: BLE001 - one bad poll must not kill the loop
+                self.log.warning("poll failed: %s", exc)
+                updates = []
             for update in updates:
-                await self.handle_update(update)
+                try:
+                    await self.handle_update(update)
+                except Exception as exc:  # noqa: BLE001 - one bad turn must not kill the loop
+                    self.log.warning("failed handling update: %s", exc)
                 if self._stop or self._reload:
                     break
             iterations += 1

@@ -152,15 +152,21 @@ class RunningCore:
             task_type=task_type,
             wait_timeout=wait_timeout,
         )
+        echoed = None
+        if state_key and self.state_manager is not None:
+            state = await self.state_manager.get_state(sid)
+            echoed = state.temporary_context.get(state_key)
+
         if task.status is not self._ac.TaskStatus.COMPLETED:
+            detail = ""
+            if isinstance(echoed, dict) and echoed.get("_error"):
+                detail = f": {echoed['_error']}"
+                if echoed.get("_details"):
+                    detail += f" {echoed['_details']}"
             raise KernelInvocationError(
-                f"capability {capability_id!r} task ended {task.status.value}"
+                f"capability {capability_id!r} task ended {task.status.value}{detail}"
             )
-        if not state_key or self.state_manager is None:
-            return {}
-        state = await self.state_manager.get_state(sid)
-        output = state.temporary_context.get(state_key)
-        return dict(output) if isinstance(output, dict) else {}
+        return dict(echoed) if isinstance(echoed, dict) else {}
 
 
 class CoreEngine:
