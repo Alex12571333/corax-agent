@@ -273,30 +273,32 @@ class GatewayCoreRoundTripTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self) -> None:
         await self.runtime.stop()
 
-    async def test_poll_through_kernel_reads_state(self) -> None:
-        from agent_core import TaskStatus
-
+    async def test_invoke_routes_through_core_and_returns_payload(self) -> None:
         async with self.runtime.core.session(
             self.runtime.capabilities, policy=GatewayPolicyEngine()
         ) as kernel:
-            task = await kernel.run_task(
-                required_capability="telegram.connector",
-                input={
+            output = await kernel.invoke(
+                "telegram.connector",
+                {
                     "operation": "poll",
                     "mock": True,
                     "mock_updates": [
                         {"update_id": 1, "message": {"text": "/new", "chat": {"id": 7}}}
                     ],
-                    "state_key": "gw_output",
                 },
-                session_id="gw-test",
                 wait_timeout=10,
             )
-            self.assertIs(task.status, TaskStatus.COMPLETED)
-            state = await kernel.get_state("gw-test")
-            output = state.temporary_context["gw_output"]
-            self.assertEqual(output["count"], 1)
-            self.assertEqual(output["updates"][0]["command"]["command"], "new_session")
+        self.assertEqual(output["count"], 1)
+        self.assertEqual(output["updates"][0]["command"]["command"], "new_session")
+
+    async def test_invoke_raises_on_failed_task(self) -> None:
+        from corax.loader.core import KernelInvocationError
+
+        async with self.runtime.core.session(
+            self.runtime.capabilities, policy=GatewayPolicyEngine()
+        ) as kernel:
+            with self.assertRaises(KernelInvocationError):
+                await kernel.invoke("telegram.connector", {"operation": "nope"}, wait_timeout=10)
 
 
 if __name__ == "__main__":

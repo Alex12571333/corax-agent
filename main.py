@@ -82,37 +82,21 @@ async def _run_chat(app: "CoraxApp", config_path: Path) -> int:
         print("Set CORAX_TELEGRAM_BOT_TOKEN before running --chat.")
         return 1
 
-    from agent_core import CapabilityRequest, TaskStatus
+    from agent_core import CapabilityRequest
 
-    from corax.gateway import CoraxTelegramGateway, GatewayError
+    from corax.gateway import CoraxTelegramGateway
     from corax.gateway.policy import GatewayPolicyEngine
+    from corax.loader.core import KernelInvocationError
 
     llm = runtime.capabilities.get("llm.local")
     if llm is None or not hasattr(llm, "stream_generate"):
         print("llm.local capability is not loaded; cannot stream replies.")
         return 1
 
-    wait_timeout = 90.0
-
     while True:
         async with runtime.core.session(
             runtime.capabilities, policy=GatewayPolicyEngine()
         ) as kernel:
-
-            async def run_capability(cap_id: str, payload: dict, *, session_id: str | None = None) -> dict:
-                sid = session_id or f"gw-{uuid.uuid4().hex[:8]}"
-                request_input = dict(payload)
-                request_input["state_key"] = "gw_output"
-                task = await kernel.run_task(
-                    required_capability=cap_id,
-                    input=request_input,
-                    session_id=sid,
-                    wait_timeout=wait_timeout,
-                )
-                if task.status is not TaskStatus.COMPLETED:
-                    raise GatewayError(f"{cap_id} task ended {task.status.value}")
-                state = await kernel.get_state(sid)
-                return dict(state.temporary_context.get("gw_output") or {})
 
             async def stream_llm(payload: dict, *, session_id: str):
                 request = CapabilityRequest(
@@ -123,13 +107,20 @@ async def _run_chat(app: "CoraxApp", config_path: Path) -> int:
                 async for chunk in llm.stream_generate(request):
                     yield chunk
 
+            # All connector calls flow through the shared, through-the-core
+            # primitive ``kernel.invoke``; only the LLM token stream is read
+            # straight from the instance (the one-shot kernel cannot stream).
             gateway = CoraxTelegramGateway(
-                run_capability=run_capability,
+                run_capability=kernel.invoke,
                 stream_llm=stream_llm,
                 model=app.config.llm.model,
             )
             print("Corax Telegram gateway is running (Ctrl-C to stop).")
-            outcome = await gateway.run()
+            try:
+                outcome = await gateway.run()
+            except KernelInvocationError as exc:
+                print(f"gateway stopped: {exc}")
+                return 1
 
         if outcome == "reload":
             print("Reloading agent…")

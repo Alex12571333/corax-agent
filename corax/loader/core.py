@@ -30,6 +30,10 @@ from typing import Any, AsyncIterator, Iterable
 from ..config import AgentConfig
 
 
+class KernelInvocationError(RuntimeError):
+    """A capability invoked through the kernel did not complete successfully."""
+
+
 def _as_pairs(capabilities: Any) -> list[tuple[str, Any]]:
     """Normalise a capability collection to ``(id, instance)`` pairs.
 
@@ -115,6 +119,48 @@ class RunningCore:
         """``submit_task`` + ``wait`` in one call; returns the final Task."""
         task_id = await self.submit_task(**submit_kwargs)
         return await self.wait(task_id, timeout=wait_timeout)
+
+    async def invoke(
+        self,
+        capability_id: str,
+        input: dict | None = None,
+        *,
+        session_id: str | None = None,
+        state_key: str = "_invoke_output",
+        task_type: str = "generic",
+        wait_timeout: float = 60.0,
+    ) -> dict:
+        """The canonical *through-the-core* call: run a capability and get its payload.
+
+        Runs ``capability_id`` as a kernel task (so the kernel's policy, schema
+        validation and tracing all apply), then reads the capability's output
+        back from session state. Capabilities echo their payload into
+        ``state_patch`` when handed a ``state_key`` — the only channel the core
+        exposes for returning data — so any capability that follows that
+        convention round-trips here without bespoke wiring.
+
+        Raises :class:`KernelInvocationError` if the task does not complete.
+        """
+        sid = session_id or f"inv-{uuid.uuid4().hex[:8]}"
+        payload = dict(input or {})
+        if state_key:
+            payload["state_key"] = state_key
+        task = await self.run_task(
+            required_capability=capability_id,
+            input=payload,
+            session_id=sid,
+            task_type=task_type,
+            wait_timeout=wait_timeout,
+        )
+        if task.status is not self._ac.TaskStatus.COMPLETED:
+            raise KernelInvocationError(
+                f"capability {capability_id!r} task ended {task.status.value}"
+            )
+        if not state_key or self.state_manager is None:
+            return {}
+        state = await self.state_manager.get_state(sid)
+        output = state.temporary_context.get(state_key)
+        return dict(output) if isinstance(output, dict) else {}
 
 
 class CoreEngine:
