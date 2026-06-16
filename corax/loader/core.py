@@ -57,11 +57,24 @@ class RunningCore:
     onto the task store and wait for it to settle, without needing a planner.
     """
 
-    def __init__(self, agent_core: Any, executor: Any, task_store: Any, capability_ids: list[str]) -> None:
+    def __init__(
+        self,
+        agent_core: Any,
+        executor: Any,
+        task_store: Any,
+        capability_ids: list[str],
+        state_manager: Any | None = None,
+    ) -> None:
         self._ac = agent_core
         self.executor = executor
         self.task_store = task_store
         self.capability_ids = list(capability_ids)
+        self.state_manager = state_manager
+
+    async def get_state(self, session_id: str) -> Any:
+        """Read a session's ephemeral state (where capabilities' ``state_patch``
+        output lands), so a kernel-driven caller can retrieve results."""
+        return await self.state_manager.get_state(session_id)
 
     async def submit_task(
         self,
@@ -142,12 +155,18 @@ class CoreEngine:
 
     # -- running --------------------------------------------------------- #
     @contextlib.asynccontextmanager
-    async def session(self, capabilities: Iterable[Any] = ()) -> AsyncIterator[RunningCore]:
+    async def session(
+        self,
+        capabilities: Iterable[Any] = (),
+        *,
+        policy: Any | None = None,
+    ) -> AsyncIterator[RunningCore]:
         """Build, start, yield and tear down a fresh kernel in the current loop.
 
         Only the real ``agent_core.Capability`` instances among ``capabilities``
         are registered; everything else (e.g. the built-in echo placeholder) is
-        skipped.
+        skipped. A custom ``policy`` (any ``agent_core.PolicyEngine``) may be
+        injected; otherwise the conservative ``DefaultPolicyEngine`` is used.
         """
         if not self.probe():
             raise RuntimeError("agent-core is not installed; the execution kernel is unavailable")
@@ -159,7 +178,7 @@ class CoreEngine:
         task_store = ac.InMemoryTaskStore()
         bus = ac.InMemoryEventBus()
         trace = ac.TraceManager()
-        policy = ac.DefaultPolicyEngine()
+        policy = policy if policy is not None else ac.DefaultPolicyEngine()
         router = ac.Router(registry)
         executor = ac.Executor(
             session_manager=sessions,
@@ -199,7 +218,7 @@ class CoreEngine:
         await lifecycle.start_all()
         self.log.info("agent-core kernel started: %d capability(ies) adopted", len(adopted))
         try:
-            yield RunningCore(ac, executor, task_store, adopted)
+            yield RunningCore(ac, executor, task_store, adopted, state)
         finally:
             await lifecycle.stop_all()
             self.log.debug("agent-core kernel stopped")
