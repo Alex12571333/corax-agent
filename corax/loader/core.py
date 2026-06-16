@@ -30,6 +30,10 @@ from typing import Any, AsyncIterator, Iterable
 from ..config import AgentConfig
 
 
+class KernelInvocationError(RuntimeError):
+    """A capability invoked through the kernel did not complete successfully."""
+
+
 def _as_pairs(capabilities: Any) -> list[tuple[str, Any]]:
     """Normalise a capability collection to ``(id, instance)`` pairs.
 
@@ -57,11 +61,24 @@ class RunningCore:
     onto the task store and wait for it to settle, without needing a planner.
     """
 
-    def __init__(self, agent_core: Any, executor: Any, task_store: Any, capability_ids: list[str]) -> None:
+    def __init__(
+        self,
+        agent_core: Any,
+        executor: Any,
+        task_store: Any,
+        capability_ids: list[str],
+        state_manager: Any | None = None,
+    ) -> None:
         self._ac = agent_core
         self.executor = executor
         self.task_store = task_store
         self.capability_ids = list(capability_ids)
+        self.state_manager = state_manager
+
+    async def get_state(self, session_id: str) -> Any:
+        """Read a session's ephemeral state (where capabilities' ``state_patch``
+        output lands), so a kernel-driven caller can retrieve results."""
+        return await self.state_manager.get_state(session_id)
 
     async def submit_task(
         self,
@@ -103,6 +120,48 @@ class RunningCore:
         task_id = await self.submit_task(**submit_kwargs)
         return await self.wait(task_id, timeout=wait_timeout)
 
+    async def invoke(
+        self,
+        capability_id: str,
+        input: dict | None = None,
+        *,
+        session_id: str | None = None,
+        state_key: str = "_invoke_output",
+        task_type: str = "generic",
+        wait_timeout: float = 60.0,
+    ) -> dict:
+        """The canonical *through-the-core* call: run a capability and get its payload.
+
+        Runs ``capability_id`` as a kernel task (so the kernel's policy, schema
+        validation and tracing all apply), then reads the capability's output
+        back from session state. Capabilities echo their payload into
+        ``state_patch`` when handed a ``state_key`` — the only channel the core
+        exposes for returning data — so any capability that follows that
+        convention round-trips here without bespoke wiring.
+
+        Raises :class:`KernelInvocationError` if the task does not complete.
+        """
+        sid = session_id or f"inv-{uuid.uuid4().hex[:8]}"
+        payload = dict(input or {})
+        if state_key:
+            payload["state_key"] = state_key
+        task = await self.run_task(
+            required_capability=capability_id,
+            input=payload,
+            session_id=sid,
+            task_type=task_type,
+            wait_timeout=wait_timeout,
+        )
+        if task.status is not self._ac.TaskStatus.COMPLETED:
+            raise KernelInvocationError(
+                f"capability {capability_id!r} task ended {task.status.value}"
+            )
+        if not state_key or self.state_manager is None:
+            return {}
+        state = await self.state_manager.get_state(sid)
+        output = state.temporary_context.get(state_key)
+        return dict(output) if isinstance(output, dict) else {}
+
 
 class CoreEngine:
     """The runtime's seam onto the ``agent-core`` execution kernel."""
@@ -142,12 +201,18 @@ class CoreEngine:
 
     # -- running --------------------------------------------------------- #
     @contextlib.asynccontextmanager
-    async def session(self, capabilities: Iterable[Any] = ()) -> AsyncIterator[RunningCore]:
+    async def session(
+        self,
+        capabilities: Iterable[Any] = (),
+        *,
+        policy: Any | None = None,
+    ) -> AsyncIterator[RunningCore]:
         """Build, start, yield and tear down a fresh kernel in the current loop.
 
         Only the real ``agent_core.Capability`` instances among ``capabilities``
         are registered; everything else (e.g. the built-in echo placeholder) is
-        skipped.
+        skipped. A custom ``policy`` (any ``agent_core.PolicyEngine``) may be
+        injected; otherwise the conservative ``DefaultPolicyEngine`` is used.
         """
         if not self.probe():
             raise RuntimeError("agent-core is not installed; the execution kernel is unavailable")
@@ -159,7 +224,7 @@ class CoreEngine:
         task_store = ac.InMemoryTaskStore()
         bus = ac.InMemoryEventBus()
         trace = ac.TraceManager()
-        policy = ac.DefaultPolicyEngine()
+        policy = policy if policy is not None else ac.DefaultPolicyEngine()
         router = ac.Router(registry)
         executor = ac.Executor(
             session_manager=sessions,
@@ -199,7 +264,7 @@ class CoreEngine:
         await lifecycle.start_all()
         self.log.info("agent-core kernel started: %d capability(ies) adopted", len(adopted))
         try:
-            yield RunningCore(ac, executor, task_store, adopted)
+            yield RunningCore(ac, executor, task_store, adopted, state)
         finally:
             await lifecycle.stop_all()
             self.log.debug("agent-core kernel stopped")
