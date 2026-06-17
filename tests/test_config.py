@@ -137,6 +137,17 @@ class TestTelegramConfig(unittest.TestCase):
             self.assertEqual(loaded.to_dict(), original.to_dict())
 
 
+class TestGatewayConfig(unittest.TestCase):
+    def test_default_gateway_section_and_registration(self) -> None:
+        config = cfg.default_config()
+        self.assertIn("gateway", config.capabilities.enabled)
+        self.assertIn("gateway", config.capabilities.available)
+        self.assertEqual(
+            config.capabilities.available["gateway"].path,
+            "../corax-gateway-capability",
+        )
+
+
 class TestBlockedPathGuard(unittest.TestCase):
     """The agent must never be allowed to write into corax-core / corax-sdk."""
 

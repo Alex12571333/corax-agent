@@ -17,6 +17,7 @@ dependencies = [
     "corax-capability-filesystem @ git+https://github.com/Alex12571333/corax-filesystem-capability.git",
     "corax-capability-editor @ git+https://github.com/Alex12571333/corax-editor-capability.git",
     "corax-shell-capability @ git+https://github.com/Alex12571333/corax-shell-capability.git",
+    "corax-plugin-tool-discovery @ git+https://github.com/Alex12571333/corax-plugin-tool-discovery.git",
     "corax-llm-local-connector @ git+https://github.com/Alex12571333/corax-llm-local-connector.git",
     "corax-telegram-connector @ git+https://github.com/Alex12571333/corax-telegram-connector.git",
 ]
