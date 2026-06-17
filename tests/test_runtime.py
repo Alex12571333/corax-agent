@@ -76,6 +76,7 @@ class TestRuntime(unittest.TestCase):
                 "gateway",
                 "llm.local",
                 "telegram.connector",
+                "web.search",
             ],
         )
         self.assertEqual(status.registry_counts["providers"], 1)
@@ -139,6 +140,27 @@ class TestRuntime(unittest.TestCase):
             self.assertEqual(os.environ["CORAX_TELEGRAM_ALLOWED_CHATS"], "100,200")
         finally:
             asyncio.run(runtime.stop())
+
+    def test_start_exports_websearch_environment(self) -> None:
+        import os
+
+        # A stale safesearch must be cleared, not exported as an empty string.
+        os.environ["CORAX_WEBSEARCH_SAFESEARCH"] = "9"
+        config = cfg.default_config()
+        config.websearch.base_url = "http://192.168.0.50:8888"
+        config.websearch.engines = "duckduckgo,brave"
+        config.websearch.language = "en"
+        config.websearch.safesearch = ""  # unset -> not exported
+        runtime = CoraxRuntime(config)
+        asyncio.run(runtime.start())
+        try:
+            self.assertEqual(os.environ["CORAX_WEBSEARCH_BASE_URL"], "http://192.168.0.50:8888")
+            self.assertEqual(os.environ["CORAX_WEBSEARCH_ENGINES"], "duckduckgo,brave")
+            self.assertEqual(os.environ["CORAX_WEBSEARCH_LANGUAGE"], "en")
+            self.assertNotIn("CORAX_WEBSEARCH_SAFESEARCH", os.environ)
+        finally:
+            asyncio.run(runtime.stop())
+            os.environ.pop("CORAX_WEBSEARCH_SAFESEARCH", None)
 
 
 class TestCapabilityIntegration(unittest.TestCase):

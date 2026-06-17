@@ -20,6 +20,7 @@ dependencies = [
     "corax-plugin-tool-discovery @ git+https://github.com/Alex12571333/corax-plugin-tool-discovery.git",
     "corax-llm-local-connector @ git+https://github.com/Alex12571333/corax-llm-local-connector.git",
     "corax-telegram-connector @ git+https://github.com/Alex12571333/corax-telegram-connector.git",
+    "corax-web-search-capability @ git+https://github.com/Alex12571333/corax-web-search-capability.git",
 ]
 
 [project.optional-dependencies]

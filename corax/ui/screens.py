@@ -26,6 +26,7 @@ MAIN_MENU = [
     "  9. Paths",
     "  L. LLM Connector (Spark / modalities)",
     "  T. Telegram Connector",
+    "  W. Web Search (SearXNG)",
     " 10. Save and Exit",
     "  0. Exit without saving",
     "",
@@ -127,6 +128,22 @@ def telegram_screen(config: AgentConfig) -> list[str]:
         "",
         "  bot token is read from CORAX_TELEGRAM_BOT_TOKEN (never stored in config).",
         "  applied to CORAX_TELEGRAM_* on the next runtime start.",
+    ]
+
+
+def websearch_screen(config: AgentConfig) -> list[str]:
+    ws = config.websearch
+    return [
+        "Web Search (SearXNG)",
+        "",
+        f"  1. base_url    : {ws.base_url}",
+        f"  2. engines     : {ws.engines or '(default)'}",
+        f"  3. language    : {ws.language or '(any)'}",
+        f"  4. safesearch  : {ws.safesearch or '(off)'}",
+        "",
+        "  endpoint must be a local/private SearXNG instance with JSON format enabled.",
+        "  optional proxy token via CORAX_WEBSEARCH_TOKEN (never stored in config).",
+        "  applied to CORAX_WEBSEARCH_* on the next runtime start.",
     ]
 
 

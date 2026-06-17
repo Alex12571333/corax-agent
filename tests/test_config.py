@@ -148,6 +148,34 @@ class TestGatewayConfig(unittest.TestCase):
         )
 
 
+class TestWebSearchConfig(unittest.TestCase):
+    def test_default_websearch_section_and_registration(self) -> None:
+        config = cfg.default_config()
+        self.assertEqual(config.websearch.base_url, "http://192.168.0.14:8080")
+        self.assertEqual(config.websearch.engines, "")
+        self.assertEqual(config.websearch.language, "")
+        self.assertEqual(config.websearch.safesearch, "")
+        # The tool is registered as an installable, enabled capability.
+        self.assertIn("web.search", config.capabilities.enabled)
+        self.assertIn("web.search", config.capabilities.available)
+        self.assertEqual(
+            config.capabilities.available["web.search"].path,
+            "../corax-web-search-capability",
+        )
+
+    def test_websearch_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "agent.yaml"
+            original = cfg.default_config()
+            original.websearch.base_url = "http://192.168.0.50:8888"
+            original.websearch.safesearch = "1"
+            cfg.save_config(original, path)
+            loaded = cfg.load_config(path)
+            self.assertEqual(loaded.websearch.base_url, "http://192.168.0.50:8888")
+            self.assertEqual(loaded.websearch.safesearch, "1")
+            self.assertEqual(loaded.to_dict(), original.to_dict())
+
+
 class TestBlockedPathGuard(unittest.TestCase):
     """The agent must never be allowed to write into corax-core / corax-sdk."""
 
