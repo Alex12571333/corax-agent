@@ -42,6 +42,7 @@ _DEFAULT_SYSTEM_PROMPT = (
 RunCapability = Callable[..., Awaitable[dict]]
 StreamCapability = Callable[..., AsyncIterator[dict]]
 ToolSelector = Callable[[str, list[dict]], Iterable[str]]
+ToolRouter = Callable[[str, list[dict]], Awaitable[Iterable[str]]]
 
 _SAFE_TOOL_NAME = re.compile(r"[^a-zA-Z0-9_-]")
 _MEDIA_LINE = re.compile(r"^\s*MEDIA:\s*(?P<path>\S.*?)\s*$")
@@ -157,6 +158,7 @@ class CoraxTelegramGateway:
         max_history_messages: int = 20,
         max_recent_files: int = 10,
         tool_selector: ToolSelector | None = None,
+        tool_router: "ToolRouter | None" = None,
         max_active_tools: int = 8,
         log: logging.Logger | None = None,
         new_session: Callable[[], str] | None = None,
@@ -185,6 +187,7 @@ class CoraxTelegramGateway:
         self.max_history_messages = max(0, max_history_messages)
         self.max_recent_files = max(0, max_recent_files)
         self.tool_selector = tool_selector
+        self.tool_router = tool_router
         self.max_active_tools = max(1, max_active_tools)
         self.log = log or logging.getLogger("corax.gateway")
         self._new_session = new_session or (lambda: f"chat-{uuid.uuid4().hex[:8]}")
@@ -356,7 +359,7 @@ class CoraxTelegramGateway:
         allow_media = bool(prepared["allow_outbound_file"])
         user_message = prepared["user_message"]
         messages = prepared["messages"]
-        active_tools = self._active_tool_specs(text, allow_media=allow_media)
+        active_tools = await self._active_tool_specs(text, allow_media=allow_media)
         final_text = ""
         recovery_needed = False
         recovery_tool_attempted = False
@@ -467,7 +470,12 @@ class CoraxTelegramGateway:
             for spec in self._tool_specs
             if spec["function"]["name"] != _SEND_DOCUMENT_TOOL
         ) or "none"
-        tool_mode = "dynamic top-K selector" if self.tool_selector is not None else "static list"
+        if self.tool_router is not None:
+            tool_mode = "llm router"
+        elif self.tool_selector is not None:
+            tool_mode = "dynamic top-K selector"
+        else:
+            tool_mode = "static list"
         state = "gateway capability" if self._has_gateway_capability else "local fallback state"
         return (
             "Corax status\n"
@@ -746,44 +754,33 @@ class CoraxTelegramGateway:
             "document_sent": document_sent,
         }
 
-    def _active_tool_specs(self, user_text: str, *, allow_media: bool) -> list[dict]:
+    async def _active_tool_specs(self, user_text: str, *, allow_media: bool) -> list[dict]:
         base_specs = [
             spec
             for spec in self._tool_specs
             if spec["function"]["name"] != _SEND_DOCUMENT_TOOL
         ]
-        if self.tool_selector is None:
-            # No selector: static mode offers the whole tool set.
+        selection = await self._resolve_tool_selection(user_text, base_specs)
+        if selection is None:
+            # Static mode, or the router/selector errored: offer the full set so
+            # the model is never silently left without tools.
             selected_specs = base_specs
         else:
-            selector_failed = False
-            try:
-                selected_ids = [
-                    str(cap_id)
-                    for cap_id in self.tool_selector(user_text, base_specs)
-                    if str(cap_id) in self._cap_to_tool
-                ]
-            except Exception as exc:  # noqa: BLE001 - selector must not break chat
-                self.log.debug("tool selector failed: %s", exc)
-                selected_ids = []
-                selector_failed = True
-            if selected_ids:
-                selected_names = {self._cap_to_tool[cap_id] for cap_id in selected_ids}
-                selected_specs = [
-                    spec
-                    for spec in base_specs
-                    if spec["function"]["name"] in selected_names
-                ]
-            elif selector_failed:
-                # The selector errored — fall back to the full set so a broken
-                # selector never silently strips the model's tools.
-                selected_specs = base_specs
-            else:
-                # The selector ran and found nothing relevant for this turn (e.g.
-                # a greeting or small talk): offer no tools. Attaching every tool
-                # here would defeat the whole point of dynamic selection — a small
-                # prompt — and tempts a weak model into spurious tool calls.
-                selected_specs = []
+            # The selector ran. A concrete list (possibly empty) is authoritative:
+            # an empty selection means "no tool needed this turn" (e.g. a greeting),
+            # which is the whole point of dynamic selection — keep the prompt small
+            # rather than attaching every tool.
+            selected_names = {
+                self._cap_to_tool[cap_id]
+                for cap_id in selection
+                if cap_id in self._cap_to_tool
+            }
+            selected_specs = [
+                spec
+                for spec in base_specs
+                if spec["function"]["name"] in selected_names
+            ]
+        if self.tool_router is not None or self.tool_selector is not None:
             selected_specs = selected_specs[: self.max_active_tools]
 
         if allow_media and self._send_document_spec is not None:
@@ -795,6 +792,31 @@ class CoraxTelegramGateway:
                 ", ".join(spec["function"]["name"] for spec in selected_specs),
             )
         return selected_specs
+
+    async def _resolve_tool_selection(
+        self, user_text: str, base_specs: list[dict]
+    ) -> list[str] | None:
+        """Return selected capability ids, or ``None`` to offer the full set.
+
+        ``None`` means "no opinion" (static mode, or the router/selector raised)
+        and the caller offers every tool as a safety net. A concrete list — even
+        an empty one — is an authoritative selection for the turn.
+        """
+        if self.tool_router is not None:
+            try:
+                ids = await self.tool_router(user_text, base_specs)
+            except Exception as exc:  # noqa: BLE001 - routing must never break a turn
+                self.log.debug("tool router failed: %s", exc)
+                return None
+            return [str(cap_id) for cap_id in ids if str(cap_id) in self._cap_to_tool]
+        if self.tool_selector is not None:
+            try:
+                ids = self.tool_selector(user_text, base_specs)
+            except Exception as exc:  # noqa: BLE001 - selector must not break chat
+                self.log.debug("tool selector failed: %s", exc)
+                return None
+            return [str(cap_id) for cap_id in ids if str(cap_id) in self._cap_to_tool]
+        return None
 
     async def _send(self, chat_id: Any, text: str) -> None:
         await self._run(

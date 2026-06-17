@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import os
 import signal
 import sys
@@ -115,6 +116,50 @@ def _tool_capability_specs(runtime) -> list[dict]:
     return specs
 
 
+def _resolve_tool_routing(app: "CoraxApp", selector_available: bool) -> tuple[str, str]:
+    """Decide how tools are picked per turn, from ``CORAX_TOOL_ROUTER``.
+
+    Modes: ``llm`` (default) — ask the model which tools to activate;
+    ``lexical`` — the keyword/hint top-K selector; ``off`` — offer every tool.
+    Falls back gracefully when a mode's prerequisite is missing. Returns the
+    resolved mode and a human-readable label for the dashboard.
+    """
+    mode = (os.getenv("CORAX_TOOL_ROUTER") or "llm").strip().lower()
+    if mode == "off":
+        return "off", "static full list"
+    if mode == "lexical":
+        if selector_available:
+            return "lexical", "lexical top-K selector"
+        return "off", "static full list (no selector)"
+    # default: llm router (the chat path guarantees llm.local is loaded)
+    return "llm", f"llm router ({app.config.llm.model})"
+
+
+def _build_tool_routing(
+    routing_mode: str, kernel, specs: list[dict], selector, app: "CoraxApp"
+) -> dict:
+    """Build the gateway's tool-selection kwargs for the resolved routing mode."""
+    if routing_mode == "llm":
+        from corax.tool_router import LLMToolRouter
+
+        catalog = [
+            s
+            for s in specs
+            if s["id"] not in ("gateway", "llm.local", "telegram.connector")
+        ]
+        router = LLMToolRouter(
+            kernel.invoke,
+            catalog=catalog,
+            model=app.config.llm.model,
+            fallback=selector.select if selector.available else None,
+            log=logging.getLogger("corax.tool_router"),
+        )
+        return {"tool_router": router.route}
+    if routing_mode == "lexical":
+        return {"tool_selector": selector.select}
+    return {}
+
+
 def _chat_system_prompt(root_path: str | Path) -> str | None:
     """Load the operator-editable chat prompt files when present."""
     prompt_dir = Path(root_path) / "prompts"
@@ -151,6 +196,7 @@ async def _run_chat(app: "CoraxApp", config_path: Path) -> int:
 
     specs = _tool_capability_specs(runtime)
     selector = RuntimeToolSelector(app.config, root_path=runtime.root_path)
+    routing_mode, tool_mode_label = _resolve_tool_routing(app, selector.available)
     stream_transport = _telegram_stream_transport()
     system_prompt = _chat_system_prompt(runtime.root_path)
     tool_ids = [
@@ -167,7 +213,7 @@ async def _run_chat(app: "CoraxApp", config_path: Path) -> int:
         app,
         specs,
         tool_ids,
-        tool_discovery=selector.available,
+        tool_mode=tool_mode_label,
         stream_transport=stream_transport,
     )
 
@@ -183,9 +229,11 @@ async def _run_chat(app: "CoraxApp", config_path: Path) -> int:
                 "workspace_path": runtime.workspace_path,
                 "state_path": runtime.data_path / "telegram-gateway-fallback-state.json",
                 "profile_path": runtime.data_path / "profile.md",
-                "tool_selector": selector.select if selector.available else None,
                 "stream_transport": stream_transport,
             }
+            gateway_kwargs.update(
+                _build_tool_routing(routing_mode, kernel, specs, selector, app)
+            )
             if system_prompt is not None:
                 gateway_kwargs["system_prompt"] = system_prompt
             gateway = CoraxTelegramGateway(**gateway_kwargs)
@@ -197,6 +245,7 @@ async def _run_chat(app: "CoraxApp", config_path: Path) -> int:
             await runtime.reload_config(config_mod.load_config(config_path))
             specs = _tool_capability_specs(runtime)
             selector = RuntimeToolSelector(app.config, root_path=runtime.root_path)
+            routing_mode, tool_mode_label = _resolve_tool_routing(app, selector.available)
             stream_transport = _telegram_stream_transport()
             system_prompt = _chat_system_prompt(runtime.root_path)
             tool_ids = [
@@ -208,7 +257,7 @@ async def _run_chat(app: "CoraxApp", config_path: Path) -> int:
                 app,
                 specs,
                 tool_ids,
-                tool_discovery=selector.available,
+                tool_mode=tool_mode_label,
                 stream_transport=stream_transport,
             )
             continue
@@ -266,7 +315,7 @@ def _print_chat_dashboard(
     specs: list[dict],
     tool_ids: list[str],
     *,
-    tool_discovery: bool = False,
+    tool_mode: str = "static full list",
     stream_transport: str = "edit",
 ) -> None:
     runtime = app.runtime
@@ -281,7 +330,7 @@ def _print_chat_dashboard(
         ("gateway", "standalone capability" if has_gateway else "fallback local state"),
         ("connector", "telegram.connector" if has_telegram else "missing"),
         ("streaming", f"{stream_transport} transport"),
-        ("tool mode", "dynamic top-K selector" if tool_discovery else "static full list"),
+        ("tool mode", tool_mode),
         ("tools", ", ".join(tool_ids) or "none"),
         ("allowed chats", allowed_chats),
         ("workspace", str(runtime.workspace_path)),

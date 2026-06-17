@@ -175,6 +175,14 @@ async def _nosleep(_seconds):
     return None
 
 
+def _async_return(value):
+    """Build an async tool_router that always returns ``value``."""
+    async def _router(_query, _specs):
+        return value
+
+    return _router
+
+
 def _gateway(backend, **kwargs):
     kwargs.setdefault("capabilities", CAPS)
     kwargs.setdefault("sleep", _nosleep)
@@ -204,7 +212,7 @@ def _streamer_batches(batches):
     return stream_capability
 
 
-class ToolSpecTests(unittest.TestCase):
+class ToolSpecTests(unittest.IsolatedAsyncioTestCase):
     def test_tools_built_from_capabilities_excluding_infra(self) -> None:
         gw = _gateway(FakeBackend())
         names = {t["function"]["name"] for t in gw._tool_specs}
@@ -225,35 +233,56 @@ class ToolSpecTests(unittest.TestCase):
         self.assertIn("telegram_send_document", names)
         self.assertNotIn("gateway", names)
 
-    def test_active_tools_are_selected_per_turn(self) -> None:
+    async def test_active_tools_are_selected_per_turn(self) -> None:
         def selector(query, _specs):
             self.assertEqual(query, "read file")
             return ["filesystem"]
 
         gw = _gateway(FakeBackend(), tool_selector=selector)
-        names = {t["function"]["name"] for t in gw._active_tool_specs("read file", allow_media=False)}
+        names = {t["function"]["name"] for t in await gw._active_tool_specs("read file", allow_media=False)}
         self.assertEqual(names, {"filesystem"})
 
-    def test_empty_selection_offers_no_tools(self) -> None:
+    async def test_empty_selection_offers_no_tools(self) -> None:
         # A no-intent turn (selector returns nothing) must carry no tools, not
         # the whole catalogue — dynamic selection exists to keep the prompt small.
         gw = _gateway(FakeBackend(), tool_selector=lambda _query, _specs: [])
-        specs = gw._active_tool_specs("привет", allow_media=False)
+        specs = await gw._active_tool_specs("привет", allow_media=False)
         self.assertEqual(specs, [])
 
-    def test_selector_error_falls_back_to_all_tools(self) -> None:
+    async def test_selector_error_falls_back_to_all_tools(self) -> None:
         # A broken selector must not strip the model's tools.
         def boom(_query, _specs):
             raise RuntimeError("selector down")
 
         gw = _gateway(FakeBackend(), tool_selector=boom)
-        names = {t["function"]["name"] for t in gw._active_tool_specs("read file", allow_media=False)}
+        names = {t["function"]["name"] for t in await gw._active_tool_specs("read file", allow_media=False)}
         self.assertIn("filesystem", names)
 
-    def test_send_document_is_active_only_when_user_requested_media(self) -> None:
+    async def test_async_tool_router_selects_tools(self) -> None:
+        async def router(query, _specs):
+            self.assertEqual(query, "delete a file")
+            return ["filesystem"]
+
+        gw = _gateway(FakeBackend(), tool_router=router)
+        names = {t["function"]["name"] for t in await gw._active_tool_specs("delete a file", allow_media=False)}
+        self.assertEqual(names, {"filesystem"})
+
+    async def test_async_tool_router_empty_offers_no_tools(self) -> None:
+        gw = _gateway(FakeBackend(), tool_router=_async_return([]))
+        self.assertEqual(await gw._active_tool_specs("привет", allow_media=False), [])
+
+    async def test_async_tool_router_error_falls_back_to_all_tools(self) -> None:
+        async def boom(_query, _specs):
+            raise RuntimeError("router down")
+
+        gw = _gateway(FakeBackend(), tool_router=boom)
+        names = {t["function"]["name"] for t in await gw._active_tool_specs("read file", allow_media=False)}
+        self.assertIn("filesystem", names)
+
+    async def test_send_document_is_active_only_when_user_requested_media(self) -> None:
         gw = _gateway(FakeBackend(), tool_selector=lambda _query, _specs: ["filesystem"])
-        without_media = {t["function"]["name"] for t in gw._active_tool_specs("create file", allow_media=False)}
-        with_media = {t["function"]["name"] for t in gw._active_tool_specs("send file", allow_media=True)}
+        without_media = {t["function"]["name"] for t in await gw._active_tool_specs("create file", allow_media=False)}
+        with_media = {t["function"]["name"] for t in await gw._active_tool_specs("send file", allow_media=True)}
         self.assertNotIn("telegram_send_document", without_media)
         self.assertIn("telegram_send_document", with_media)
 
