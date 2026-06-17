@@ -171,14 +171,14 @@ async def _run_chat(app: "CoraxApp", config_path: Path) -> int:
 
 
 def _telegram_stream_transport() -> str:
-    transport = os.getenv("CORAX_TELEGRAM_STREAM_TRANSPORT", "auto").strip().lower()
+    transport = os.getenv("CORAX_TELEGRAM_STREAM_TRANSPORT", "edit").strip().lower()
     if transport in {"auto", "draft", "edit", "off"}:
         return transport
     _print_warning(
         "STREAMING",
-        f"invalid CORAX_TELEGRAM_STREAM_TRANSPORT={transport!r}; using auto.",
+        f"invalid CORAX_TELEGRAM_STREAM_TRANSPORT={transport!r}; using edit.",
     )
-    return "auto"
+    return "edit"
 
 
 async def _run_gateway_until_stopped(gateway: Any) -> str:
@@ -222,7 +222,7 @@ def _print_chat_dashboard(
     tool_ids: list[str],
     *,
     tool_discovery: bool = False,
-    stream_transport: str = "auto",
+    stream_transport: str = "edit",
 ) -> None:
     runtime = app.runtime
     executable = runtime.core.executable_ids(runtime.capabilities)

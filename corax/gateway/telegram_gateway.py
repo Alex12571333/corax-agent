@@ -80,7 +80,7 @@ class CoraxTelegramGateway:
         reveal_delay: float = 0.08,
         reveal_edit_interval_ms: int = 450,
         reveal_buffer_threshold: int = 28,
-        stream_transport: str = "auto",
+        stream_transport: str = "edit",
         system_prompt: str = _DEFAULT_SYSTEM_PROMPT,
         workspace_path: str | Path = "workspace",
         max_history_messages: int = 20,
