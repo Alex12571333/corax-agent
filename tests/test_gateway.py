@@ -325,6 +325,38 @@ class ChatToolLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("<|channel>", backend.sends)
         self.assertIn("hello", backend.sends)
 
+    async def test_streaming_strips_model_thought_markers(self) -> None:
+        backend = FakeBackend(poll_batches=[[_text_update(5, "hi")]])
+        gw = _gateway(
+            backend,
+            stream_capability=_streamer([
+                {"type": "delta", "content": "thought\n"},
+                {"type": "delta", "content": "thought▌\n"},
+                {"type": "delta", "content": "<thought>\n"},
+                {"type": "delta", "content": "Ответ готов."},
+                {"type": "done", "finish_reason": "stop", "tool_calls": []},
+            ]),
+        )
+        await gw.run(max_iterations=1)
+        stream_calls = [p for _c, op, p in backend.calls if op == "stream"]
+        self.assertTrue(stream_calls[-1]["done"])
+        self.assertEqual(stream_calls[-1]["text"], "Ответ готов.")
+        self.assertNotIn("thought", "\n".join(backend.sends).lower())
+
+    async def test_streaming_drops_only_thought_markers(self) -> None:
+        backend = FakeBackend(poll_batches=[[_text_update(5, "hi")]])
+        gw = _gateway(
+            backend,
+            stream_capability=_streamer([
+                {"type": "delta", "content": "thought\n"},
+                {"type": "delta", "content": "thought▌\n"},
+                {"type": "done", "finish_reason": "stop", "tool_calls": []},
+            ]),
+        )
+        await gw.run(max_iterations=1)
+        self.assertEqual([p for _c, op, p in backend.calls if op == "stream"], [])
+        self.assertIn("(no response)", backend.sends)
+
     async def test_stream_transport_can_be_overridden(self) -> None:
         backend = FakeBackend(poll_batches=[[_text_update(5, "hi", chat_type="private")]])
         gw = _gateway(

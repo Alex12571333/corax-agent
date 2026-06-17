@@ -51,11 +51,11 @@ _MEDIA_REQUEST = re.compile(
     re.IGNORECASE,
 )
 _MODEL_CHANNEL_MARKER = re.compile(
-    r"<\|?(?:channel|analysis|commentary|final|assistant)\|?>",
+    r"<\|?(?:channel|analysis|commentary|final|assistant|thought|reasoning)\|?>",
     re.IGNORECASE,
 )
 _MODEL_CHANNEL_MARKER_LINE = re.compile(
-    r"^\s*<\|?(?:channel|analysis|commentary|final|assistant)\|?>\s*$",
+    r"^\s*(?:<\|?(?:channel|analysis|commentary|final|assistant|thought|reasoning)\|?>|thought|reasoning)\s*[▌|]?\s*$",
     re.IGNORECASE,
 )
 _SEND_DOCUMENT_TOOL = "telegram_send_document"
@@ -711,7 +711,9 @@ class CoraxTelegramGateway:
 
     def _sanitize_model_text(self, text: str) -> str:
         """Remove chat-template control markers that some local models emit."""
-        if not _MODEL_CHANNEL_MARKER.search(text):
+        if not _MODEL_CHANNEL_MARKER.search(text) and not any(
+            _MODEL_CHANNEL_MARKER_LINE.fullmatch(line) for line in text.splitlines()
+        ):
             return text
         lines = [
             line
