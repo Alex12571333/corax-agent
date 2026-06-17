@@ -296,6 +296,23 @@ class ChatToolLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stream_calls[-1]["draft_id"], stream_calls[0]["draft_id"])
         self.assertEqual(backend.sends.count("hello there"), 1)
 
+    async def test_streaming_strips_model_channel_marker(self) -> None:
+        backend = FakeBackend(poll_batches=[[_text_update(5, "hi")]])
+        gw = _gateway(
+            backend,
+            stream_capability=_streamer([
+                {"type": "delta", "content": "<|channel>\n"},
+                {"type": "delta", "content": "hello"},
+                {"type": "done", "finish_reason": "stop", "tool_calls": []},
+            ]),
+        )
+        await gw.run(max_iterations=1)
+        stream_calls = [p for _c, op, p in backend.calls if op == "stream"]
+        self.assertTrue(stream_calls[-1]["done"])
+        self.assertEqual(stream_calls[-1]["text"], "hello")
+        self.assertNotIn("<|channel>", backend.sends)
+        self.assertIn("hello", backend.sends)
+
     async def test_stream_transport_can_be_overridden(self) -> None:
         backend = FakeBackend(poll_batches=[[_text_update(5, "hi", chat_type="private")]])
         gw = _gateway(
@@ -693,6 +710,16 @@ class ChatToolLoopTests(unittest.IsolatedAsyncioTestCase):
         gw = _gateway(backend)
         await gw.run(max_iterations=1)
         self.assertIn("(no response)", backend.sends)
+
+    async def test_final_answer_strips_model_channel_marker(self) -> None:
+        backend = FakeBackend(
+            poll_batches=[[_text_update(5, "hi")]],
+            llm_responses=[{"text": "<channel>\nПривет"}],
+        )
+        gw = _gateway(backend, stream_capability=None)
+        await gw.run(max_iterations=1)
+        self.assertNotIn("<channel>", backend.sends)
+        self.assertIn("Привет", backend.sends)
 
     async def test_typing_sent_before_generate(self) -> None:
         backend = FakeBackend(poll_batches=[[_text_update(5, "hi")]], llm_responses=[{"text": "ok"}])

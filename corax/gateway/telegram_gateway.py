@@ -50,6 +50,14 @@ _MEDIA_REQUEST = re.compile(
     r"(пришл|отправ|скинь|скинут|перешл|прикреп|загруз)",
     re.IGNORECASE,
 )
+_MODEL_CHANNEL_MARKER = re.compile(
+    r"<\|?(?:channel|analysis|commentary|final|assistant)\|?>",
+    re.IGNORECASE,
+)
+_MODEL_CHANNEL_MARKER_LINE = re.compile(
+    r"^\s*<\|?(?:channel|analysis|commentary|final|assistant)\|?>\s*$",
+    re.IGNORECASE,
+)
 _SEND_DOCUMENT_TOOL = "telegram_send_document"
 _LOG_VALUE_LIMIT = 140
 
@@ -399,13 +407,14 @@ class CoraxTelegramGateway:
                 if not isinstance(content, str) or not content:
                     continue
                 text += content
+                clean_text = self._sanitize_model_text(text)
                 elapsed_ms = (time.monotonic() - last_edit_at) * 1000
-                if not self._should_flush_stream(text, last_sent, elapsed_ms):
+                if not self._should_flush_stream(clean_text, last_sent, elapsed_ms):
                     continue
                 stream_payload = await self._stream_edit(
                     chat_id,
                     message_id,
-                    text,
+                    clean_text,
                     last_sent,
                     done=False,
                     elapsed_ms=10 ** 9 if not last_sent else elapsed_ms,
@@ -415,7 +424,7 @@ class CoraxTelegramGateway:
                 message_id = stream_payload.get("message_id", message_id)
                 if stream_payload.get("edited"):
                     sent_text = stream_payload.get("sent_text")
-                    last_sent = sent_text if isinstance(sent_text, str) else text
+                    last_sent = sent_text if isinstance(sent_text, str) else clean_text
                     last_edit_at = time.monotonic()
             elif event_type == "done":
                 raw_tool_calls = event.get("tool_calls")
@@ -425,6 +434,7 @@ class CoraxTelegramGateway:
                     finish_reason = event["finish_reason"]
                 break
 
+        text = self._sanitize_model_text(text)
         if text:
             await self._stream_edit(
                 chat_id,
@@ -644,12 +654,24 @@ class CoraxTelegramGateway:
         )
 
     async def _deliver_final(self, chat_id: Any, text: str, *, allow_media: bool = True) -> str:
-        clean_text, media_paths = self._extract_media_paths(text)
+        clean_text, media_paths = self._extract_media_paths(self._sanitize_model_text(text))
         await self._reveal(chat_id, clean_text or "(no response)")
         if allow_media:
             for media_path in media_paths:
                 await self._send_document(chat_id, media_path)
         return clean_text or "(no response)"
+
+    def _sanitize_model_text(self, text: str) -> str:
+        """Remove chat-template control markers that some local models emit."""
+        if not _MODEL_CHANNEL_MARKER.search(text):
+            return text
+        lines = [
+            line
+            for line in text.splitlines()
+            if not _MODEL_CHANNEL_MARKER_LINE.fullmatch(line)
+        ]
+        cleaned = "\n".join(lines).strip()
+        return _MODEL_CHANNEL_MARKER.sub("", cleaned).strip()
 
     def _extract_media_paths(self, text: str) -> tuple[str, list[Path]]:
         lines: list[str] = []
