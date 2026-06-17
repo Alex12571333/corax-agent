@@ -21,6 +21,33 @@ class RuntimeToolSelectorTests(unittest.TestCase):
         self.assertNotIn("gateway", selected)
         self.assertNotIn("telegram.connector", selected)
 
+    def test_file_request_selects_filesystem_not_web_search(self) -> None:
+        # Regression: a low-risk web-search tool used to be the only survivor of
+        # the selector's prefer-safe penalty on unrecognised file phrasings, so
+        # the model misrouted file ops (list/delete) to web.search. File intents
+        # must select filesystem and never strand the model with only web.search.
+        selector = RuntimeToolSelector(default_config(), root_path=REPO_ROOT)
+        for query in (
+            "покажи список файлов в папке",
+            "удали файл weather_mokpo_tomorrow.txt",
+            "прочитай файл notes.txt",
+            "delete the file report.txt",
+        ):
+            selected = selector.select(query, [])
+            self.assertIn("filesystem", selected, query)
+            self.assertNotEqual(selected, ["web.search"], query)
+
+    def test_web_query_selects_web_search(self) -> None:
+        selector = RuntimeToolSelector(default_config(), root_path=REPO_ROOT)
+        for query in ("какая погода в Мокпо завтра", "найди последние новости"):
+            self.assertIn("web.search", selector.select(query, []), query)
+
+    def test_no_tool_intent_returns_empty_for_full_fallback(self) -> None:
+        # No relevance signal -> empty selection so the gateway offers the full
+        # tool set (rather than a single irrelevant tool).
+        selector = RuntimeToolSelector(default_config(), root_path=REPO_ROOT)
+        self.assertEqual(selector.select("привет, как дела", []), [])
+
 
 if __name__ == "__main__":
     unittest.main()

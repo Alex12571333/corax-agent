@@ -15,6 +15,15 @@ from .config import AgentConfig
 
 _INTERNAL_IDS = ("gateway", "llm.local", "telegram.connector")
 
+# A tool with no genuine relevance signal still scores a small positive value
+# from the selector's constant capability-type bonus (e.g. a low-risk web search
+# nets ~+0.15 with zero keyword/hint match). Requiring a real signal keeps such a
+# tool from becoming the *only* selected tool on an unrecognised phrasing — in
+# which case the gateway correctly falls back to offering the full tool set
+# rather than stranding the model with one irrelevant tool. Genuine matches
+# (keyword/tag/operation/hint) score well above this floor.
+_MIN_RELEVANCE_SCORE = 1.0
+
 
 class RuntimeToolSelector:
     """Select active capability ids for a single user request."""
@@ -62,6 +71,7 @@ class RuntimeToolSelector:
             return []
         options = self._options_cls(
             top_k=self.top_k,
+            min_score=_MIN_RELEVANCE_SCORE,
             exclude_ids=_INTERNAL_IDS,
             capability_type="tool",
             max_permission="dangerous",
