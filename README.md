@@ -39,12 +39,16 @@ pip install -e ".[yaml,dev]"
 ## Usage
 
 ```bash
-python main.py            # open the settings menu (default)
-python main.py --menu     # open the settings menu
-python main.py --status   # print runtime status and exit
-python main.py --init     # create config + workspace/data/logs and exit
-python main.py --config ./corax.yaml
+corax setup                 # first-run/settings menu
+corax gateway               # run the Telegram chat gateway
+corax status                # print runtime status and exit
+corax init                  # create config + workspace/data/logs and exit
+corax --config ./corax.yaml setup
 ```
+
+Legacy development aliases still work (`python main.py --chat`,
+`python main.py --status`, `python main.py --init`), but the public CLI shape is
+`corax <command>`.
 
 ## Project layout
 

@@ -2,11 +2,11 @@
 """Corax Agent — CLI entrypoint.
 
 Usage:
-    python main.py                 # open the settings menu (default)
-    python main.py --menu          # open the settings menu
-    python main.py --status        # print runtime status and exit
-    python main.py --init          # create config + workspace/data/logs and exit
-    python main.py --config PATH    # use an explicit config file
+    corax setup                    # open the first-run/settings menu
+    corax gateway                  # run the Telegram gateway
+    corax status                   # print runtime status and exit
+    corax init                     # create config + workspace/data/logs and exit
+    corax --config PATH setup      # use an explicit config file
 """
 
 from __future__ import annotations
@@ -34,14 +34,20 @@ _CYAN = "\033[36m"
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="corax-agent",
-        description="Corax Agent — minimal agent scaffold.",
+        prog="corax",
+        description="Corax Agent — local agent runtime, setup, and gateways.",
     )
-    parser.add_argument("--menu", action="store_true", help="open the settings menu (default)")
-    parser.add_argument("--status", action="store_true", help="print runtime status and exit")
-    parser.add_argument("--chat", action="store_true", help="run the Telegram gateway (connectors routed through the core kernel)")
-    parser.add_argument("--init", action="store_true", help="create config and directories, then exit")
     parser.add_argument("--config", metavar="PATH", help="path to the config file (yaml or json)")
+    parser.add_argument(
+        "command",
+        nargs="?",
+        choices=("setup", "gateway", "status", "init", "menu"),
+        help="command to run (default: setup)",
+    )
+    parser.add_argument("--menu", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--status", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--chat", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--init", action="store_true", help=argparse.SUPPRESS)
     return parser
 
 
@@ -53,25 +59,42 @@ def _resolve_config_path(arg: str | None) -> Path:
 
 async def _run(args: argparse.Namespace) -> int:
     config_path = _resolve_config_path(args.config)
+    command = _resolve_command(args)
 
-    if args.init:
+    if command == "init":
         return _do_init(config_path)
 
     app = CoraxApp(config_path)
     await app.boot()
     try:
-        if args.status:
+        if command == "status":
             status = await app.runtime.status()
             print("\nCorax runtime status\n")
             print(status.render())
             print()
-        elif args.chat:
+        elif command == "gateway":
             return await _run_chat(app, config_path)
         else:
+            _print_setup_overview(app)
             await app.run_menu()
     finally:
         await app.shutdown()
     return 0
+
+
+def _resolve_command(args: argparse.Namespace) -> str:
+    """Resolve modern subcommands plus legacy flags into one command name."""
+    if args.init:
+        return "init"
+    if args.chat:
+        return "gateway"
+    if args.status:
+        return "status"
+    if args.menu:
+        return "setup"
+    if args.command == "menu":
+        return "setup"
+    return args.command or "setup"
 
 
 def _tool_capability_specs(runtime) -> list[dict]:
@@ -269,6 +292,26 @@ def _print_chat_dashboard(
     print(_style("-" * 64, _DIM))
     for label, value in rows:
         print(f"{_style(label.rjust(13), _DIM)}  {_style(value, _GREEN if label in {'kernel', 'gateway'} else '')}")
+    print(_style("-" * 64, _DIM))
+
+
+def _print_setup_overview(app: "CoraxApp") -> None:
+    runtime = app.runtime
+    print()
+    print(_style("Corax Setup", _BOLD + _CYAN))
+    print(_style("-" * 64, _DIM))
+    rows = [
+        ("config", str(app.config_path)),
+        ("profile", app.config.agent.profile),
+        ("model", app.config.llm.model),
+        ("telegram", "configured" if os.getenv("CORAX_TELEGRAM_BOT_TOKEN") else "token missing"),
+        ("web search", app.config.websearch.base_url),
+        ("workspace", str(runtime.workspace_path)),
+        ("next", "corax gateway"),
+    ]
+    for label, value in rows:
+        color = _YELLOW if value == "token missing" else ""
+        print(f"{_style(label.rjust(10), _DIM)}  {_style(value, color)}")
     print(_style("-" * 64, _DIM))
 
 

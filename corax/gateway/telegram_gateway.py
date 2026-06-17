@@ -245,6 +245,7 @@ class CoraxTelegramGateway:
         self._recent_files: dict[str, list[str]] = {}
         self._last_assistant_by_session: dict[str, str] = {}
         self._offset: int | None = None
+        self._bot_menu_synced = False
         self._load_fallback_state()
         self._reload = False
         self._stop = False
@@ -254,6 +255,7 @@ class CoraxTelegramGateway:
         """Run the poll/dispatch loop. Returns ``"reload"`` or ``"stopped"``."""
         self._reload = False
         self._stop = False
+        await self._ensure_bot_menu()
         iterations = 0
         while not self._stop and not self._reload:
             try:
@@ -339,6 +341,8 @@ class CoraxTelegramGateway:
                 await self._send(chat_id, f"✅ Model set to {args}")
             else:
                 await self._send(chat_id, f"Current model: {self.model or 'default'}")
+        elif name == "status":
+            await self._send(chat_id, self._status_text(chat_id))
         elif name == "help":
             await self._send(chat_id, command.get("reply") or "Send a message to chat.")
         elif name == "cancel":
@@ -445,6 +449,35 @@ class CoraxTelegramGateway:
             await self._run(self.telegram_id, {"operation": "chat_action", "chat_id": chat_id})
         except Exception as exc:  # noqa: BLE001
             self.log.debug("chat action failed: %s", exc)
+
+    async def _ensure_bot_menu(self) -> None:
+        """Best-effort native Telegram menu setup."""
+        if self._bot_menu_synced:
+            return
+        self._bot_menu_synced = True
+        try:
+            await self._run(self.telegram_id, {"operation": "set_bot_commands"})
+        except Exception as exc:  # noqa: BLE001 - menu setup must not block chat
+            self.log.debug("telegram bot menu setup failed: %s", exc)
+
+    def _status_text(self, chat_id: Any) -> str:
+        session_id = self._sessions.get(self._session_key(chat_id)) or "(not started)"
+        tools = ", ".join(
+            spec["function"]["name"]
+            for spec in self._tool_specs
+            if spec["function"]["name"] != _SEND_DOCUMENT_TOOL
+        ) or "none"
+        tool_mode = "dynamic top-K selector" if self.tool_selector is not None else "static list"
+        state = "gateway capability" if self._has_gateway_capability else "local fallback state"
+        return (
+            "Corax status\n"
+            f"model: {self.model or 'default'}\n"
+            f"session: {session_id}\n"
+            f"state: {state}\n"
+            f"tools: {tools}\n"
+            f"tool mode: {tool_mode}\n"
+            f"streaming: {self.stream_transport}"
+        )
 
     async def _generate(
         self,

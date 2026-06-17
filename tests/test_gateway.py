@@ -132,6 +132,8 @@ class FakeBackend:
         if op == "send_document":
             self.documents.append(payload)
             return {"message_id": 2}
+        if op == "set_bot_commands":
+            return {"ok": True, "commands": payload.get("commands", [])}
         if op == "stream":  # progressive reveal of the final answer
             if payload.get("done"):
                 self.sends.append(payload["text"])
@@ -919,6 +921,18 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         await gw.run(max_iterations=1)
         self.assertEqual(gw.model, "gemma-4")
         self.assertTrue(any("Current model" in s for s in backend.sends))
+
+    async def test_status_command(self) -> None:
+        backend = FakeBackend(poll_batches=[[_cmd_update(5, "status")]])
+        await _gateway(backend, model="gemma-4").run(max_iterations=1)
+        self.assertTrue(any("Corax status" in s and "gemma-4" in s for s in backend.sends))
+
+    async def test_bot_menu_is_synced_on_start(self) -> None:
+        backend = FakeBackend(poll_batches=[[]])
+        await _gateway(backend).run(max_iterations=1)
+        self.assertTrue(
+            any(cap_id == "telegram.connector" and op == "set_bot_commands" for cap_id, op, _ in backend.calls)
+        )
 
     async def test_help_cancel_unknown(self) -> None:
         backend = FakeBackend(poll_batches=[[
