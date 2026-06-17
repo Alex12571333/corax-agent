@@ -399,14 +399,16 @@ class CoraxTelegramGateway:
                 if not isinstance(content, str) or not content:
                     continue
                 text += content
-                elapsed_ms = 10 ** 9 if message_id is None else (time.monotonic() - last_edit_at) * 1000
+                elapsed_ms = (time.monotonic() - last_edit_at) * 1000
+                if not self._should_flush_stream(text, last_sent, elapsed_ms):
+                    continue
                 stream_payload = await self._stream_edit(
                     chat_id,
                     message_id,
                     text,
                     last_sent,
                     done=False,
-                    elapsed_ms=elapsed_ms,
+                    elapsed_ms=10 ** 9 if not last_sent else elapsed_ms,
                     chat_type=chat_type,
                     draft_id=draft_id,
                 )
@@ -440,6 +442,20 @@ class CoraxTelegramGateway:
             "finish_reason": finish_reason,
             "_streamed": bool(text and not tool_calls),
         }
+
+    def _should_flush_stream(self, text: str, last_sent: str, elapsed_ms: float) -> bool:
+        """Return True when a buffered LLM stream should hit Telegram.
+
+        This keeps fast model token streams from being slowed down by a
+        kernel-mediated Telegram task for every tiny delta. The connector still
+        enforces its own throttle; this pre-filter avoids most no-op calls.
+        """
+        if not text:
+            return False
+        if not last_sent:
+            return True
+        pending = max(0, len(text) - len(last_sent))
+        return elapsed_ms >= self.reveal_edit_interval_ms or pending >= self.reveal_buffer_threshold
 
     async def _reveal(self, chat_id: Any, text: str) -> None:
         """Stream the final answer in by progressively editing one message."""
