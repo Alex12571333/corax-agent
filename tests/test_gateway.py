@@ -183,6 +183,22 @@ class ToolSpecTests(unittest.TestCase):
         self.assertIn("telegram_send_document", names)
         self.assertNotIn("gateway", names)
 
+    def test_active_tools_are_selected_per_turn(self) -> None:
+        def selector(query, _specs):
+            self.assertEqual(query, "read file")
+            return ["filesystem"]
+
+        gw = _gateway(FakeBackend(), tool_selector=selector)
+        names = {t["function"]["name"] for t in gw._active_tool_specs("read file", allow_media=False)}
+        self.assertEqual(names, {"filesystem"})
+
+    def test_send_document_is_active_only_when_user_requested_media(self) -> None:
+        gw = _gateway(FakeBackend(), tool_selector=lambda _query, _specs: ["filesystem"])
+        without_media = {t["function"]["name"] for t in gw._active_tool_specs("create file", allow_media=False)}
+        with_media = {t["function"]["name"] for t in gw._active_tool_specs("send file", allow_media=True)}
+        self.assertNotIn("telegram_send_document", without_media)
+        self.assertIn("telegram_send_document", with_media)
+
     def test_shell_tool_log_args_are_compact(self) -> None:
         gw = _gateway(FakeBackend())
         command = "python3 -c \"" + "\n".join(f"print({i})" for i in range(30)) + "\""
@@ -230,6 +246,24 @@ class ChatToolLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(gen["messages"][0]["role"], "system")
         self.assertEqual(gen["messages"][1]["role"], "user")
         self.assertRegex(gen["messages"][1]["content"], r"^\[[A-Z][a-z]{2} \d{4}-\d{2}-\d{2} ")
+
+    async def test_generate_receives_only_active_selected_tools(self) -> None:
+        backend = FakeBackend(
+            poll_batches=[[_text_update(5, "исправь файл")]],
+            llm_responses=[{"text": "ok"}],
+        )
+        gw = _gateway(
+            backend,
+            capabilities=[
+                *CAPS,
+                {"id": "editor", "description": "editor", "input_schema": {"type": "object", "properties": {}}},
+            ],
+            tool_selector=lambda _query, _specs: ["editor", "filesystem"],
+        )
+        await gw.run(max_iterations=1)
+        gen = next(p for _c, op, p in backend.calls if op == "generate")
+        names = {tool["function"]["name"] for tool in gen["tools"]}
+        self.assertEqual(names, {"editor", "filesystem"})
 
     async def test_gateway_capability_prepares_and_records_turn(self) -> None:
         backend = FakeBackend(

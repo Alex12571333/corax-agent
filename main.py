@@ -107,8 +107,10 @@ async def _run_chat(app: "CoraxApp", config_path: Path) -> int:
 
     from corax.gateway import CoraxTelegramGateway
     from corax.gateway.policy import GatewayPolicyEngine
+    from corax.tool_discovery import RuntimeToolSelector
 
     specs = _tool_capability_specs(runtime)
+    selector = RuntimeToolSelector(app.config, root_path=runtime.root_path)
     tool_ids = [
         s["id"]
         for s in specs
@@ -119,7 +121,7 @@ async def _run_chat(app: "CoraxApp", config_path: Path) -> int:
             "SECURITY",
             "no CORAX_TELEGRAM_ALLOWED_CHATS set; anyone who can message the bot can drive these tools.",
         )
-    _print_chat_dashboard(app, specs, tool_ids)
+    _print_chat_dashboard(app, specs, tool_ids, tool_discovery=selector.available)
 
     while True:
         async with runtime.core.session(
@@ -130,6 +132,7 @@ async def _run_chat(app: "CoraxApp", config_path: Path) -> int:
                 capabilities=specs,
                 model=app.config.llm.model,
                 workspace_path=runtime.workspace_path,
+                tool_selector=selector.select if selector.available else None,
             )
             print(_style("Corax Telegram gateway is running. Ctrl-C to stop.", _GREEN))
             outcome = await gateway.run()
@@ -138,17 +141,24 @@ async def _run_chat(app: "CoraxApp", config_path: Path) -> int:
             print(_style("Reloading agent...", _YELLOW))
             await runtime.reload_config(config_mod.load_config(config_path))
             specs = _tool_capability_specs(runtime)
+            selector = RuntimeToolSelector(app.config, root_path=runtime.root_path)
             tool_ids = [
                 s["id"]
                 for s in specs
                 if s["id"] not in ("gateway", "llm.local", "telegram.connector")
             ]
-            _print_chat_dashboard(app, specs, tool_ids)
+            _print_chat_dashboard(app, specs, tool_ids, tool_discovery=selector.available)
             continue
         return 0
 
 
-def _print_chat_dashboard(app: "CoraxApp", specs: list[dict], tool_ids: list[str]) -> None:
+def _print_chat_dashboard(
+    app: "CoraxApp",
+    specs: list[dict],
+    tool_ids: list[str],
+    *,
+    tool_discovery: bool = False,
+) -> None:
     runtime = app.runtime
     executable = runtime.core.executable_ids(runtime.capabilities)
     has_gateway = any(spec["id"] == "gateway" for spec in specs)
@@ -160,6 +170,7 @@ def _print_chat_dashboard(app: "CoraxApp", specs: list[dict], tool_ids: list[str
         ("kernel", f"ready, {len(executable)} executable capability(ies)"),
         ("gateway", "standalone capability" if has_gateway else "fallback in-process memory"),
         ("connector", "telegram.connector" if has_telegram else "missing"),
+        ("tool mode", "dynamic top-K selector" if tool_discovery else "static full list"),
         ("tools", ", ".join(tool_ids) or "none"),
         ("allowed chats", allowed_chats),
         ("workspace", str(runtime.workspace_path)),
