@@ -33,6 +33,7 @@ CAPABILITY_ROOTS = {
     "filesystem": REPO_ROOT.parent / "corax-filesystem-capability",
     "editor": REPO_ROOT.parent / "corax-editor-capability",
     "shell": REPO_ROOT.parent / "corax-shell-capability",
+    "gateway": REPO_ROOT.parent / "corax-gateway-capability",
 }
 
 
@@ -54,7 +55,7 @@ class TestRuntime(unittest.TestCase):
         # The package capabilities load only when agent-sdk is installed AND the
         # sibling repos are present on disk.
         if HAS_AGENT_SDK:
-            for cap_id in ("filesystem", "editor", "shell"):
+            for cap_id in ("filesystem", "editor", "shell", "gateway"):
                 if CAPABILITY_ROOTS[cap_id].is_dir():
                     self.assertTrue(self.runtime.capabilities.has(cap_id))
 
@@ -67,7 +68,15 @@ class TestRuntime(unittest.TestCase):
         self.assertEqual(status.connectors_active, ["terminal"])
         self.assertEqual(
             status.capabilities_enabled,
-            ["echo", "filesystem", "editor", "shell", "llm.local", "telegram.connector"],
+            [
+                "echo",
+                "filesystem",
+                "editor",
+                "shell",
+                "gateway",
+                "llm.local",
+                "telegram.connector",
+            ],
         )
         self.assertEqual(status.registry_counts["providers"], 1)
         self.assertIn("RUNNING", status.render())

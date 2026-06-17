@@ -225,7 +225,15 @@ def default_config() -> AgentConfig:
             },
         ),
         capabilities=CapabilitiesConfig(
-            enabled=["echo", "filesystem", "editor", "shell", "llm.local", "telegram.connector"],
+            enabled=[
+                "echo",
+                "filesystem",
+                "editor",
+                "shell",
+                "gateway",
+                "llm.local",
+                "telegram.connector",
+            ],
             available={
                 "echo": ProviderSpec(
                     enabled=True, type="tool",
@@ -248,6 +256,12 @@ def default_config() -> AgentConfig:
                     type="tool",
                     description="Guarded local shell command capability",
                     path="../corax-shell-capability",
+                ),
+                "gateway": ProviderSpec(
+                    enabled=True,
+                    type="tool",
+                    description="Channel-agnostic gateway policy and session context",
+                    path="../corax-gateway-capability",
                 ),
                 "llm.local": ProviderSpec(
                     enabled=True,

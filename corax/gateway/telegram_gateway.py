@@ -15,15 +15,35 @@ capabilities become available automatically, with no per-tool wiring.
 
 from __future__ import annotations
 
+import datetime
 import json
 import logging
+from pathlib import Path
 import re
 import uuid
 from typing import Any, Awaitable, Callable, Iterable
 
+_DEFAULT_SYSTEM_PROMPT = (
+    "You are Corax, a helpful assistant running locally on the user's machine. "
+    "When the user asks you to act, use the available tools rather than guessing. "
+    "For file creation, reading, editing, and deletion, prefer the filesystem or "
+    "editor tools over shell commands. Reply in the user's language. "
+    "Only when the user explicitly asks you to send, attach, share, or upload a "
+    "local file, use the telegram_send_document tool. Do not send files just "
+    "because you created them. If the user asks for the file you just created "
+    "or discussed, use the recent local files context to choose the matching path."
+)
+
 RunCapability = Callable[..., Awaitable[dict]]
 
 _SAFE_TOOL_NAME = re.compile(r"[^a-zA-Z0-9_-]")
+_MEDIA_LINE = re.compile(r"^\s*MEDIA:\s*(?P<path>\S.*?)\s*$")
+_MEDIA_REQUEST = re.compile(
+    r"\b(send|attach|share|upload)\b|"
+    r"(пришл|отправ|скинь|скинут|перешл|прикреп|загруз)",
+    re.IGNORECASE,
+)
+_SEND_DOCUMENT_TOOL = "telegram_send_document"
 
 
 class GatewayError(RuntimeError):
@@ -38,6 +58,7 @@ class CoraxTelegramGateway:
         *,
         run_capability: RunCapability,
         capabilities: Iterable[dict] = (),
+        gateway_id: str = "gateway",
         llm_id: str = "llm.local",
         telegram_id: str = "telegram.connector",
         model: str | None = None,
@@ -47,11 +68,16 @@ class CoraxTelegramGateway:
         max_tool_result_chars: int = 4000,
         reveal_chunk: int = 64,
         reveal_delay: float = 0.2,
+        system_prompt: str = _DEFAULT_SYSTEM_PROMPT,
+        workspace_path: str | Path = "workspace",
+        max_history_messages: int = 20,
+        max_recent_files: int = 10,
         log: logging.Logger | None = None,
         new_session: Callable[[], str] | None = None,
         sleep: Callable[[float], Awaitable[None]] | None = None,
     ) -> None:
         self._run = run_capability
+        self.gateway_id = gateway_id
         self.llm_id = llm_id
         self.telegram_id = telegram_id
         self.model = model
@@ -61,6 +87,10 @@ class CoraxTelegramGateway:
         self.max_tool_result_chars = max_tool_result_chars
         self.reveal_chunk = reveal_chunk
         self.reveal_delay = reveal_delay
+        self.system_prompt = system_prompt
+        self.workspace_path = Path(workspace_path).expanduser()
+        self.max_history_messages = max(0, max_history_messages)
+        self.max_recent_files = max(0, max_recent_files)
         self.log = log or logging.getLogger("corax.gateway")
         self._new_session = new_session or (lambda: f"chat-{uuid.uuid4().hex[:8]}")
         self._sleep = sleep or _async_sleep
@@ -69,9 +99,12 @@ class CoraxTelegramGateway:
         # the chat infrastructure itself (the LLM and the Telegram connector).
         self._tool_specs: list[dict] = []
         self._tool_to_cap: dict[str, str] = {}
-        for cap in capabilities:
+        capability_list = list(capabilities)
+        self._has_gateway_capability = any(cap.get("id") == gateway_id for cap in capability_list)
+        has_telegram_connector = any(cap.get("id") == telegram_id for cap in capability_list)
+        for cap in capability_list:
             cap_id = cap.get("id")
-            if not cap_id or cap_id in (llm_id, telegram_id):
+            if not cap_id or cap_id in (gateway_id, llm_id, telegram_id):
                 continue
             name = _SAFE_TOOL_NAME.sub("_", cap_id)
             self._tool_to_cap[name] = cap_id
@@ -88,8 +121,31 @@ class CoraxTelegramGateway:
                     },
                 }
             )
+        if has_telegram_connector:
+            self._tool_specs.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": _SEND_DOCUMENT_TOOL,
+                        "description": (
+                            "Send a local file to the current Telegram chat. Use only after "
+                            "the user explicitly asks to send, attach, share, or upload a file."
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string"},
+                                "caption": {"type": "string"},
+                            },
+                            "required": ["path"],
+                        },
+                    },
+                }
+            )
 
         self._sessions: dict[Any, str] = {}
+        self._history: dict[str, list[dict[str, Any]]] = {}
+        self._recent_files: dict[str, list[str]] = {}
         self._offset: int | None = None
         self._reload = False
         self._stop = False
@@ -150,7 +206,21 @@ class CoraxTelegramGateway:
     async def _handle_command(self, chat_id: Any, command: dict) -> None:
         name = command.get("command")
         if name == "new_session":
-            self._sessions[chat_id] = self._new_session()
+            session_id = self._new_session()
+            self._sessions[chat_id] = session_id
+            if self._has_gateway_capability:
+                try:
+                    await self._run(
+                        self.gateway_id,
+                        {
+                            "operation": "new_session",
+                            "channel": "telegram",
+                            "conversation_id": chat_id,
+                            "session_id": session_id,
+                        },
+                    )
+                except Exception as exc:  # noqa: BLE001 - command reply should still work
+                    self.log.debug("gateway new_session failed: %s", exc)
             await self._send(chat_id, command.get("reply") or "🆕 New session started.")
         elif name == "reload_agent":
             await self._send(chat_id, command.get("reply") or "♻️ Reloading the agent…")
@@ -170,8 +240,11 @@ class CoraxTelegramGateway:
             await self._send(chat_id, "Unknown command. Send /help.")
 
     async def _handle_chat(self, chat_id: Any, text: str) -> None:
-        session_id = self._session_for(chat_id)
-        messages: list[dict[str, Any]] = [{"role": "user", "content": text}]
+        prepared = await self._prepare_turn(chat_id, text)
+        session_id = prepared["session_id"]
+        allow_media = bool(prepared["allow_outbound_file"])
+        user_message = prepared["user_message"]
+        messages = prepared["messages"]
         final_text = ""
         for _ in range(self.max_tool_iterations):
             await self._typing(chat_id)  # show "typing…" while the agent works
@@ -197,10 +270,22 @@ class CoraxTelegramGateway:
                 }
             )
             for tool_call in tool_calls:
-                await self._run_tool(messages, tool_call)
+                await self._run_tool(
+                    messages,
+                    tool_call,
+                    chat_id=chat_id,
+                    session_id=session_id,
+                    allow_media=allow_media,
+                    user_text=text,
+                )
         else:
             final_text = "⚠️ Stopped: too many tool steps."
-        await self._reveal(chat_id, final_text or "(no response)")
+        delivered_text = await self._deliver_final(
+            chat_id,
+            final_text or "(no response)",
+            allow_media=allow_media,
+        )
+        await self._record_turn(session_id, text, user_message, delivered_text)
 
     async def _typing(self, chat_id: Any) -> None:
         """Best-effort 'typing…' chat action; never let it break a turn."""
@@ -239,7 +324,16 @@ class CoraxTelegramGateway:
         )
         return payload.get("message_id", message_id)
 
-    async def _run_tool(self, messages: list[dict], tool_call: dict) -> None:
+    async def _run_tool(
+        self,
+        messages: list[dict],
+        tool_call: dict,
+        *,
+        chat_id: Any,
+        session_id: str,
+        allow_media: bool,
+        user_text: str,
+    ) -> None:
         function = tool_call.get("function") or {}
         name = function.get("name")
         cap_id = self._tool_to_cap.get(name)
@@ -250,7 +344,15 @@ class CoraxTelegramGateway:
         except (ValueError, TypeError):
             args = {}
 
-        if cap_id is None:
+        if name == _SEND_DOCUMENT_TOOL:
+            result = await self._run_send_document_tool(
+                chat_id,
+                args,
+                session_id=session_id,
+                user_text=user_text,
+                allow_media=allow_media,
+            )
+        elif cap_id is None:
             result: dict[str, Any] = {"error": f"unknown tool {name!r}"}
         else:
             self.log.info("tool call: %s(%s)", cap_id, args)
@@ -258,6 +360,8 @@ class CoraxTelegramGateway:
                 result = await self._run(cap_id, args)
             except Exception as exc:  # noqa: BLE001 - a failed tool feeds the error back
                 result = {"error": str(exc)}
+            else:
+                await self._record_artifact(session_id, cap_id, args, result)
 
         messages.append(
             {
@@ -271,6 +375,278 @@ class CoraxTelegramGateway:
         await self._run(
             self.telegram_id, {"operation": "send", "chat_id": chat_id, "text": text}
         )
+
+    async def _deliver_final(self, chat_id: Any, text: str, *, allow_media: bool = True) -> str:
+        clean_text, media_paths = self._extract_media_paths(text)
+        await self._reveal(chat_id, clean_text or "(no response)")
+        if allow_media:
+            for media_path in media_paths:
+                await self._send_document(chat_id, media_path)
+        return clean_text or "(no response)"
+
+    def _extract_media_paths(self, text: str) -> tuple[str, list[Path]]:
+        lines: list[str] = []
+        media_paths: list[Path] = []
+        for line in text.splitlines():
+            match = _MEDIA_LINE.match(line)
+            if match is None:
+                lines.append(line)
+                continue
+            media_paths.append(self._resolve_media_path(match.group("path")))
+        if not media_paths:
+            return text, media_paths
+        return "\n".join(lines).strip(), media_paths
+
+    async def _send_document(self, chat_id: Any, path: Path) -> None:
+        try:
+            await self._run(
+                self.telegram_id,
+                {
+                    "operation": "send_document",
+                    "chat_id": chat_id,
+                    "path": str(path),
+                    "caption": f"Файл: {path.name}",
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 - text delivery should still succeed
+            self.log.debug("document send failed: %s", exc)
+
+    async def _prepare_turn(self, chat_id: Any, text: str) -> dict[str, Any]:
+        if self._has_gateway_capability:
+            try:
+                prepared = await self._run(
+                    self.gateway_id,
+                    {
+                        "operation": "prepare_turn",
+                        "channel": "telegram",
+                        "conversation_id": chat_id,
+                        "text": text,
+                        "system_prompt": self.system_prompt,
+                    },
+                )
+                if isinstance(prepared, dict) and prepared.get("messages"):
+                    return prepared
+            except Exception as exc:  # noqa: BLE001 - fallback keeps chat alive
+                self.log.debug("gateway prepare_turn failed: %s", exc)
+
+        session_id = self._session_for(chat_id)
+        user_message = {"role": "user", "content": self._timestamped_user_message(text)}
+        return {
+            "session_id": session_id,
+            "allow_outbound_file": self._user_requested_media(text),
+            "user_message": user_message,
+            "messages": [
+                {"role": "system", "content": self.system_prompt},
+                *self._recent_files_context(session_id),
+                *self._history_for(session_id),
+                user_message,
+            ],
+        }
+
+    async def _record_turn(
+        self,
+        session_id: str,
+        text: str,
+        user_message: dict[str, Any],
+        assistant_text: str,
+    ) -> None:
+        if self._has_gateway_capability:
+            try:
+                await self._run(
+                    self.gateway_id,
+                    {
+                        "operation": "record_turn",
+                        "session_id": session_id,
+                        "text": text,
+                        "assistant_text": assistant_text,
+                        "max_history_messages": self.max_history_messages,
+                    },
+                )
+                return
+            except Exception as exc:  # noqa: BLE001
+                self.log.debug("gateway record_turn failed: %s", exc)
+        self._remember_turn(session_id, user_message, assistant_text)
+
+    async def _record_artifact(
+        self, session_id: str, cap_id: str, args: dict[str, Any], result: dict[str, Any]
+    ) -> None:
+        if self._has_gateway_capability:
+            try:
+                await self._run(
+                    self.gateway_id,
+                    {
+                        "operation": "record_artifact",
+                        "session_id": session_id,
+                        "tool_capability_id": cap_id,
+                        "tool_args": args,
+                        "tool_result": result,
+                        "max_recent_files": self.max_recent_files,
+                    },
+                )
+                return
+            except Exception as exc:  # noqa: BLE001
+                self.log.debug("gateway record_artifact failed: %s", exc)
+        self._remember_recent_file(session_id, cap_id, args, result)
+
+    async def _plan_file_delivery(
+        self,
+        session_id: str,
+        user_text: str,
+        args: dict[str, Any],
+        *,
+        allow_media: bool,
+    ) -> dict[str, Any]:
+        if self._has_gateway_capability:
+            payload: dict[str, Any] = {
+                "operation": "plan_file_delivery",
+                "session_id": session_id,
+                "text": user_text,
+                "workspace_root": str(self.workspace_path),
+                "connector_id": self.telegram_id,
+            }
+            raw_path = args.get("path")
+            if isinstance(raw_path, str) and raw_path.strip():
+                payload["path"] = raw_path
+            caption = args.get("caption")
+            if isinstance(caption, str) and caption.strip():
+                payload["caption"] = caption
+            try:
+                planned = await self._run(self.gateway_id, payload)
+                delivery = planned.get("delivery") if isinstance(planned, dict) else None
+                if isinstance(delivery, dict):
+                    return delivery
+            except Exception as exc:  # noqa: BLE001
+                self.log.debug("gateway plan_file_delivery failed: %s", exc)
+
+        if not allow_media:
+            return {"allowed": False, "reason": "file delivery was not requested by the user"}
+        raw_path = args.get("path")
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            return {"allowed": False, "reason": "path must be a non-empty string"}
+        return {"allowed": True, "path": str(self._resolve_media_path(raw_path))}
+
+    async def _run_send_document_tool(
+        self,
+        chat_id: Any,
+        args: dict[str, Any],
+        *,
+        session_id: str,
+        user_text: str,
+        allow_media: bool,
+    ) -> dict[str, Any]:
+        delivery_plan = await self._plan_file_delivery(session_id, user_text, args, allow_media=allow_media)
+        if not delivery_plan.get("allowed"):
+            return {
+                "ok": False,
+                "error": delivery_plan.get("reason") or "file delivery was not allowed",
+            }
+        raw_path = args.get("path")
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            raw_path = delivery_plan.get("path")
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            return {"ok": False, "error": "path must be a non-empty string"}
+        path = Path(delivery_plan["path"]) if delivery_plan.get("path") else self._resolve_media_path(raw_path)
+        payload: dict[str, Any] = {
+            "operation": "send_document",
+            "chat_id": chat_id,
+            "path": str(path),
+        }
+        caption = args.get("caption")
+        if isinstance(caption, str) and caption.strip():
+            payload["caption"] = caption
+        else:
+            payload["caption"] = f"Файл: {path.name}"
+        try:
+            result = await self._run(self.telegram_id, payload)
+        except Exception as exc:  # noqa: BLE001 - tool result feeds the error back
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "path": str(path), "result": result}
+
+    def _timestamped_user_message(self, text: str) -> str:
+        now = datetime.datetime.now().astimezone()
+        timestamp = now.strftime("%a %Y-%m-%d %H:%M %Z")
+        return f"[{timestamp}] {text}"
+
+    def _user_requested_media(self, text: str) -> bool:
+        return bool(_MEDIA_REQUEST.search(text))
+
+    def _resolve_media_path(self, raw_path: str) -> Path:
+        path = Path(raw_path).expanduser()
+        if not path.is_absolute():
+            path = self.workspace_path / path
+        return path
+
+    def _recent_files_context(self, session_id: str) -> list[dict[str, str]]:
+        files = self._recent_files.get(session_id, [])
+        if not files:
+            return []
+        file_list = "\n".join(f"- {path}" for path in files)
+        return [
+            {
+                "role": "system",
+                "content": (
+                    "Recent local files created or modified in this session "
+                    "(newest first):\n"
+                    f"{file_list}\n"
+                    "When the user asks for the file just created, discussed, "
+                    "or requested earlier, use telegram_send_document with the "
+                    "matching path."
+                ),
+            }
+        ]
+
+    def _remember_recent_file(
+        self, session_id: str, cap_id: str, args: dict[str, Any], result: dict[str, Any]
+    ) -> None:
+        if self.max_recent_files <= 0:
+            return
+        path = self._artifact_path_from_tool(cap_id, args, result)
+        if path is None:
+            return
+        files = self._recent_files.setdefault(session_id, [])
+        if path in files:
+            files.remove(path)
+        files.insert(0, path)
+        del files[self.max_recent_files :]
+
+    def _artifact_path_from_tool(
+        self, cap_id: str, args: dict[str, Any], result: dict[str, Any]
+    ) -> str | None:
+        raw_path = result.get("path") if isinstance(result.get("path"), str) else args.get("path")
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            return None
+
+        operation = str(args.get("operation") or result.get("operation") or "").lower()
+        if cap_id == "filesystem":
+            if operation not in {"write", "append"} and not (
+                result.get("written") or result.get("appended")
+            ):
+                return None
+        elif cap_id == "editor":
+            if result.get("success") is False or result.get("changed") is False:
+                return None
+        else:
+            return None
+        return raw_path.strip()
+
+    def _history_for(self, session_id: str) -> list[dict[str, Any]]:
+        return [dict(message) for message in self._history.get(session_id, [])]
+
+    def _remember_turn(
+        self, session_id: str, user_message: dict[str, Any], assistant_text: str
+    ) -> None:
+        if self.max_history_messages <= 0:
+            return
+        history = self._history.setdefault(session_id, [])
+        history.extend(
+            [
+                dict(user_message),
+                {"role": "assistant", "content": assistant_text},
+            ]
+        )
+        overflow = len(history) - self.max_history_messages
+        if overflow > 0:
+            del history[:overflow]
 
     def _session_for(self, chat_id: Any) -> str:
         session = self._sessions.get(chat_id)

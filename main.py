@@ -102,7 +102,11 @@ async def _run_chat(app: "CoraxApp", config_path: Path) -> int:
     from corax.gateway.policy import GatewayPolicyEngine
 
     specs = _tool_capability_specs(runtime)
-    tool_ids = [s["id"] for s in specs if s["id"] not in ("llm.local", "telegram.connector")]
+    tool_ids = [
+        s["id"]
+        for s in specs
+        if s["id"] not in ("gateway", "llm.local", "telegram.connector")
+    ]
     if not app.config.telegram.allowed_chats:
         print(
             "⚠️  SECURITY: no CORAX_TELEGRAM_ALLOWED_CHATS set — anyone who can "
@@ -118,6 +122,7 @@ async def _run_chat(app: "CoraxApp", config_path: Path) -> int:
                 run_capability=kernel.invoke,
                 capabilities=specs,
                 model=app.config.llm.model,
+                workspace_path=runtime.workspace_path,
             )
             print("Corax Telegram gateway is running (Ctrl-C to stop).")
             outcome = await gateway.run()

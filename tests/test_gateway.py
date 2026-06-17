@@ -32,6 +32,14 @@ CAPS = [
     {"id": "llm.local", "input_schema": {}},   # excluded (infra)
     {"id": "telegram.connector", "input_schema": {}},  # excluded (infra)
 ]
+CAPS_WITH_GATEWAY = [
+    *CAPS,
+    {
+        "id": "gateway",
+        "description": "gateway",
+        "input_schema": {"type": "object", "properties": {"operation": {"type": "string"}}},
+    },
+]
 
 
 class FakeBackend:
@@ -41,7 +49,9 @@ class FakeBackend:
         self.tool_results = dict(tool_results or {})
         self.calls: list = []
         self.sends: list[str] = []
+        self.documents: list[dict] = []
         self.tools_run: list = []
+        self.gateway_calls: list[dict] = []
         self.fail_capability: str | None = None
         self.fail_operation: str | None = None
 
@@ -50,6 +60,35 @@ class FakeBackend:
         self.calls.append((cap_id, op, payload))
         if cap_id == self.fail_capability or (self.fail_operation is not None and op == self.fail_operation):
             raise GatewayError("boom")
+        if cap_id == "gateway":
+            self.gateway_calls.append(payload)
+            if op == "prepare_turn":
+                text = payload.get("text", "")
+                return {
+                    "operation": "prepare_turn",
+                    "ok": True,
+                    "session_id": "gw-session",
+                    "allow_outbound_file": "пришли" in text.lower() or "send" in text.lower(),
+                    "user_message": {"role": "user", "content": f"[GW] {text}"},
+                    "messages": [
+                        {"role": "system", "content": "gateway system"},
+                        {"role": "user", "content": f"[GW] {text}"},
+                    ],
+                    "recent_files": [],
+                }
+            if op == "plan_file_delivery":
+                return {
+                    "operation": "plan_file_delivery",
+                    "ok": True,
+                    "delivery": {
+                        "allowed": True,
+                        "path": "/tmp/corax-workspace/gateway-planned.txt",
+                        "caption": payload.get("caption"),
+                    },
+                }
+            if op in {"new_session", "record_turn", "record_artifact", "forget_session"}:
+                return {"operation": op, "ok": True}
+            return {"operation": op, "ok": True}
         if op == "poll":
             return {"updates": self.poll_batches.pop(0) if self.poll_batches else [], "next_offset": 999}
         if op == "chat_action":
@@ -57,6 +96,9 @@ class FakeBackend:
         if op == "send":
             self.sends.append(payload["text"])
             return {"message_id": 1}
+        if op == "send_document":
+            self.documents.append(payload)
+            return {"message_id": 2}
         if op == "stream":  # progressive reveal of the final answer
             if payload.get("done"):
                 self.sends.append(payload["text"])
@@ -89,10 +131,10 @@ async def _nosleep(_seconds):
 
 def _gateway(backend, **kwargs):
     kwargs.setdefault("capabilities", CAPS)
+    kwargs.setdefault("sleep", _nosleep)
+    kwargs.setdefault("new_session", lambda: "sess-fixed")
     return CoraxTelegramGateway(
         run_capability=backend.run_capability,
-        sleep=_nosleep,
-        new_session=lambda: "sess-fixed",
         **kwargs,
     )
 
@@ -101,7 +143,7 @@ class ToolSpecTests(unittest.TestCase):
     def test_tools_built_from_capabilities_excluding_infra(self) -> None:
         gw = _gateway(FakeBackend())
         names = {t["function"]["name"] for t in gw._tool_specs}
-        self.assertEqual(names, {"filesystem", "shell", "clock"})  # llm/telegram excluded, no-id skipped
+        self.assertEqual(names, {"filesystem", "shell", "clock", "telegram_send_document"})
         self.assertEqual(gw._tool_to_cap["filesystem"], "filesystem")
         clock = next(t for t in gw._tool_specs if t["function"]["name"] == "clock")
         self.assertEqual(clock["function"]["description"], "clock")  # falls back to id
@@ -111,6 +153,12 @@ class ToolSpecTests(unittest.TestCase):
         gw = _gateway(FakeBackend(), capabilities=[{"id": "web.search", "input_schema": {}}])
         self.assertIn("web_search", gw._tool_to_cap)
         self.assertEqual(gw._tool_to_cap["web_search"], "web.search")
+
+    def test_gateway_capability_is_internal_not_model_tool(self) -> None:
+        gw = _gateway(FakeBackend(), capabilities=CAPS_WITH_GATEWAY)
+        names = {t["function"]["name"] for t in gw._tool_specs}
+        self.assertIn("telegram_send_document", names)
+        self.assertNotIn("gateway", names)
 
 
 class ChatToolLoopTests(unittest.IsolatedAsyncioTestCase):
@@ -123,6 +171,121 @@ class ChatToolLoopTests(unittest.IsolatedAsyncioTestCase):
         gen = next(p for c, op, p in backend.calls if op == "generate")
         self.assertEqual(gen["model"], "gemma-4")
         self.assertTrue(gen["tools"])  # tools were offered
+        self.assertEqual(gen["messages"][0]["role"], "system")
+        self.assertEqual(gen["messages"][1]["role"], "user")
+        self.assertRegex(gen["messages"][1]["content"], r"^\[[A-Z][a-z]{2} \d{4}-\d{2}-\d{2} ")
+
+    async def test_gateway_capability_prepares_and_records_turn(self) -> None:
+        backend = FakeBackend(
+            poll_batches=[[_text_update(5, "hi")]],
+            llm_responses=[{"text": "hello from llm"}],
+        )
+        gw = _gateway(backend, capabilities=CAPS_WITH_GATEWAY)
+        await gw.run(max_iterations=1)
+        gen = next(p for _c, op, p in backend.calls if op == "generate")
+        self.assertEqual(gen["messages"][0]["content"], "gateway system")
+        self.assertEqual(gen["messages"][1]["content"], "[GW] hi")
+        ops = [call["operation"] for call in backend.gateway_calls]
+        self.assertEqual(ops, ["prepare_turn", "record_turn"])
+
+    async def test_media_tag_without_user_request_does_not_send_document(self) -> None:
+        backend = FakeBackend(
+            poll_batches=[[_text_update(5, "create test.txt")]],
+            llm_responses=[
+                {"tool_calls": [_tool_call("filesystem", '{"operation": "write", "path": "test.txt", "content": "hi"}')]},
+                {"text": "Готово.\nMEDIA:test.txt"},
+            ],
+            tool_results={"filesystem": {"path": "test.txt", "written": True, "size": 2}},
+        )
+        gw = _gateway(backend, workspace_path="/tmp/corax-workspace")
+        await gw.run(max_iterations=1)
+        self.assertIn("Готово.", backend.sends)
+        self.assertNotIn("MEDIA:test.txt", backend.sends)
+        self.assertEqual(backend.documents, [])
+
+    async def test_media_tag_with_user_request_sends_document(self) -> None:
+        backend = FakeBackend(
+            poll_batches=[[_text_update(5, "create and send test.txt")]],
+            llm_responses=[
+                {"tool_calls": [_tool_call("filesystem", '{"operation": "write", "path": "test.txt", "content": "hi"}')]},
+                {"text": "Готово.\nMEDIA:test.txt"},
+            ],
+            tool_results={"filesystem": {"path": "test.txt", "written": True, "size": 2}},
+        )
+        gw = _gateway(backend, workspace_path="/tmp/corax-workspace")
+        await gw.run(max_iterations=1)
+        self.assertIn("Готово.", backend.sends)
+        self.assertNotIn("MEDIA:test.txt", backend.sends)
+        self.assertEqual(backend.documents[0]["path"], "/tmp/corax-workspace/test.txt")
+        self.assertIn("test.txt", backend.documents[0]["caption"])
+
+    async def test_send_document_tool_without_user_request_is_denied(self) -> None:
+        backend = FakeBackend(
+            poll_batches=[[_text_update(5, "create test.txt")]],
+            llm_responses=[
+                {"tool_calls": [_tool_call("telegram_send_document", '{"path": "test.txt"}')]},
+                {"text": "Файл создан."},
+            ],
+        )
+        gw = _gateway(backend, workspace_path="/tmp/corax-workspace")
+        await gw.run(max_iterations=1)
+        self.assertEqual(backend.documents, [])
+        gen_calls = [p for _c, op, p in backend.calls if op == "generate"]
+        tool_msg = gen_calls[1]["messages"][-1]
+        self.assertEqual(tool_msg["role"], "tool")
+        self.assertIn("file delivery was not requested", tool_msg["content"])
+
+    async def test_send_document_tool_with_user_request_sends_document(self) -> None:
+        backend = FakeBackend(
+            poll_batches=[[_text_update(5, "пришли test.txt")]],
+            llm_responses=[
+                {"tool_calls": [_tool_call("telegram_send_document", '{"path": "test.txt", "caption": "готово"}')]},
+                {"text": "Отправил."},
+            ],
+        )
+        gw = _gateway(backend, workspace_path="/tmp/corax-workspace")
+        await gw.run(max_iterations=1)
+        self.assertEqual(backend.documents[0]["path"], "/tmp/corax-workspace/test.txt")
+        self.assertEqual(backend.documents[0]["caption"], "готово")
+        self.assertIn("Отправил.", backend.sends)
+
+    async def test_gateway_capability_plans_send_document_tool(self) -> None:
+        backend = FakeBackend(
+            poll_batches=[[_text_update(5, "пришли test.txt")]],
+            llm_responses=[
+                {"tool_calls": [_tool_call("telegram_send_document", '{"path": "test.txt"}')]},
+                {"text": "Отправил."},
+            ],
+        )
+        gw = _gateway(backend, capabilities=CAPS_WITH_GATEWAY, workspace_path="/tmp/corax-workspace")
+        await gw.run(max_iterations=1)
+        self.assertEqual(backend.documents[0]["path"], "/tmp/corax-workspace/gateway-planned.txt")
+        ops = [call["operation"] for call in backend.gateway_calls]
+        self.assertIn("plan_file_delivery", ops)
+
+    async def test_recent_created_file_is_available_on_next_turn(self) -> None:
+        backend = FakeBackend(
+            poll_batches=[
+                [_text_update(5, "создай Test2.txt")],
+                [_text_update(5, "пришли мне файл который я просил тебя создать")],
+            ],
+            llm_responses=[
+                {"tool_calls": [_tool_call("filesystem", '{"operation": "write", "path": "Test2.txt", "content": "hi"}')]},
+                {"text": "Файл создан."},
+                {"tool_calls": [_tool_call("telegram_send_document", '{"path": "Test2.txt"}')]},
+                {"text": "Отправил."},
+            ],
+            tool_results={"filesystem": {"path": "Test2.txt", "written": True, "size": 2}},
+        )
+        gw = _gateway(backend, workspace_path="/tmp/corax-workspace")
+        await gw.run(max_iterations=2)
+        gen_calls = [p for _c, op, p in backend.calls if op == "generate"]
+        second_turn_messages = gen_calls[2]["messages"]
+        self.assertTrue(
+            any("Recent local files" in m["content"] and "Test2.txt" in m["content"] for m in second_turn_messages)
+        )
+        self.assertEqual(backend.documents[0]["path"], "/tmp/corax-workspace/Test2.txt")
+        self.assertIn("Отправил.", backend.sends)
 
     async def test_tool_call_then_final_answer(self) -> None:
         backend = FakeBackend(
@@ -138,6 +301,58 @@ class ChatToolLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(backend.tools_run[0][0], "filesystem")
         self.assertEqual(backend.tools_run[0][1], {"path": "."})  # args parsed, op stripped
         self.assertIn("here are your files", backend.sends)
+
+    async def test_gateway_capability_records_tool_artifact(self) -> None:
+        backend = FakeBackend(
+            poll_batches=[[_text_update(5, "create notes")]],
+            llm_responses=[
+                {"tool_calls": [_tool_call("filesystem", '{"operation": "write", "path": "notes.txt", "content": "hi"}')]},
+                {"text": "done"},
+            ],
+            tool_results={"filesystem": {"path": "notes.txt", "written": True, "size": 2}},
+        )
+        gw = _gateway(backend, capabilities=CAPS_WITH_GATEWAY)
+        await gw.run(max_iterations=1)
+        artifact_calls = [
+            call for call in backend.gateway_calls if call["operation"] == "record_artifact"
+        ]
+        self.assertEqual(artifact_calls[0]["tool_capability_id"], "filesystem")
+        self.assertEqual(artifact_calls[0]["tool_result"]["path"], "notes.txt")
+
+    async def test_same_chat_reuses_session_history(self) -> None:
+        backend = FakeBackend(
+            poll_batches=[
+                [_text_update(5, "my name is Alex")],
+                [_text_update(5, "what is my name?")],
+            ],
+            llm_responses=[{"text": "Nice to meet you, Alex."}, {"text": "Alex"}],
+        )
+        gw = _gateway(backend)
+        await gw.run(max_iterations=2)
+        gen_calls = [p for _c, op, p in backend.calls if op == "generate"]
+        second_messages = gen_calls[1]["messages"]
+        self.assertTrue(
+            any(m["role"] == "assistant" and "Nice to meet you" in m["content"] for m in second_messages)
+        )
+        self.assertTrue(
+            any(m["role"] == "user" and "my name is Alex" in m["content"] for m in second_messages)
+        )
+
+    async def test_new_session_starts_empty_history(self) -> None:
+        backend = FakeBackend(
+            poll_batches=[
+                [_text_update(5, "remember this")],
+                [_cmd_update(5, "new_session")],
+                [_text_update(5, "what did I say?")],
+            ],
+            llm_responses=[{"text": "remembered"}, {"text": "I do not know"}],
+        )
+        sessions = iter(["sess-1", "sess-2"])
+        gw = _gateway(backend, new_session=lambda: next(sessions))
+        await gw.run(max_iterations=3)
+        gen_calls = [p for _c, op, p in backend.calls if op == "generate"]
+        second_messages = gen_calls[1]["messages"]
+        self.assertFalse(any("remember this" in m.get("content", "") for m in second_messages))
 
     async def test_unknown_tool_is_fed_back_as_error(self) -> None:
         backend = FakeBackend(
@@ -233,6 +448,15 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
     async def test_new_session(self) -> None:
         backend = FakeBackend(poll_batches=[[_cmd_update(5, "new_session", reply="🆕")]])
         await _gateway(backend).run(max_iterations=1)
+        self.assertIn("🆕", backend.sends)
+
+    async def test_new_session_resets_gateway_capability(self) -> None:
+        backend = FakeBackend(poll_batches=[[_cmd_update(5, "new_session", reply="🆕")]])
+        await _gateway(backend, capabilities=CAPS_WITH_GATEWAY).run(max_iterations=1)
+        calls = [call for call in backend.gateway_calls if call["operation"] == "new_session"]
+        self.assertEqual(calls[0]["channel"], "telegram")
+        self.assertEqual(calls[0]["conversation_id"], 5)
+        self.assertEqual(calls[0]["session_id"], "sess-fixed")
         self.assertIn("🆕", backend.sends)
 
     async def test_reload(self) -> None:
