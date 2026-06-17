@@ -290,7 +290,7 @@ class ChatToolLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(generate_calls, [])
         self.assertTrue(stream_calls[-1]["done"])
         self.assertEqual(stream_calls[-1]["text"], "hello there")
-        self.assertEqual(stream_calls[0]["transport"], "edit")
+        self.assertEqual(stream_calls[0]["transport"], "auto")
         self.assertEqual(stream_calls[0]["chat_type"], "private")
         self.assertIsInstance(stream_calls[0]["draft_id"], int)
         self.assertEqual(stream_calls[-1]["draft_id"], stream_calls[0]["draft_id"])
@@ -304,11 +304,11 @@ class ChatToolLoopTests(unittest.IsolatedAsyncioTestCase):
                 {"type": "delta", "content": "hello"},
                 {"type": "done", "finish_reason": "stop", "tool_calls": []},
             ]),
-            stream_transport="auto",
+            stream_transport="edit",
         )
         await gw.run(max_iterations=1)
         stream_call = next(p for _c, op, p in backend.calls if op == "stream")
-        self.assertEqual(stream_call["transport"], "auto")
+        self.assertEqual(stream_call["transport"], "edit")
 
     async def test_streaming_buffers_small_deltas_before_telegram_flush(self) -> None:
         backend = FakeBackend(poll_batches=[[_text_update(5, "hi")]])
