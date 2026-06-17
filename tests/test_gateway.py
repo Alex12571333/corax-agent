@@ -41,6 +41,18 @@ CAPS_WITH_GATEWAY = [
         "input_schema": {"type": "object", "properties": {"operation": {"type": "string"}}},
     },
 ]
+WEB_CAP = {
+    "id": "web.search",
+    "description": "Search the web and return titles, URLs, and snippets.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "operation": {"type": "string"},
+            "query": {"type": "string"},
+            "count": {"type": "integer"},
+        },
+    },
+}
 
 
 class FakeBackend:
@@ -486,6 +498,63 @@ class ChatToolLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(backend.documents), 1)
         self.assertEqual(backend.documents[0]["path"], "/tmp/corax-workspace/ukraine_news.txt")
         self.assertTrue(any("Файл сохранен локально" in sent for sent in backend.sends))
+
+    async def test_current_news_requires_web_search_before_final_answer(self) -> None:
+        backend = FakeBackend(
+            poll_batches=[[_text_update(5, "последние новости Украины сегодня")]],
+            llm_responses=[
+                {"text": "Общая сводка без источников."},
+                {"tool_calls": [_tool_call("web_search", '{"query": "Украина новости сегодня", "count": 3}')]},
+                {"text": "Нашел новости по источникам."},
+            ],
+            tool_results={
+                "web.search": {
+                    "results": [{"title": "News title", "url": "https://example.com", "snippet": "snippet"}]
+                }
+            },
+        )
+        gw = _gateway(backend, capabilities=[*CAPS, WEB_CAP])
+        await gw.run(max_iterations=1)
+        self.assertEqual(backend.tools_run[0][0], "web.search")
+        self.assertNotIn("Общая сводка без источников.", backend.sends)
+        self.assertIn("Нашел новости по источникам.", backend.sends)
+
+    async def test_current_news_blocks_file_write_before_web_search(self) -> None:
+        backend = FakeBackend(
+            poll_batches=[[_text_update(5, "найди последние новости Украины, запиши в файл и отправь")]],
+            llm_responses=[
+                {
+                    "tool_calls": [
+                        _tool_call(
+                            "filesystem",
+                            '{"operation": "write", "path": "ukraine_news.txt", "content": "generic"}',
+                            id="bad-write",
+                        )
+                    ]
+                },
+                {"tool_calls": [_tool_call("web_search", '{"query": "Украина последние новости", "count": 3}')]},
+                {
+                    "tool_calls": [
+                        _tool_call(
+                            "filesystem",
+                            '{"operation": "write", "path": "ukraine_news.txt", "content": "real news"}',
+                            id="good-write",
+                        )
+                    ]
+                },
+                {"text": "Файл готов."},
+            ],
+            tool_results={
+                "web.search": {
+                    "results": [{"title": "News title", "url": "https://example.com", "snippet": "snippet"}]
+                },
+                "filesystem": {"path": "ukraine_news.txt", "written": True, "size": 9},
+            },
+        )
+        gw = _gateway(backend, capabilities=[*CAPS, WEB_CAP], workspace_path="/tmp/corax-workspace")
+        await gw.run(max_iterations=1)
+        self.assertEqual([tool for tool, _payload in backend.tools_run], ["web.search", "filesystem"])
+        self.assertEqual(backend.documents[0]["path"], "/tmp/corax-workspace/ukraine_news.txt")
 
     async def test_gateway_capability_plans_send_document_tool(self) -> None:
         backend = FakeBackend(

@@ -31,6 +31,10 @@ _DEFAULT_SYSTEM_PROMPT = (
     "editor tools over shell commands. Reply in the user's language. "
     "If a tool fails, do not stop after the first error. Read the error, adjust "
     "the arguments, inspect the environment, or try a different available tool. "
+    "For current, latest, recent, or today's news and other time-sensitive facts, "
+    "call the web_search tool before answering or writing files; do not invent "
+    "a summary from memory. Include concrete titles, snippets, and source URLs "
+    "when search results are available. "
     "Ask the user only when the next step requires information or permission "
     "that is not available from the current context. "
     "Only when the user explicitly asks you to send, attach, share, or upload a "
@@ -48,6 +52,11 @@ _MEDIA_LINE = re.compile(r"^\s*MEDIA:\s*(?P<path>\S.*?)\s*$")
 _MEDIA_REQUEST = re.compile(
     r"\b(send|attach|share|upload)\b|"
     r"(пришл|отправ|скинь|скинут|перешл|прикреп|загруз)",
+    re.IGNORECASE,
+)
+_CURRENT_INFO_REQUEST = re.compile(
+    r"\b(today|latest|current|recent|news|headlines|breaking)\b|"
+    r"(сегодня|последн|свеж|текущ|актуальн|новост|новини|сводк)",
     re.IGNORECASE,
 )
 _MODEL_CHANNEL_MARKER = re.compile(
@@ -280,6 +289,10 @@ class CoraxTelegramGateway:
         user_message = prepared["user_message"]
         messages = prepared["messages"]
         active_tools = self._active_tool_specs(text, allow_media=allow_media)
+        current_info_required = self._requires_current_info(text) and self._active_tool_available(
+            active_tools, "web.search"
+        )
+        current_info_satisfied = False
         final_text = ""
         recovery_needed = False
         recovery_tool_attempted = False
@@ -306,6 +319,10 @@ class CoraxTelegramGateway:
             )
             tool_calls = response.get("tool_calls") or []
             if not tool_calls:
+                if current_info_required and not current_info_satisfied and active_tools:
+                    self.log.info("current-info guard inserted before accepting final answer")
+                    messages.append({"role": "system", "content": self._current_info_required_prompt()})
+                    continue
                 if (
                     recovery_needed
                     and not recovery_tool_attempted
@@ -338,7 +355,11 @@ class CoraxTelegramGateway:
                     session_id=session_id,
                     allow_media=allow_media,
                     user_text=text,
+                    current_info_required=current_info_required,
+                    current_info_satisfied=current_info_satisfied,
                 )
+                if tool_outcome.get("current_info_satisfied"):
+                    current_info_satisfied = True
                 artifact_path = tool_outcome.get("artifact_path")
                 if isinstance(artifact_path, str) and artifact_path:
                     turn_artifacts.insert(0, artifact_path)
@@ -556,10 +577,15 @@ class CoraxTelegramGateway:
         session_id: str,
         allow_media: bool,
         user_text: str,
+        current_info_required: bool = False,
+        current_info_satisfied: bool = False,
     ) -> dict[str, Any]:
         function = tool_call.get("function") or {}
         name = function.get("name")
         cap_id = self._tool_to_cap.get(name)
+        recovery_plan: dict[str, Any] | None = None
+        tool_failed = False
+        model_result: dict[str, Any] = {}
         try:
             args = json.loads(function.get("arguments") or "{}")
             if not isinstance(args, dict):
@@ -579,6 +605,21 @@ class CoraxTelegramGateway:
             document_sent = result.get("ok") is True
         elif cap_id is None:
             result: dict[str, Any] = {"error": f"unknown tool {name!r}"}
+            artifact_path = None
+            document_sent = False
+        elif (
+            current_info_required
+            and not current_info_satisfied
+            and cap_id != "web.search"
+            and self._is_persistent_write_tool(cap_id, args)
+        ):
+            result = {
+                "ok": False,
+                "error": (
+                    "current/latest news requests require web_search before writing. "
+                    "Call web_search, use its returned titles/snippets/URLs, then write the file."
+                ),
+            }
             artifact_path = None
             document_sent = False
         else:
@@ -610,6 +651,18 @@ class CoraxTelegramGateway:
             model_result = recovery_plan.get("tool_result")
             if not isinstance(model_result, dict):
                 model_result = result
+        elif recovery_plan is None:
+            recovery_plan = await self._plan_tool_recovery(session_id, cap_id, args, result)
+            tool_failed = bool(recovery_plan.get("tool_failed"))
+            if tool_failed:
+                self.log.warning(
+                    "tool %-20s failed: %s",
+                    cap_id,
+                    self._compact_log_value(self._tool_error_text(result), limit=100),
+                )
+            model_result = recovery_plan.get("tool_result")
+            if not isinstance(model_result, dict):
+                model_result = result
 
         messages.append(
             {
@@ -623,6 +676,7 @@ class CoraxTelegramGateway:
             "recovery_prompt": recovery_plan.get("recovery_prompt") or "",
             "artifact_path": artifact_path,
             "document_sent": document_sent,
+            "current_info_satisfied": cap_id == "web.search" and not tool_failed,
         }
 
     def _active_tool_specs(self, user_text: str, *, allow_media: bool) -> list[dict]:
@@ -983,6 +1037,34 @@ class CoraxTelegramGateway:
             "arguments, or choose a safer alternate route. Do not ask the user to "
             "choose an option unless required information or permission is missing."
         )
+
+    def _current_info_required_prompt(self) -> str:
+        return (
+            "The user asked for current/latest news or up-to-date information. "
+            "Do not answer from memory and do not write a news file from guesses. "
+            "Call the web_search tool first, then base the answer/file on returned "
+            "titles, snippets, and URLs. If web_search fails, retry or report the "
+            "search failure clearly instead of inventing news."
+        )
+
+    def _requires_current_info(self, text: str) -> bool:
+        return bool(_CURRENT_INFO_REQUEST.search(text))
+
+    def _active_tool_available(self, specs: list[dict], cap_id: str) -> bool:
+        tool_name = self._cap_to_tool.get(cap_id)
+        if tool_name is None:
+            return False
+        return any(spec.get("function", {}).get("name") == tool_name for spec in specs)
+
+    def _is_persistent_write_tool(self, cap_id: str, args: dict[str, Any]) -> bool:
+        operation = str(args.get("operation") or "").lower()
+        if cap_id == "filesystem":
+            return operation in {"write", "append", "delete"} or "content" in args
+        if cap_id == "editor":
+            return operation in {"write", "append", "replace", "insert", "delete"} or any(
+                key in args for key in ("content", "replacement", "text")
+            )
+        return False
 
     def _tool_result_failed(self, result: dict[str, Any]) -> bool:
         if result.get("ok") is False:
