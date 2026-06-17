@@ -465,6 +465,28 @@ class ChatToolLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(backend.documents[0]["caption"], "готово")
         self.assertIn("Отправил.", backend.sends)
 
+    async def test_explicit_file_request_auto_sends_created_file(self) -> None:
+        backend = FakeBackend(
+            poll_batches=[[_text_update(5, "найди новости, запиши в файл и отправь мне сюда")]],
+            llm_responses=[
+                {
+                    "tool_calls": [
+                        _tool_call(
+                            "filesystem",
+                            '{"operation": "write", "path": "ukraine_news.txt", "content": "news"}',
+                        )
+                    ]
+                },
+                {"text": "Файл сохранен локально и готов предоставить."},
+            ],
+            tool_results={"filesystem": {"path": "ukraine_news.txt", "written": True, "size": 4}},
+        )
+        gw = _gateway(backend, workspace_path="/tmp/corax-workspace")
+        await gw.run(max_iterations=1)
+        self.assertEqual(len(backend.documents), 1)
+        self.assertEqual(backend.documents[0]["path"], "/tmp/corax-workspace/ukraine_news.txt")
+        self.assertTrue(any("Файл сохранен локально" in sent for sent in backend.sends))
+
     async def test_gateway_capability_plans_send_document_tool(self) -> None:
         backend = FakeBackend(
             poll_batches=[[_text_update(5, "пришли test.txt")]],

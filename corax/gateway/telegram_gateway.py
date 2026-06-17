@@ -285,6 +285,8 @@ class CoraxTelegramGateway:
         recovery_tool_attempted = False
         recovery_prompts = 0
         recovery_prompt = ""
+        turn_artifacts: list[str] = []
+        document_sent = False
         for _ in range(self.max_tool_iterations):
             await self._typing(chat_id)  # show "typing…" while the agent works
             generate: dict[str, Any] = {
@@ -337,6 +339,11 @@ class CoraxTelegramGateway:
                     allow_media=allow_media,
                     user_text=text,
                 )
+                artifact_path = tool_outcome.get("artifact_path")
+                if isinstance(artifact_path, str) and artifact_path:
+                    turn_artifacts.insert(0, artifact_path)
+                if tool_outcome.get("document_sent"):
+                    document_sent = True
                 if tool_outcome["failed"]:
                     failed_tools += 1
                     recovery_prompt = tool_outcome.get("recovery_prompt") or recovery_prompt
@@ -353,6 +360,10 @@ class CoraxTelegramGateway:
             final_text or "(no response)",
             allow_media=allow_media,
         )
+        if allow_media and not document_sent and not self._final_text_has_media(final_text):
+            auto_sent_path = await self._send_latest_requested_file(chat_id, turn_artifacts)
+            if auto_sent_path:
+                delivered_text = f"{delivered_text}\n\nФайл отправлен: {Path(auto_sent_path).name}"
         await self._record_turn(session_id, text, user_message, delivered_text)
 
     async def _typing(self, chat_id: Any) -> None:
@@ -564,8 +575,12 @@ class CoraxTelegramGateway:
                 user_text=user_text,
                 allow_media=allow_media,
             )
+            artifact_path = result.get("path") if result.get("ok") is True else None
+            document_sent = result.get("ok") is True
         elif cap_id is None:
             result: dict[str, Any] = {"error": f"unknown tool {name!r}"}
+            artifact_path = None
+            document_sent = False
         else:
             self.log.info("tool %-20s %s", cap_id, self._format_tool_args_for_log(cap_id, args))
             self.log.debug("tool payload: %s(%s)", cap_id, args)
@@ -573,8 +588,11 @@ class CoraxTelegramGateway:
                 result = await self._run(cap_id, args)
             except Exception as exc:  # noqa: BLE001 - a failed tool feeds the error back
                 result = {"error": str(exc)}
+                artifact_path = None
             else:
                 await self._record_artifact(session_id, cap_id, args, result)
+                artifact_path = self._artifact_path_from_tool(cap_id, args, result)
+            document_sent = False
             recovery_plan = await self._plan_tool_recovery(session_id, cap_id, args, result)
             tool_failed = bool(recovery_plan.get("tool_failed"))
             if tool_failed:
@@ -603,6 +621,8 @@ class CoraxTelegramGateway:
         return {
             "failed": tool_failed,
             "recovery_prompt": recovery_plan.get("recovery_prompt") or "",
+            "artifact_path": artifact_path,
+            "document_sent": document_sent,
         }
 
     def _active_tool_specs(self, user_text: str, *, allow_media: bool) -> list[dict]:
@@ -660,6 +680,19 @@ class CoraxTelegramGateway:
             for media_path in media_paths:
                 await self._send_document(chat_id, media_path)
         return clean_text or "(no response)"
+
+    async def _send_latest_requested_file(self, chat_id: Any, artifact_paths: list[str]) -> str | None:
+        for raw_path in artifact_paths:
+            if not raw_path:
+                continue
+            path = self._resolve_media_path(raw_path)
+            await self._send_document(chat_id, path)
+            return str(path)
+        return None
+
+    def _final_text_has_media(self, text: str) -> bool:
+        _clean_text, media_paths = self._extract_media_paths(self._sanitize_model_text(text))
+        return bool(media_paths)
 
     def _sanitize_model_text(self, text: str) -> str:
         """Remove chat-template control markers that some local models emit."""
