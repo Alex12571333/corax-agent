@@ -184,6 +184,8 @@ class CoraxTelegramGateway:
             try:
                 updates = await self.poll_once()
             except Exception as exc:  # noqa: BLE001 - one bad poll must not kill the loop
+                if self._stop:
+                    break
                 self.log.warning("poll failed: %s", exc)
                 updates = []
             for update in updates:

@@ -777,6 +777,18 @@ class LoopTests(unittest.IsolatedAsyncioTestCase):
         outcome = await _gateway(backend).run(max_iterations=1)
         self.assertEqual(outcome, "stopped")
 
+    async def test_stopped_poll_failure_exits_quietly(self) -> None:
+        backend = FakeBackend()
+        gw = _gateway(backend)
+
+        async def interrupted_poll():
+            gw.stop()
+            raise GatewayError("telegram API request interrupted")
+
+        gw.poll_once = interrupted_poll
+        outcome = await gw.run(max_iterations=1)
+        self.assertEqual(outcome, "stopped")
+
     async def test_update_handling_failure_is_logged_not_fatal(self) -> None:
         # Poll succeeds (no offset yet), but the LLM call fails — survive.
         backend = FakeBackend(poll_batches=[[_text_update(5, "hi")]])

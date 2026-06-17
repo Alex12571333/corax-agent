@@ -14,8 +14,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import signal
 import sys
 from pathlib import Path
+from typing import Any
 
 from corax import config as config_mod
 from corax.app import CoraxApp
@@ -136,7 +138,7 @@ async def _run_chat(app: "CoraxApp", config_path: Path) -> int:
                 tool_selector=selector.select if selector.available else None,
             )
             print(_style("Corax Telegram gateway is running. Ctrl-C to stop.", _GREEN))
-            outcome = await gateway.run()
+            outcome = await _run_gateway_until_stopped(gateway)
 
         if outcome == "reload":
             print(_style("Reloading agent...", _YELLOW))
@@ -151,6 +153,41 @@ async def _run_chat(app: "CoraxApp", config_path: Path) -> int:
             _print_chat_dashboard(app, specs, tool_ids, tool_discovery=selector.available)
             continue
         return 0
+
+
+async def _run_gateway_until_stopped(gateway: Any) -> str:
+    """Run the gateway with a graceful Ctrl-C path.
+
+    Telegram long-poll uses a blocking HTTPS read inside the connector. Raising
+    KeyboardInterrupt once breaks that read; the connector turns it into a
+    regular failed poll, and the gateway exits because ``stop()`` was already
+    set. A second Ctrl-C is treated as the user's request to force termination.
+    """
+    previous_handler = signal.getsignal(signal.SIGINT)
+    interrupts = 0
+
+    def _handle_sigint(_signum: int, _frame: Any) -> None:
+        nonlocal interrupts
+        interrupts += 1
+        gateway.stop()
+        if interrupts == 1:
+            print()
+            print(_style("Stopping Telegram gateway...", _YELLOW))
+        else:
+            raise KeyboardInterrupt
+        raise KeyboardInterrupt
+
+    try:
+        signal.signal(signal.SIGINT, _handle_sigint)
+    except (ValueError, RuntimeError):
+        return await gateway.run()
+    try:
+        return await gateway.run()
+    except KeyboardInterrupt:
+        gateway.stop()
+        return "stopped"
+    finally:
+        signal.signal(signal.SIGINT, previous_handler)
 
 
 def _print_chat_dashboard(
