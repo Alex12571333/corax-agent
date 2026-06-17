@@ -119,12 +119,14 @@ class RunningCore:
         task_store: Any,
         capability_ids: list[str],
         state_manager: Any | None = None,
+        streamers: dict[str, Any] | None = None,
     ) -> None:
         self._ac = agent_core
         self.executor = executor
         self.task_store = task_store
         self.capability_ids = list(capability_ids)
         self.state_manager = state_manager
+        self._streamers = dict(streamers or {})
 
     async def get_state(self, session_id: str) -> Any:
         """Read a session's ephemeral state (where capabilities' ``state_patch``
@@ -219,6 +221,27 @@ class RunningCore:
             )
         return dict(echoed) if isinstance(echoed, dict) else {}
 
+    async def stream_generate_events(
+        self,
+        capability_id: str,
+        input: dict | None = None,
+        *,
+        session_id: str | None = None,
+    ) -> AsyncIterator[dict]:
+        """Stream capability events from a kernel-adopted streaming connector."""
+        streamer = self._streamers.get(capability_id)
+        if streamer is None or not hasattr(streamer, "stream_generate_events"):
+            raise KernelInvocationError(f"capability {capability_id!r} does not support streaming events")
+        sid = session_id or f"stream-{uuid.uuid4().hex[:8]}"
+        request = self._ac.CapabilityRequest(
+            task_id=f"stream-{uuid.uuid4().hex[:8]}",
+            session_id=sid,
+            input=dict(input or {}),
+        )
+        async for event in streamer.stream_generate_events(request):
+            if isinstance(event, dict):
+                yield event
+
 
 class CoreEngine:
     """The runtime's seam onto the ``agent-core`` execution kernel."""
@@ -296,6 +319,7 @@ class CoreEngine:
         )
 
         adopted: list[str] = []
+        streamers: dict[str, Any] = {}
         echo_cls = _echo_wrapper_class(ac)
         for cap_id, item in _as_pairs(capabilities):
             if not isinstance(item, ac.Capability):
@@ -308,6 +332,8 @@ class CoreEngine:
                 self.log.warning("core rejected capability '%s': %s", cap_id, exc)
             else:
                 adopted.append(item.id)
+                if hasattr(item, "stream_generate_events"):
+                    streamers[item.id] = item
 
         lifecycle = ac.LifecycleManager()
         for name, component in (
@@ -324,7 +350,7 @@ class CoreEngine:
         await lifecycle.start_all()
         self.log.info("agent-core kernel started: %d capability(ies) adopted", len(adopted))
         try:
-            yield RunningCore(ac, executor, task_store, adopted, state)
+            yield RunningCore(ac, executor, task_store, adopted, state, streamers)
         finally:
             await lifecycle.stop_all()
             self.log.debug("agent-core kernel stopped")

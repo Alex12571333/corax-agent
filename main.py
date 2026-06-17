@@ -129,6 +129,7 @@ async def _run_chat(app: "CoraxApp", config_path: Path) -> int:
         ) as kernel:
             gateway = CoraxTelegramGateway(
                 run_capability=kernel.invoke,
+                stream_capability=kernel.stream_generate_events,
                 capabilities=specs,
                 model=app.config.llm.model,
                 workspace_path=runtime.workspace_path,

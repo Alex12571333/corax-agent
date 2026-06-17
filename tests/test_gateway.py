@@ -15,6 +15,7 @@ from corax.gateway.policy import GatewayPolicyEngine
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TELEGRAM_REPO = REPO_ROOT.parent / "corax-telegram-connector"
+LLM_REPO = REPO_ROOT.parent / "corax-llm-local-connector"
 
 try:
     import agent_core  # noqa: F401
@@ -121,7 +122,11 @@ class FakeBackend:
         if op == "stream":  # progressive reveal of the final answer
             if payload.get("done"):
                 self.sends.append(payload["text"])
-            return {"message_id": payload.get("message_id") or 1}
+            return {
+                "message_id": payload.get("message_id") or 1,
+                "edited": True,
+                "sent_text": payload.get("text", ""),
+            }
         if cap_id == "llm.local" and op == "generate":
             resp = self.llm_responses.pop(0) if self.llm_responses else {"text": "(default)"}
             tcs = resp.get("tool_calls") or []
@@ -160,6 +165,25 @@ def _gateway(backend, **kwargs):
         run_capability=backend.run_capability,
         **kwargs,
     )
+
+
+def _streamer(events):
+    async def stream_capability(_cap_id, _payload, *, session_id=None):
+        for event in events:
+            yield event
+
+    return stream_capability
+
+
+def _streamer_batches(batches):
+    batches = list(batches)
+
+    async def stream_capability(_cap_id, _payload, *, session_id=None):
+        events = batches.pop(0) if batches else [{"type": "done", "finish_reason": "stop", "tool_calls": []}]
+        for event in events:
+            yield event
+
+    return stream_capability
 
 
 class ToolSpecTests(unittest.TestCase):
@@ -246,6 +270,51 @@ class ChatToolLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(gen["messages"][0]["role"], "system")
         self.assertEqual(gen["messages"][1]["role"], "user")
         self.assertRegex(gen["messages"][1]["content"], r"^\[[A-Z][a-z]{2} \d{4}-\d{2}-\d{2} ")
+
+    async def test_streaming_answer_is_sent_live_without_duplicate_final(self) -> None:
+        backend = FakeBackend(poll_batches=[[_text_update(5, "hi")]])
+        gw = _gateway(
+            backend,
+            stream_capability=_streamer([
+                {"type": "delta", "content": "hello "},
+                {"type": "delta", "content": "there"},
+                {"type": "done", "finish_reason": "stop", "tool_calls": []},
+            ]),
+        )
+        await gw.run(max_iterations=1)
+        stream_calls = [p for _c, op, p in backend.calls if op == "stream"]
+        generate_calls = [p for _c, op, p in backend.calls if op == "generate"]
+        self.assertEqual(generate_calls, [])
+        self.assertTrue(stream_calls[-1]["done"])
+        self.assertEqual(stream_calls[-1]["text"], "hello there")
+        self.assertEqual(backend.sends.count("hello there"), 1)
+
+    async def test_streaming_tool_call_is_executed_by_gateway_loop(self) -> None:
+        backend = FakeBackend(
+            poll_batches=[[_text_update(5, "list files")]],
+            llm_responses=[{"text": "done"}],
+            tool_results={"filesystem": {"files": ["a.txt"]}},
+        )
+        gw = _gateway(
+            backend,
+            stream_capability=_streamer_batches([
+                [
+                    {
+                        "type": "done",
+                        "finish_reason": "tool_calls",
+                        "tool_calls": [_tool_call("filesystem", '{"path": "."}')],
+                    }
+                ],
+                [
+                    {"type": "delta", "content": "done"},
+                    {"type": "done", "finish_reason": "stop", "tool_calls": []},
+                ],
+            ]),
+        )
+        await gw.run(max_iterations=1)
+        self.assertEqual(backend.tools_run[0][0], "filesystem")
+        self.assertEqual(backend.tools_run[0][1], {"path": "."})
+        self.assertIn("done", backend.sends)
 
     async def test_generate_receives_only_active_selected_tools(self) -> None:
         backend = FakeBackend(
@@ -740,11 +809,14 @@ class CoreRoundTripTests(unittest.IsolatedAsyncioTestCase):
             self.skipTest("agent-core / agent-sdk not installed")
         if not TELEGRAM_REPO.is_dir():
             self.skipTest("corax-telegram-connector repo not present")
+        if not LLM_REPO.is_dir():
+            self.skipTest("corax-llm-local-connector repo not present")
         from corax import config as cfg
         from corax.runtime import CoraxRuntime
 
         config = cfg.default_config()
         config.capabilities.available["telegram.connector"].path = str(TELEGRAM_REPO)
+        config.capabilities.available["llm.local"].path = str(LLM_REPO)
         self.runtime = CoraxRuntime(config, root_path=REPO_ROOT)
         await self.runtime.start()
 
@@ -773,6 +845,21 @@ class CoreRoundTripTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(KernelInvocationError) as ctx:
                 await kernel.invoke("telegram.connector", {"operation": "nope"}, wait_timeout=10)
         self.assertIn("unsupported operation", str(ctx.exception))
+
+    async def test_stream_generate_events_routes_from_kernel_session(self) -> None:
+        async with self.runtime.core.session(
+            self.runtime.capabilities, policy=GatewayPolicyEngine()
+        ) as kernel:
+            events = [
+                event
+                async for event in kernel.stream_generate_events(
+                    "llm.local",
+                    {"prompt": "hi", "mock_response": "hello"},
+                    session_id="stream-test",
+                )
+            ]
+        self.assertEqual(events[0], {"type": "delta", "content": "hello"})
+        self.assertEqual(events[-1]["type"], "done")
 
 
 class EchoWrapperTests(unittest.IsolatedAsyncioTestCase):

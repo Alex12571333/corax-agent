@@ -20,8 +20,9 @@ import json
 import logging
 from pathlib import Path
 import re
+import time
 import uuid
-from typing import Any, Awaitable, Callable, Iterable
+from typing import Any, AsyncIterator, Awaitable, Callable, Iterable
 
 _DEFAULT_SYSTEM_PROMPT = (
     "You are Corax, a helpful assistant running locally on the user's machine. "
@@ -39,6 +40,7 @@ _DEFAULT_SYSTEM_PROMPT = (
 )
 
 RunCapability = Callable[..., Awaitable[dict]]
+StreamCapability = Callable[..., AsyncIterator[dict]]
 ToolSelector = Callable[[str, list[dict]], Iterable[str]]
 
 _SAFE_TOOL_NAME = re.compile(r"[^a-zA-Z0-9_-]")
@@ -63,6 +65,7 @@ class CoraxTelegramGateway:
         self,
         *,
         run_capability: RunCapability,
+        stream_capability: StreamCapability | None = None,
         capabilities: Iterable[dict] = (),
         gateway_id: str = "gateway",
         llm_id: str = "llm.local",
@@ -73,8 +76,10 @@ class CoraxTelegramGateway:
         max_tool_iterations: int = 6,
         max_tool_recovery_prompts: int = 1,
         max_tool_result_chars: int = 4000,
-        reveal_chunk: int = 64,
-        reveal_delay: float = 0.2,
+        reveal_chunk: int = 28,
+        reveal_delay: float = 0.08,
+        reveal_edit_interval_ms: int = 450,
+        reveal_buffer_threshold: int = 28,
         system_prompt: str = _DEFAULT_SYSTEM_PROMPT,
         workspace_path: str | Path = "workspace",
         max_history_messages: int = 20,
@@ -86,6 +91,7 @@ class CoraxTelegramGateway:
         sleep: Callable[[float], Awaitable[None]] | None = None,
     ) -> None:
         self._run = run_capability
+        self._stream = stream_capability
         self.gateway_id = gateway_id
         self.llm_id = llm_id
         self.telegram_id = telegram_id
@@ -97,6 +103,8 @@ class CoraxTelegramGateway:
         self.max_tool_result_chars = max_tool_result_chars
         self.reveal_chunk = reveal_chunk
         self.reveal_delay = reveal_delay
+        self.reveal_edit_interval_ms = max(100, reveal_edit_interval_ms)
+        self.reveal_buffer_threshold = max(8, reveal_buffer_threshold)
         self.system_prompt = system_prompt
         self.workspace_path = Path(workspace_path).expanduser()
         self.max_history_messages = max(0, max_history_messages)
@@ -276,7 +284,7 @@ class CoraxTelegramGateway:
                 generate["tools"] = active_tools
             if self.model:
                 generate["model"] = self.model
-            response = await self._run(self.llm_id, generate, session_id=session_id)
+            response = await self._generate(chat_id, generate, session_id=session_id)
             tool_calls = response.get("tool_calls") or []
             if not tool_calls:
                 if (
@@ -290,6 +298,10 @@ class CoraxTelegramGateway:
                     messages.append({"role": "system", "content": recovery_prompt or self._tool_recovery_prompt()})
                     continue
                 final_text = response.get("text") or ""
+                if response.get("_streamed"):
+                    delivered_text = final_text or "(no response)"
+                    await self._record_turn(session_id, text, user_message, delivered_text)
+                    return
                 break
             messages.append(
                 {
@@ -333,6 +345,69 @@ class CoraxTelegramGateway:
         except Exception as exc:  # noqa: BLE001
             self.log.debug("chat action failed: %s", exc)
 
+    async def _generate(self, chat_id: Any, payload: dict[str, Any], *, session_id: str) -> dict[str, Any]:
+        if self._stream is None:
+            return await self._run(self.llm_id, payload, session_id=session_id)
+        try:
+            streamed = await self._stream_generate(chat_id, payload, session_id=session_id)
+        except Exception as exc:  # noqa: BLE001 - fallback to ordinary generate
+            self.log.debug("llm streaming failed, falling back to generate: %s", exc)
+            return await self._run(self.llm_id, payload, session_id=session_id)
+        return streamed
+
+    async def _stream_generate(self, chat_id: Any, payload: dict[str, Any], *, session_id: str) -> dict[str, Any]:
+        text = ""
+        message_id: Any = None
+        last_sent = ""
+        last_edit_at = time.monotonic()
+        tool_calls: list[dict[str, Any]] = []
+        finish_reason = "stop"
+
+        async for event in self._stream(self.llm_id, payload, session_id=session_id):
+            event_type = event.get("type")
+            if event_type == "delta":
+                content = event.get("content")
+                if not isinstance(content, str) or not content:
+                    continue
+                text += content
+                elapsed_ms = 10 ** 9 if message_id is None else (time.monotonic() - last_edit_at) * 1000
+                stream_payload = await self._stream_edit(
+                    chat_id,
+                    message_id,
+                    text,
+                    last_sent,
+                    done=False,
+                    elapsed_ms=elapsed_ms,
+                )
+                message_id = stream_payload.get("message_id", message_id)
+                if stream_payload.get("edited"):
+                    sent_text = stream_payload.get("sent_text")
+                    last_sent = sent_text if isinstance(sent_text, str) else text
+                    last_edit_at = time.monotonic()
+            elif event_type == "done":
+                raw_tool_calls = event.get("tool_calls")
+                if isinstance(raw_tool_calls, list):
+                    tool_calls = [call for call in raw_tool_calls if isinstance(call, dict)]
+                if isinstance(event.get("finish_reason"), str):
+                    finish_reason = event["finish_reason"]
+                break
+
+        if text:
+            await self._stream_edit(
+                chat_id,
+                message_id,
+                text,
+                last_sent,
+                done=True,
+                elapsed_ms=10 ** 9,
+            )
+        return {
+            "text": text,
+            "tool_calls": tool_calls,
+            "finish_reason": finish_reason,
+            "_streamed": bool(text and not tool_calls),
+        }
+
     async def _reveal(self, chat_id: Any, text: str) -> None:
         """Stream the final answer in by progressively editing one message."""
         if len(text) <= self.reveal_chunk:
@@ -340,15 +415,44 @@ class CoraxTelegramGateway:
             return
         message_id: Any = None
         last_sent = ""
+        last_edit_at = time.monotonic()
         cut = self.reveal_chunk
         while cut < len(text):
-            message_id = await self._stream_edit(chat_id, message_id, text[:cut], last_sent, done=False)
-            last_sent = text[:cut]
+            elapsed_ms = 10 ** 9 if message_id is None else (time.monotonic() - last_edit_at) * 1000
+            payload = await self._stream_edit(
+                chat_id,
+                message_id,
+                text[:cut],
+                last_sent,
+                done=False,
+                elapsed_ms=elapsed_ms,
+            )
+            message_id = payload.get("message_id", message_id)
+            if payload.get("edited"):
+                sent_text = payload.get("sent_text")
+                last_sent = sent_text if isinstance(sent_text, str) else text[:cut]
+                last_edit_at = time.monotonic()
             await self._sleep(self.reveal_delay)
             cut += self.reveal_chunk
-        await self._stream_edit(chat_id, message_id, text, last_sent, done=True)
+        await self._stream_edit(
+            chat_id,
+            message_id,
+            text,
+            last_sent,
+            done=True,
+            elapsed_ms=10 ** 9,
+        )
 
-    async def _stream_edit(self, chat_id: Any, message_id: Any, text: str, last_sent: str, *, done: bool) -> Any:
+    async def _stream_edit(
+        self,
+        chat_id: Any,
+        message_id: Any,
+        text: str,
+        last_sent: str,
+        *,
+        done: bool,
+        elapsed_ms: float,
+    ) -> dict[str, Any]:
         payload = await self._run(
             self.telegram_id,
             {
@@ -357,11 +461,13 @@ class CoraxTelegramGateway:
                 "message_id": message_id,
                 "text": text,
                 "last_sent_text": last_sent,
-                "elapsed_ms": 10 ** 9,  # force the connector to flush this edit
+                "elapsed_ms": elapsed_ms,
+                "edit_interval_ms": self.reveal_edit_interval_ms,
+                "buffer_threshold": self.reveal_buffer_threshold,
                 "done": done,
             },
         )
-        return payload.get("message_id", message_id)
+        return payload if isinstance(payload, dict) else {"message_id": message_id}
 
     async def _run_tool(
         self,
