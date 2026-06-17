@@ -1,4 +1,4 @@
-# Safety guardrails
+# Safety guardrails template
 
 > These rules are enforced in code (see
 > [`corax/paths.py`](../corax/paths.py) and the `security` section of
@@ -19,3 +19,5 @@
 - Confirm before irreversible or outward-facing actions.
 - Prefer read-only operations when gathering context.
 - Surface refusals and failures honestly instead of guessing.
+- Treat capability manifests and runtime policy as the source of truth; prompts
+  should not duplicate an installed tool list.
