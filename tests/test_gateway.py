@@ -160,6 +160,22 @@ class ToolSpecTests(unittest.TestCase):
         self.assertIn("telegram_send_document", names)
         self.assertNotIn("gateway", names)
 
+    def test_shell_tool_log_args_are_compact(self) -> None:
+        gw = _gateway(FakeBackend())
+        command = "python3 -c \"" + "\n".join(f"print({i})" for i in range(30)) + "\""
+        rendered = gw._format_tool_args_for_log("shell", {"command": command})
+        self.assertIn('command="python3 -c', rendered)
+        self.assertNotIn("\n", rendered)
+        self.assertLess(len(rendered), 170)
+
+    def test_filesystem_tool_log_args_show_operation_and_path(self) -> None:
+        gw = _gateway(FakeBackend())
+        rendered = gw._format_tool_args_for_log(
+            "filesystem",
+            {"operation": "write", "path": "notes.txt", "content": "secret long content"},
+        )
+        self.assertEqual(rendered, 'operation=write path="notes.txt"')
+
 
 class ChatToolLoopTests(unittest.IsolatedAsyncioTestCase):
     async def test_plain_answer_no_tools(self) -> None:

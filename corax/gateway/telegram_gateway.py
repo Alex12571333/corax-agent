@@ -44,6 +44,7 @@ _MEDIA_REQUEST = re.compile(
     re.IGNORECASE,
 )
 _SEND_DOCUMENT_TOOL = "telegram_send_document"
+_LOG_VALUE_LIMIT = 140
 
 
 class GatewayError(RuntimeError):
@@ -355,7 +356,8 @@ class CoraxTelegramGateway:
         elif cap_id is None:
             result: dict[str, Any] = {"error": f"unknown tool {name!r}"}
         else:
-            self.log.info("tool call: %s(%s)", cap_id, args)
+            self.log.info("tool %-20s %s", cap_id, self._format_tool_args_for_log(cap_id, args))
+            self.log.debug("tool payload: %s(%s)", cap_id, args)
             try:
                 result = await self._run(cap_id, args)
             except Exception as exc:  # noqa: BLE001 - a failed tool feeds the error back
@@ -566,6 +568,44 @@ class CoraxTelegramGateway:
         now = datetime.datetime.now().astimezone()
         timestamp = now.strftime("%a %Y-%m-%d %H:%M %Z")
         return f"[{timestamp}] {text}"
+
+    def _format_tool_args_for_log(self, cap_id: str, args: dict[str, Any]) -> str:
+        if not args:
+            return ""
+        if cap_id == "shell":
+            command = args.get("command")
+            if isinstance(command, str):
+                return f'command="{self._compact_log_value(command)}"'
+        if cap_id in {"filesystem", "editor"}:
+            parts = []
+            operation = args.get("operation")
+            path = args.get("path")
+            if isinstance(operation, str) and operation:
+                parts.append(f"operation={operation}")
+            if isinstance(path, str) and path:
+                parts.append(f'path="{self._compact_log_value(path, limit=80)}"')
+            if parts:
+                return " ".join(parts)
+
+        parts = []
+        for key, value in args.items():
+            if key in {"content", "text", "last_sent_text"}:
+                continue
+            if isinstance(value, str):
+                parts.append(f'{key}="{self._compact_log_value(value, limit=80)}"')
+            elif isinstance(value, (int, float, bool)) or value is None:
+                parts.append(f"{key}={value!r}")
+            else:
+                parts.append(f"{key}=<{type(value).__name__}>")
+            if len(parts) >= 4:
+                break
+        return " ".join(parts) if parts else f"{len(args)} arg(s)"
+
+    def _compact_log_value(self, value: str, *, limit: int = _LOG_VALUE_LIMIT) -> str:
+        cleaned = " ".join(value.split())
+        if len(cleaned) <= limit:
+            return cleaned
+        return f"{cleaned[: limit - 1]}..."
 
     def _user_requested_media(self, text: str) -> bool:
         return bool(_MEDIA_REQUEST.search(text))
