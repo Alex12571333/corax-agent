@@ -86,6 +86,25 @@ class FakeBackend:
                         "caption": payload.get("caption"),
                     },
                 }
+            if op == "plan_tool_recovery":
+                result = dict(payload.get("tool_result") or {})
+                failed = result.get("ok") is False or any(key in result for key in ("error", "errors", "exception"))
+                recovery_prompt = ""
+                if failed:
+                    result.setdefault("ok", False)
+                    result["error_kind"] = "missing_file_or_resource"
+                    result["recovery_steps"] = ["list or search nearby paths"]
+                    result["recovery_hint"] = "try another available tool before asking the user"
+                    recovery_prompt = "A tool failed and no recovery attempt has been made yet."
+                return {
+                    "operation": "plan_tool_recovery",
+                    "ok": True,
+                    "tool_failed": failed,
+                    "tool_result": result,
+                    "error_kind": result.get("error_kind", ""),
+                    "recovery_steps": result.get("recovery_steps", []),
+                    "recovery_prompt": recovery_prompt,
+                }
             if op in {"new_session", "record_turn", "record_artifact", "forget_session"}:
                 return {"operation": op, "ok": True}
             return {"operation": op, "ok": True}
@@ -355,6 +374,22 @@ class ChatToolLoopTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(artifact_calls[0]["tool_capability_id"], "filesystem")
         self.assertEqual(artifact_calls[0]["tool_result"]["path"], "notes.txt")
+
+    async def test_gateway_capability_plans_tool_recovery(self) -> None:
+        backend = FakeBackend(
+            poll_batches=[[_text_update(5, "read notes")]],
+            llm_responses=[
+                {"tool_calls": [_tool_call("filesystem", '{"operation": "read", "path": "missing.txt"}')]},
+                {"text": "ok"},
+            ],
+        )
+        backend.fail_capability = "filesystem"
+        await _gateway(backend, capabilities=CAPS_WITH_GATEWAY).run(max_iterations=1)
+        recovery_calls = [
+            call for call in backend.gateway_calls if call["operation"] == "plan_tool_recovery"
+        ]
+        self.assertEqual(recovery_calls[0]["tool_capability_id"], "filesystem")
+        self.assertEqual(recovery_calls[0]["tool_result"]["error"], "boom")
 
     async def test_same_chat_reuses_session_history(self) -> None:
         backend = FakeBackend(

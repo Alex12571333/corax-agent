@@ -256,6 +256,7 @@ class CoraxTelegramGateway:
         recovery_needed = False
         recovery_tool_attempted = False
         recovery_prompts = 0
+        recovery_prompt = ""
         for _ in range(self.max_tool_iterations):
             await self._typing(chat_id)  # show "typing…" while the agent works
             generate: dict[str, Any] = {
@@ -278,7 +279,7 @@ class CoraxTelegramGateway:
                 ):
                     recovery_prompts += 1
                     self.log.info("tool recovery prompt inserted after failed step")
-                    messages.append({"role": "system", "content": self._tool_recovery_prompt()})
+                    messages.append({"role": "system", "content": recovery_prompt or self._tool_recovery_prompt()})
                     continue
                 final_text = response.get("text") or ""
                 break
@@ -291,7 +292,7 @@ class CoraxTelegramGateway:
             )
             failed_tools = 0
             for tool_call in tool_calls:
-                tool_failed = await self._run_tool(
+                tool_outcome = await self._run_tool(
                     messages,
                     tool_call,
                     chat_id=chat_id,
@@ -299,8 +300,9 @@ class CoraxTelegramGateway:
                     allow_media=allow_media,
                     user_text=text,
                 )
-                if tool_failed:
+                if tool_outcome["failed"]:
                     failed_tools += 1
+                    recovery_prompt = tool_outcome.get("recovery_prompt") or recovery_prompt
             if failed_tools:
                 recovery_needed = True
                 recovery_tool_attempted = False
@@ -362,7 +364,7 @@ class CoraxTelegramGateway:
         session_id: str,
         allow_media: bool,
         user_text: str,
-    ) -> bool:
+    ) -> dict[str, Any]:
         function = tool_call.get("function") or {}
         name = function.get("name")
         cap_id = self._tool_to_cap.get(name)
@@ -392,21 +394,35 @@ class CoraxTelegramGateway:
                 result = {"error": str(exc)}
             else:
                 await self._record_artifact(session_id, cap_id, args, result)
-            if self._tool_result_failed(result):
+            recovery_plan = await self._plan_tool_recovery(session_id, cap_id, args, result)
+            tool_failed = bool(recovery_plan.get("tool_failed"))
+            if tool_failed:
                 self.log.warning(
                     "tool %-20s failed: %s",
                     cap_id,
                     self._compact_log_value(self._tool_error_text(result), limit=100),
                 )
+            model_result = recovery_plan.get("tool_result")
+            if not isinstance(model_result, dict):
+                model_result = result
+        if name == _SEND_DOCUMENT_TOOL or cap_id is None:
+            recovery_plan = await self._plan_tool_recovery(session_id, cap_id or name or "unknown", args, result)
+            tool_failed = bool(recovery_plan.get("tool_failed"))
+            model_result = recovery_plan.get("tool_result")
+            if not isinstance(model_result, dict):
+                model_result = result
 
         messages.append(
             {
                 "role": "tool",
                 "tool_call_id": tool_call.get("id"),
-                "content": self._format_tool_result_for_model(result)[: self.max_tool_result_chars],
+                "content": json.dumps(model_result)[: self.max_tool_result_chars],
             }
         )
-        return self._tool_result_failed(result)
+        return {
+            "failed": tool_failed,
+            "recovery_prompt": recovery_plan.get("recovery_prompt") or "",
+        }
 
     async def _send(self, chat_id: Any, text: str) -> None:
         await self._run(
@@ -524,6 +540,43 @@ class CoraxTelegramGateway:
             except Exception as exc:  # noqa: BLE001
                 self.log.debug("gateway record_artifact failed: %s", exc)
         self._remember_recent_file(session_id, cap_id, args, result)
+
+    async def _plan_tool_recovery(
+        self,
+        session_id: str,
+        cap_id: str,
+        args: dict[str, Any],
+        result: dict[str, Any],
+    ) -> dict[str, Any]:
+        if self._has_gateway_capability:
+            try:
+                planned = await self._run(
+                    self.gateway_id,
+                    {
+                        "operation": "plan_tool_recovery",
+                        "session_id": session_id,
+                        "tool_capability_id": cap_id,
+                        "tool_args": args,
+                        "tool_result": result,
+                        "max_tool_recovery_prompts": self.max_tool_recovery_prompts,
+                    },
+                )
+                if (
+                    isinstance(planned, dict)
+                    and isinstance(planned.get("tool_failed"), bool)
+                    and isinstance(planned.get("tool_result"), dict)
+                ):
+                    return planned
+            except Exception as exc:  # noqa: BLE001
+                self.log.debug("gateway plan_tool_recovery failed: %s", exc)
+
+        return {
+            "operation": "plan_tool_recovery",
+            "ok": True,
+            "tool_failed": self._tool_result_failed(result),
+            "tool_result": json.loads(self._format_tool_result_for_model(result)),
+            "recovery_prompt": self._tool_recovery_prompt() if self._tool_result_failed(result) else "",
+        }
 
     async def _plan_file_delivery(
         self,
