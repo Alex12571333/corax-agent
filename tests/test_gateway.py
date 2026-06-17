@@ -140,8 +140,11 @@ def _tool_call(name, arguments="{}", id="c1"):
     return {"id": id, "type": "function", "function": {"name": name, "arguments": arguments}}
 
 
-def _text_update(chat_id, text):
-    return {"chat_id": chat_id, "text": text, "command": {"is_command": False}}
+def _text_update(chat_id, text, *, chat_type=None):
+    update = {"chat_id": chat_id, "text": text, "command": {"is_command": False}}
+    if chat_type is not None:
+        update["chat_type"] = chat_type
+    return update
 
 
 def _cmd_update(chat_id, command, args="", reply=None):
@@ -272,7 +275,7 @@ class ChatToolLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertRegex(gen["messages"][1]["content"], r"^\[[A-Z][a-z]{2} \d{4}-\d{2}-\d{2} ")
 
     async def test_streaming_answer_is_sent_live_without_duplicate_final(self) -> None:
-        backend = FakeBackend(poll_batches=[[_text_update(5, "hi")]])
+        backend = FakeBackend(poll_batches=[[_text_update(5, "hi", chat_type="private")]])
         gw = _gateway(
             backend,
             stream_capability=_streamer([
@@ -287,6 +290,10 @@ class ChatToolLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(generate_calls, [])
         self.assertTrue(stream_calls[-1]["done"])
         self.assertEqual(stream_calls[-1]["text"], "hello there")
+        self.assertEqual(stream_calls[0]["transport"], "auto")
+        self.assertEqual(stream_calls[0]["chat_type"], "private")
+        self.assertIsInstance(stream_calls[0]["draft_id"], int)
+        self.assertEqual(stream_calls[-1]["draft_id"], stream_calls[0]["draft_id"])
         self.assertEqual(backend.sends.count("hello there"), 1)
 
     async def test_streaming_tool_call_is_executed_by_gateway_loop(self) -> None:

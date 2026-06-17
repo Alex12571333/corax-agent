@@ -80,6 +80,7 @@ class CoraxTelegramGateway:
         reveal_delay: float = 0.08,
         reveal_edit_interval_ms: int = 450,
         reveal_buffer_threshold: int = 28,
+        stream_transport: str = "auto",
         system_prompt: str = _DEFAULT_SYSTEM_PROMPT,
         workspace_path: str | Path = "workspace",
         max_history_messages: int = 20,
@@ -105,6 +106,7 @@ class CoraxTelegramGateway:
         self.reveal_delay = reveal_delay
         self.reveal_edit_interval_ms = max(100, reveal_edit_interval_ms)
         self.reveal_buffer_threshold = max(8, reveal_buffer_threshold)
+        self.stream_transport = stream_transport
         self.system_prompt = system_prompt
         self.workspace_path = Path(workspace_path).expanduser()
         self.max_history_messages = max(0, max_history_messages)
@@ -222,7 +224,7 @@ class CoraxTelegramGateway:
             return
         text = update.get("text")
         if isinstance(text, str) and text.strip():
-            await self._handle_chat(chat_id, text)
+            await self._handle_chat(chat_id, text, chat_type=update.get("chat_type"))
 
     # -- dispatch -------------------------------------------------------- #
     async def _handle_command(self, chat_id: Any, command: dict) -> None:
@@ -261,7 +263,7 @@ class CoraxTelegramGateway:
         else:  # unknown
             await self._send(chat_id, "Unknown command. Send /help.")
 
-    async def _handle_chat(self, chat_id: Any, text: str) -> None:
+    async def _handle_chat(self, chat_id: Any, text: str, *, chat_type: Any = None) -> None:
         prepared = await self._prepare_turn(chat_id, text)
         session_id = prepared["session_id"]
         allow_media = bool(prepared["allow_outbound_file"])
@@ -284,7 +286,12 @@ class CoraxTelegramGateway:
                 generate["tools"] = active_tools
             if self.model:
                 generate["model"] = self.model
-            response = await self._generate(chat_id, generate, session_id=session_id)
+            response = await self._generate(
+                chat_id,
+                generate,
+                session_id=session_id,
+                chat_type=chat_type,
+            )
             tool_calls = response.get("tool_calls") or []
             if not tool_calls:
                 if (
@@ -345,21 +352,41 @@ class CoraxTelegramGateway:
         except Exception as exc:  # noqa: BLE001
             self.log.debug("chat action failed: %s", exc)
 
-    async def _generate(self, chat_id: Any, payload: dict[str, Any], *, session_id: str) -> dict[str, Any]:
+    async def _generate(
+        self,
+        chat_id: Any,
+        payload: dict[str, Any],
+        *,
+        session_id: str,
+        chat_type: Any = None,
+    ) -> dict[str, Any]:
         if self._stream is None:
             return await self._run(self.llm_id, payload, session_id=session_id)
         try:
-            streamed = await self._stream_generate(chat_id, payload, session_id=session_id)
+            streamed = await self._stream_generate(
+                chat_id,
+                payload,
+                session_id=session_id,
+                chat_type=chat_type,
+            )
         except Exception as exc:  # noqa: BLE001 - fallback to ordinary generate
             self.log.debug("llm streaming failed, falling back to generate: %s", exc)
             return await self._run(self.llm_id, payload, session_id=session_id)
         return streamed
 
-    async def _stream_generate(self, chat_id: Any, payload: dict[str, Any], *, session_id: str) -> dict[str, Any]:
+    async def _stream_generate(
+        self,
+        chat_id: Any,
+        payload: dict[str, Any],
+        *,
+        session_id: str,
+        chat_type: Any = None,
+    ) -> dict[str, Any]:
         text = ""
         message_id: Any = None
         last_sent = ""
         last_edit_at = time.monotonic()
+        draft_id = int(time.time() * 1000) % 2_147_000_000 or 1
         tool_calls: list[dict[str, Any]] = []
         finish_reason = "stop"
 
@@ -378,6 +405,8 @@ class CoraxTelegramGateway:
                     last_sent,
                     done=False,
                     elapsed_ms=elapsed_ms,
+                    chat_type=chat_type,
+                    draft_id=draft_id,
                 )
                 message_id = stream_payload.get("message_id", message_id)
                 if stream_payload.get("edited"):
@@ -400,6 +429,8 @@ class CoraxTelegramGateway:
                 last_sent,
                 done=True,
                 elapsed_ms=10 ** 9,
+                chat_type=chat_type,
+                draft_id=draft_id,
             )
         return {
             "text": text,
@@ -452,20 +483,28 @@ class CoraxTelegramGateway:
         *,
         done: bool,
         elapsed_ms: float,
+        chat_type: Any = None,
+        draft_id: int | None = None,
     ) -> dict[str, Any]:
+        request = {
+            "operation": "stream",
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text,
+            "last_sent_text": last_sent,
+            "elapsed_ms": elapsed_ms,
+            "edit_interval_ms": self.reveal_edit_interval_ms,
+            "buffer_threshold": self.reveal_buffer_threshold,
+            "transport": self.stream_transport,
+            "done": done,
+        }
+        if chat_type is not None:
+            request["chat_type"] = str(chat_type)
+        if draft_id is not None:
+            request["draft_id"] = draft_id
         payload = await self._run(
             self.telegram_id,
-            {
-                "operation": "stream",
-                "chat_id": chat_id,
-                "message_id": message_id,
-                "text": text,
-                "last_sent_text": last_sent,
-                "elapsed_ms": elapsed_ms,
-                "edit_interval_ms": self.reveal_edit_interval_ms,
-                "buffer_threshold": self.reveal_buffer_threshold,
-                "done": done,
-            },
+            request,
         )
         return payload if isinstance(payload, dict) else {"message_id": message_id}
 
