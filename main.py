@@ -159,6 +159,7 @@ async def _run_chat(app: "CoraxApp", config_path: Path) -> int:
                 "model": app.config.llm.model,
                 "workspace_path": runtime.workspace_path,
                 "state_path": runtime.data_path / "telegram-gateway-fallback-state.json",
+                "profile_path": runtime.data_path / "profile.md",
                 "tool_selector": selector.select if selector.available else None,
                 "stream_transport": stream_transport,
             }

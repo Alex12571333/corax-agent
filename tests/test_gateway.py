@@ -657,6 +657,64 @@ class ChatToolLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("новости экономики" in m.get("content", "") for m in messages))
         self.assertTrue(any("Ищу свежие новости экономики" in m.get("content", "") for m in messages))
 
+    async def test_profile_memory_survives_new_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            profile_path = Path(tmpdir) / "profile.md"
+            backend = FakeBackend(
+                poll_batches=[
+                    [_text_update(5, "Меня зовут Алекс, пиши со мной на русском.")],
+                    [_cmd_update(5, "new_session")],
+                    [_text_update(5, "как меня зовут?")],
+                ],
+                llm_responses=[{"text": "Запомнил имя."}, {"text": "Алекс."}],
+            )
+            sessions = iter(["sess-1", "sess-2"])
+            await _gateway(
+                backend,
+                profile_path=profile_path,
+                new_session=lambda: next(sessions),
+            ).run(max_iterations=3)
+
+            profile_text = profile_path.read_text(encoding="utf-8")
+
+        self.assertIn("Меня зовут Алекс", profile_text)
+        gen_calls = [p for _c, op, p in backend.calls if op == "generate"]
+        messages = gen_calls[1]["messages"]
+        system_text = messages[0]["content"]
+        self.assertIn("Remembered User Profile", system_text)
+        self.assertIn("Меня зовут Алекс", system_text)
+        self.assertFalse(any(m.get("role") == "assistant" and "Запомнил имя" in m.get("content", "") for m in messages))
+
+    async def test_profile_memory_skips_secret_like_notes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            profile_path = Path(tmpdir) / "profile.md"
+            backend = FakeBackend(
+                poll_batches=[[_text_update(5, "запомни токен abc123")]],
+                llm_responses=[{"text": "Не сохраняю секреты."}],
+            )
+            await _gateway(backend, profile_path=profile_path).run(max_iterations=1)
+
+            self.assertFalse(profile_path.exists())
+
+    async def test_profile_memory_saves_answer_to_onboarding_question(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            profile_path = Path(tmpdir) / "profile.md"
+            backend = FakeBackend(
+                poll_batches=[
+                    [_text_update(5, "привет")],
+                    [_text_update(5, "Алекс, русский, проект Corax")],
+                ],
+                llm_responses=[
+                    {"text": "Как вас зовут, какой язык предпочитаете и с какими проектами помогать?"},
+                    {"text": "Отлично."},
+                ],
+            )
+            await _gateway(backend, profile_path=profile_path).run(max_iterations=2)
+
+            profile_text = profile_path.read_text(encoding="utf-8")
+
+        self.assertIn("Алекс, русский, проект Corax", profile_text)
+
     async def test_new_session_starts_empty_history(self) -> None:
         backend = FakeBackend(
             poll_batches=[

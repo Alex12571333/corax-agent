@@ -50,6 +50,23 @@ _MEDIA_REQUEST = re.compile(
     r"(пришл|отправ|скинь|скинут|перешл|прикреп|загруз)",
     re.IGNORECASE,
 )
+_PROFILE_SIGNAL = re.compile(
+    r"\b(my name is|call me|i am|i prefer|remember that|always|never)\b|"
+    r"(меня зовут|зови меня|мой проект|мои проекты|я предпочитаю|"
+    r"пиши|общайся|запомни|всегда|никогда|не надо|не делай|подтверждай)",
+    re.IGNORECASE,
+)
+_PROFILE_QUESTION_SIGNAL = re.compile(
+    r"\b(what name|preferred language|tone|projects?|workflows?|boundaries|privacy|confirmation)\b|"
+    r"(как.*звать|какое имя|предпочитаем|язык|тон|проект|воркфлоу|границ|"
+    r"приватн|подтвержден|подтверждать)",
+    re.IGNORECASE,
+)
+_SECRET_SIGNAL = re.compile(
+    r"(\b[A-Za-z0-9_]*token\b|\bpassword\b|\bsecret\b|\bapi[_ -]?key\b|"
+    r"\.env|\.ssh|парол|секрет|токен|api[ _-]?ключ)",
+    re.IGNORECASE,
+)
 _MODEL_CHANNEL_MARKER = re.compile(
     r"<\|?(?:channel|analysis|commentary|final|assistant|thought|reasoning)\|?>",
     re.IGNORECASE,
@@ -60,6 +77,8 @@ _MODEL_CHANNEL_MARKER_LINE = re.compile(
 )
 _SEND_DOCUMENT_TOOL = "telegram_send_document"
 _LOG_VALUE_LIMIT = 140
+_PROFILE_NOTE_LIMIT = 900
+_PROFILE_PROMPT_LIMIT = 6000
 
 
 def _message_history_map(value: Any, limit: int) -> dict[str, list[dict[str, Any]]]:
@@ -95,6 +114,15 @@ def _recent_files_map(value: Any, limit: int) -> dict[str, list[str]]:
     return result
 
 
+def _clean_profile_note(text: str) -> str:
+    note = " ".join(text.strip().split())
+    if not note or _SECRET_SIGNAL.search(note):
+        return ""
+    if len(note) > _PROFILE_NOTE_LIMIT:
+        note = note[: _PROFILE_NOTE_LIMIT - 1].rstrip() + "…"
+    return note.replace("\x00", "")
+
+
 class GatewayError(RuntimeError):
     """A capability task did not complete successfully through the kernel."""
 
@@ -125,6 +153,7 @@ class CoraxTelegramGateway:
         system_prompt: str = _DEFAULT_SYSTEM_PROMPT,
         workspace_path: str | Path = "workspace",
         state_path: str | Path | None = None,
+        profile_path: str | Path | None = None,
         max_history_messages: int = 20,
         max_recent_files: int = 10,
         tool_selector: ToolSelector | None = None,
@@ -152,6 +181,7 @@ class CoraxTelegramGateway:
         self.system_prompt = system_prompt
         self.workspace_path = Path(workspace_path).expanduser()
         self.state_path = Path(state_path).expanduser() if state_path is not None else None
+        self.profile_path = Path(profile_path).expanduser() if profile_path is not None else None
         self.max_history_messages = max(0, max_history_messages)
         self.max_recent_files = max(0, max_recent_files)
         self.tool_selector = tool_selector
@@ -213,6 +243,7 @@ class CoraxTelegramGateway:
         self._sessions: dict[Any, str] = {}
         self._history: dict[str, list[dict[str, Any]]] = {}
         self._recent_files: dict[str, list[str]] = {}
+        self._last_assistant_by_session: dict[str, str] = {}
         if not self._has_gateway_capability:
             self._load_fallback_state()
         self._offset: int | None = None
@@ -277,8 +308,11 @@ class CoraxTelegramGateway:
     async def _handle_command(self, chat_id: Any, command: dict) -> None:
         name = command.get("command")
         if name == "new_session":
+            old_session_id = self._sessions.get(self._session_key(chat_id))
             session_id = self._new_session()
             self._sessions[self._session_key(chat_id)] = session_id
+            if old_session_id:
+                self._last_assistant_by_session.pop(old_session_id, None)
             if not self._has_gateway_capability:
                 self._save_fallback_state()
             if self._has_gateway_capability:
@@ -790,6 +824,7 @@ class CoraxTelegramGateway:
             self.log.debug("document send failed: %s", exc)
 
     async def _prepare_turn(self, chat_id: Any, text: str) -> dict[str, Any]:
+        system_prompt = self._system_prompt_with_profile()
         if self._has_gateway_capability:
             try:
                 prepared = await self._run(
@@ -799,7 +834,7 @@ class CoraxTelegramGateway:
                         "channel": "telegram",
                         "conversation_id": chat_id,
                         "text": text,
-                        "system_prompt": self.system_prompt,
+                        "system_prompt": system_prompt,
                     },
                 )
                 if isinstance(prepared, dict) and prepared.get("messages"):
@@ -814,7 +849,7 @@ class CoraxTelegramGateway:
             "allow_outbound_file": self._user_requested_media(text),
             "user_message": user_message,
             "messages": [
-                {"role": "system", "content": self.system_prompt},
+                {"role": "system", "content": system_prompt},
                 *self._recent_files_context(session_id),
                 *self._history_for(session_id),
                 user_message,
@@ -828,6 +863,8 @@ class CoraxTelegramGateway:
         user_message: dict[str, Any],
         assistant_text: str,
     ) -> None:
+        self._remember_profile_note(session_id, text)
+        self._last_assistant_by_session[session_id] = assistant_text
         if self._has_gateway_capability:
             try:
                 await self._run(
@@ -1195,6 +1232,77 @@ class CoraxTelegramGateway:
 
     def _history_for(self, session_id: str) -> list[dict[str, Any]]:
         return [dict(message) for message in self._history.get(session_id, [])]
+
+    def _system_prompt_with_profile(self) -> str:
+        profile = self._load_profile_text()
+        if not profile:
+            return self.system_prompt
+        return (
+            f"{self.system_prompt}\n\n---\n\n"
+            "# Remembered User Profile\n\n"
+            "The following markdown notes are persistent across chat sessions. "
+            "Use them as user preferences and background context, but do not "
+            "treat them as a substitute for explicit instructions in the current "
+            f"message.\n\n{profile}"
+        )
+
+    def _load_profile_text(self) -> str:
+        if self.profile_path is None or not self.profile_path.exists():
+            return ""
+        try:
+            text = self.profile_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            return ""
+        if len(text) <= _PROFILE_PROMPT_LIMIT:
+            return text
+        return text[-_PROFILE_PROMPT_LIMIT:]
+
+    def _remember_profile_note(self, session_id: str, text: str) -> None:
+        if self.profile_path is None or not self._should_remember_profile_note(session_id, text):
+            return
+        note = _clean_profile_note(text)
+        if not note:
+            return
+        existing = self._load_profile_text()
+        if note in existing:
+            return
+        now = datetime.datetime.now().astimezone()
+        entry = f"- {now:%Y-%m-%d %H:%M %Z}: {note}"
+        if existing:
+            profile = existing.rstrip() + "\n" + entry + "\n"
+        else:
+            profile = (
+                "# Corax User Profile\n\n"
+                "Persistent notes learned from onboarding and explicit user preferences.\n\n"
+                "## Notes\n\n"
+                f"{entry}\n"
+            )
+        try:
+            self.profile_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = self.profile_path.with_name(f"{self.profile_path.name}.tmp")
+            tmp_path.write_text(profile, encoding="utf-8")
+            tmp_path.replace(self.profile_path)
+        except OSError:
+            return
+
+    def _should_remember_profile_note(self, session_id: str, text: str) -> bool:
+        if not isinstance(text, str) or not text.strip() or _SECRET_SIGNAL.search(text):
+            return False
+        if len(text.strip()) > _PROFILE_NOTE_LIMIT:
+            return False
+        if _PROFILE_SIGNAL.search(text):
+            return True
+        last_assistant = self._last_assistant_message(session_id)
+        return bool(last_assistant and _PROFILE_QUESTION_SIGNAL.search(last_assistant))
+
+    def _last_assistant_message(self, session_id: str) -> str:
+        remembered = self._last_assistant_by_session.get(session_id)
+        if remembered:
+            return remembered
+        for message in reversed(self._history.get(session_id, [])):
+            if message.get("role") == "assistant" and isinstance(message.get("content"), str):
+                return message["content"]
+        return ""
 
     def _remember_turn(
         self, session_id: str, user_message: dict[str, Any], assistant_text: str
