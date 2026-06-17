@@ -158,6 +158,7 @@ async def _run_chat(app: "CoraxApp", config_path: Path) -> int:
                 "capabilities": specs,
                 "model": app.config.llm.model,
                 "workspace_path": runtime.workspace_path,
+                "state_path": runtime.data_path / "telegram-gateway-fallback-state.json",
                 "tool_selector": selector.select if selector.available else None,
                 "stream_transport": stream_transport,
             }
@@ -253,7 +254,7 @@ def _print_chat_dashboard(
         ("mode", "telegram chat gateway"),
         ("model", app.config.llm.model),
         ("kernel", f"ready, {len(executable)} executable capability(ies)"),
-        ("gateway", "standalone capability" if has_gateway else "fallback in-process memory"),
+        ("gateway", "standalone capability" if has_gateway else "fallback local state"),
         ("connector", "telegram.connector" if has_telegram else "missing"),
         ("streaming", f"{stream_transport} transport"),
         ("tool mode", "dynamic top-K selector" if tool_discovery else "static full list"),

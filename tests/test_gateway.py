@@ -7,6 +7,7 @@ tests are fast and deterministic.
 from __future__ import annotations
 
 import json
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -635,6 +636,26 @@ class ChatToolLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             any(m["role"] == "user" and "my name is Alex" in m["content"] for m in second_messages)
         )
+
+    async def test_fallback_state_survives_gateway_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "telegram-gateway-state.json"
+            first_backend = FakeBackend(
+                poll_batches=[[_text_update(5, "найди новости экономики")]],
+                llm_responses=[{"text": "Ищу свежие новости экономики."}],
+            )
+            await _gateway(first_backend, state_path=state_path).run(max_iterations=1)
+
+            second_backend = FakeBackend(
+                poll_batches=[[_text_update(5, "а теперь по России")]],
+                llm_responses=[{"text": "Продолжаю по России."}],
+            )
+            await _gateway(second_backend, state_path=state_path).run(max_iterations=1)
+
+        gen_calls = [p for _c, op, p in second_backend.calls if op == "generate"]
+        messages = gen_calls[0]["messages"]
+        self.assertTrue(any("новости экономики" in m.get("content", "") for m in messages))
+        self.assertTrue(any("Ищу свежие новости экономики" in m.get("content", "") for m in messages))
 
     async def test_new_session_starts_empty_history(self) -> None:
         backend = FakeBackend(

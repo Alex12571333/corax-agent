@@ -62,6 +62,39 @@ _SEND_DOCUMENT_TOOL = "telegram_send_document"
 _LOG_VALUE_LIMIT = 140
 
 
+def _message_history_map(value: Any, limit: int) -> dict[str, list[dict[str, Any]]]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, list[dict[str, Any]]] = {}
+    for session_id, messages in value.items():
+        if not isinstance(session_id, str) or not isinstance(messages, list):
+            continue
+        cleaned: list[dict[str, Any]] = []
+        for message in messages[-limit:] if limit > 0 else []:
+            if not isinstance(message, dict):
+                continue
+            role = message.get("role")
+            content = message.get("content")
+            if isinstance(role, str) and isinstance(content, str):
+                cleaned.append({"role": role, "content": content})
+        if cleaned:
+            result[session_id] = cleaned
+    return result
+
+
+def _recent_files_map(value: Any, limit: int) -> dict[str, list[str]]:
+    if not isinstance(value, dict) or limit <= 0:
+        return {}
+    result: dict[str, list[str]] = {}
+    for session_id, files in value.items():
+        if not isinstance(session_id, str) or not isinstance(files, list):
+            continue
+        cleaned = [path for path in files[:limit] if isinstance(path, str) and path.strip()]
+        if cleaned:
+            result[session_id] = cleaned
+    return result
+
+
 class GatewayError(RuntimeError):
     """A capability task did not complete successfully through the kernel."""
 
@@ -91,6 +124,7 @@ class CoraxTelegramGateway:
         stream_transport: str = "edit",
         system_prompt: str = _DEFAULT_SYSTEM_PROMPT,
         workspace_path: str | Path = "workspace",
+        state_path: str | Path | None = None,
         max_history_messages: int = 20,
         max_recent_files: int = 10,
         tool_selector: ToolSelector | None = None,
@@ -117,6 +151,7 @@ class CoraxTelegramGateway:
         self.stream_transport = stream_transport
         self.system_prompt = system_prompt
         self.workspace_path = Path(workspace_path).expanduser()
+        self.state_path = Path(state_path).expanduser() if state_path is not None else None
         self.max_history_messages = max(0, max_history_messages)
         self.max_recent_files = max(0, max_recent_files)
         self.tool_selector = tool_selector
@@ -178,6 +213,8 @@ class CoraxTelegramGateway:
         self._sessions: dict[Any, str] = {}
         self._history: dict[str, list[dict[str, Any]]] = {}
         self._recent_files: dict[str, list[str]] = {}
+        if not self._has_gateway_capability:
+            self._load_fallback_state()
         self._offset: int | None = None
         self._reload = False
         self._stop = False
@@ -241,7 +278,9 @@ class CoraxTelegramGateway:
         name = command.get("command")
         if name == "new_session":
             session_id = self._new_session()
-            self._sessions[chat_id] = session_id
+            self._sessions[self._session_key(chat_id)] = session_id
+            if not self._has_gateway_capability:
+                self._save_fallback_state()
             if self._has_gateway_capability:
                 try:
                     await self._run(
@@ -1131,6 +1170,8 @@ class CoraxTelegramGateway:
             files.remove(path)
         files.insert(0, path)
         del files[self.max_recent_files :]
+        if not self._has_gateway_capability:
+            self._save_fallback_state()
 
     def _artifact_path_from_tool(
         self, cap_id: str, args: dict[str, Any], result: dict[str, Any]
@@ -1170,13 +1211,58 @@ class CoraxTelegramGateway:
         overflow = len(history) - self.max_history_messages
         if overflow > 0:
             del history[:overflow]
+        if not self._has_gateway_capability:
+            self._save_fallback_state()
 
     def _session_for(self, chat_id: Any) -> str:
-        session = self._sessions.get(chat_id)
+        key = self._session_key(chat_id)
+        session = self._sessions.get(key)
         if session is None:
             session = self._new_session()
-            self._sessions[chat_id] = session
+            self._sessions[key] = session
+            if not self._has_gateway_capability:
+                self._save_fallback_state()
         return session
+
+    def _session_key(self, chat_id: Any) -> str:
+        return str(chat_id)
+
+    def _load_fallback_state(self) -> None:
+        if self.state_path is None or not self.state_path.exists():
+            return
+        try:
+            data = json.loads(self.state_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        if not isinstance(data, dict):
+            return
+        self._sessions = {
+            str(key): value
+            for key, value in (data.get("sessions") or {}).items()
+            if isinstance(value, str) and value.strip()
+        }
+        self._history = _message_history_map(data.get("history"), self.max_history_messages)
+        self._recent_files = _recent_files_map(data.get("recent_files"), self.max_recent_files)
+
+    def _save_fallback_state(self) -> None:
+        if self.state_path is None:
+            return
+        data = {
+            "version": 1,
+            "sessions": self._sessions,
+            "history": self._history,
+            "recent_files": self._recent_files,
+        }
+        try:
+            self.state_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = self.state_path.with_name(f"{self.state_path.name}.tmp")
+            tmp_path.write_text(
+                json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            tmp_path.replace(self.state_path)
+        except OSError:
+            return
 
 
 async def _async_sleep(seconds: float) -> None:

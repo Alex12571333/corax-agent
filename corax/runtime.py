@@ -109,6 +109,7 @@ class CoraxRuntime:
         self.workspace_path = Path(
             workspace_path or self.root_path / config.runtime.workspace_path
         ).resolve()
+        self.data_path = Path(self.root_path / config.runtime.data_path).resolve()
         self.core_version = core_version
 
         self.connectors = ConnectorRegistry()
@@ -137,6 +138,7 @@ class CoraxRuntime:
         self._apply_llm_environment()
         self._apply_telegram_environment()
         self._apply_websearch_environment()
+        self._apply_gateway_environment()
         self._populate_registries()
         self._running = True
         self._started_at = datetime.now(timezone.utc)
@@ -282,6 +284,20 @@ class CoraxRuntime:
                 os.environ[env_name] = value
             else:
                 os.environ.pop(env_name, None)
+
+    def _apply_gateway_environment(self) -> None:
+        """Give the standalone gateway a durable local state file.
+
+        Session memory belongs to the gateway capability, but it is loaded
+        through the generic SDK interface, so constructor wiring would couple the
+        agent to one capability. A non-secret env var keeps the package
+        standalone while making Telegram restarts reuse the same conversation
+        context.
+        """
+        os.environ.setdefault(
+            "CORAX_GATEWAY_STATE_PATH",
+            str(self.data_path / "gateway-state.json"),
+        )
 
     def _populate_registries(self) -> None:
         self._clear_registries()

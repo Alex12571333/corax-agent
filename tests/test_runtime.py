@@ -162,6 +162,43 @@ class TestRuntime(unittest.TestCase):
             asyncio.run(runtime.stop())
             os.environ.pop("CORAX_WEBSEARCH_SAFESEARCH", None)
 
+    def test_start_exports_gateway_state_path(self) -> None:
+        import os
+
+        old_value = os.environ.pop("CORAX_GATEWAY_STATE_PATH", None)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = cfg.default_config()
+            config.runtime.data_path = "custom-data"
+            runtime = CoraxRuntime(config, root_path=tmpdir)
+            asyncio.run(runtime.start())
+            try:
+                self.assertEqual(
+                    os.environ["CORAX_GATEWAY_STATE_PATH"],
+                    str((Path(tmpdir) / "custom-data" / "gateway-state.json").resolve()),
+                )
+            finally:
+                asyncio.run(runtime.stop())
+                if old_value is None:
+                    os.environ.pop("CORAX_GATEWAY_STATE_PATH", None)
+                else:
+                    os.environ["CORAX_GATEWAY_STATE_PATH"] = old_value
+
+    def test_start_keeps_custom_gateway_state_path(self) -> None:
+        import os
+
+        old_value = os.environ.get("CORAX_GATEWAY_STATE_PATH")
+        os.environ["CORAX_GATEWAY_STATE_PATH"] = "/tmp/custom-corax-gateway.json"
+        runtime = CoraxRuntime(cfg.default_config())
+        asyncio.run(runtime.start())
+        try:
+            self.assertEqual(os.environ["CORAX_GATEWAY_STATE_PATH"], "/tmp/custom-corax-gateway.json")
+        finally:
+            asyncio.run(runtime.stop())
+            if old_value is None:
+                os.environ.pop("CORAX_GATEWAY_STATE_PATH", None)
+            else:
+                os.environ["CORAX_GATEWAY_STATE_PATH"] = old_value
+
 
 class TestCapabilityIntegration(unittest.TestCase):
     def setUp(self) -> None:
