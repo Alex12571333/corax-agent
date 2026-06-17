@@ -290,11 +290,25 @@ class ChatToolLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(generate_calls, [])
         self.assertTrue(stream_calls[-1]["done"])
         self.assertEqual(stream_calls[-1]["text"], "hello there")
-        self.assertEqual(stream_calls[0]["transport"], "auto")
+        self.assertEqual(stream_calls[0]["transport"], "edit")
         self.assertEqual(stream_calls[0]["chat_type"], "private")
         self.assertIsInstance(stream_calls[0]["draft_id"], int)
         self.assertEqual(stream_calls[-1]["draft_id"], stream_calls[0]["draft_id"])
         self.assertEqual(backend.sends.count("hello there"), 1)
+
+    async def test_stream_transport_can_be_overridden(self) -> None:
+        backend = FakeBackend(poll_batches=[[_text_update(5, "hi", chat_type="private")]])
+        gw = _gateway(
+            backend,
+            stream_capability=_streamer([
+                {"type": "delta", "content": "hello"},
+                {"type": "done", "finish_reason": "stop", "tool_calls": []},
+            ]),
+            stream_transport="auto",
+        )
+        await gw.run(max_iterations=1)
+        stream_call = next(p for _c, op, p in backend.calls if op == "stream")
+        self.assertEqual(stream_call["transport"], "auto")
 
     async def test_streaming_tool_call_is_executed_by_gateway_loop(self) -> None:
         backend = FakeBackend(

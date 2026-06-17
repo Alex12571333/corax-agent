@@ -113,6 +113,7 @@ async def _run_chat(app: "CoraxApp", config_path: Path) -> int:
 
     specs = _tool_capability_specs(runtime)
     selector = RuntimeToolSelector(app.config, root_path=runtime.root_path)
+    stream_transport = _telegram_stream_transport()
     tool_ids = [
         s["id"]
         for s in specs
@@ -123,7 +124,13 @@ async def _run_chat(app: "CoraxApp", config_path: Path) -> int:
             "SECURITY",
             "no CORAX_TELEGRAM_ALLOWED_CHATS set; anyone who can message the bot can drive these tools.",
         )
-    _print_chat_dashboard(app, specs, tool_ids, tool_discovery=selector.available)
+    _print_chat_dashboard(
+        app,
+        specs,
+        tool_ids,
+        tool_discovery=selector.available,
+        stream_transport=stream_transport,
+    )
 
     while True:
         async with runtime.core.session(
@@ -136,6 +143,7 @@ async def _run_chat(app: "CoraxApp", config_path: Path) -> int:
                 model=app.config.llm.model,
                 workspace_path=runtime.workspace_path,
                 tool_selector=selector.select if selector.available else None,
+                stream_transport=stream_transport,
             )
             print(_style("Corax Telegram gateway is running. Ctrl-C to stop.", _GREEN))
             outcome = await _run_gateway_until_stopped(gateway)
@@ -145,14 +153,32 @@ async def _run_chat(app: "CoraxApp", config_path: Path) -> int:
             await runtime.reload_config(config_mod.load_config(config_path))
             specs = _tool_capability_specs(runtime)
             selector = RuntimeToolSelector(app.config, root_path=runtime.root_path)
+            stream_transport = _telegram_stream_transport()
             tool_ids = [
                 s["id"]
                 for s in specs
                 if s["id"] not in ("gateway", "llm.local", "telegram.connector")
             ]
-            _print_chat_dashboard(app, specs, tool_ids, tool_discovery=selector.available)
+            _print_chat_dashboard(
+                app,
+                specs,
+                tool_ids,
+                tool_discovery=selector.available,
+                stream_transport=stream_transport,
+            )
             continue
         return 0
+
+
+def _telegram_stream_transport() -> str:
+    transport = os.getenv("CORAX_TELEGRAM_STREAM_TRANSPORT", "edit").strip().lower()
+    if transport in {"auto", "draft", "edit", "off"}:
+        return transport
+    _print_warning(
+        "STREAMING",
+        f"invalid CORAX_TELEGRAM_STREAM_TRANSPORT={transport!r}; using edit.",
+    )
+    return "edit"
 
 
 async def _run_gateway_until_stopped(gateway: Any) -> str:
@@ -196,6 +222,7 @@ def _print_chat_dashboard(
     tool_ids: list[str],
     *,
     tool_discovery: bool = False,
+    stream_transport: str = "edit",
 ) -> None:
     runtime = app.runtime
     executable = runtime.core.executable_ids(runtime.capabilities)
@@ -208,6 +235,7 @@ def _print_chat_dashboard(
         ("kernel", f"ready, {len(executable)} executable capability(ies)"),
         ("gateway", "standalone capability" if has_gateway else "fallback in-process memory"),
         ("connector", "telegram.connector" if has_telegram else "missing"),
+        ("streaming", f"{stream_transport} transport"),
         ("tool mode", "dynamic top-K selector" if tool_discovery else "static full list"),
         ("tools", ", ".join(tool_ids) or "none"),
         ("allowed chats", allowed_chats),
