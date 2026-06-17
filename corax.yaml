@@ -44,6 +44,7 @@ capabilities:
     - shell
     - llm.local
     - telegram.connector
+    - web.search
   available:
     echo:
       enabled: true
@@ -74,6 +75,11 @@ capabilities:
       type: connector
       description: "Telegram chat connector (streaming, commands, HTML formatting)"
       path: ../corax-telegram-connector
+    web.search:
+      enabled: true
+      type: tool
+      description: "Web search via a self-hosted SearXNG instance"
+      path: ../corax-web-search-capability
 
 security:
   mode: normal
@@ -114,3 +120,14 @@ telegram:
   # allowed_chats is a comma-separated allow-list (empty = any chat).
   base_url: https://api.telegram.org
   allowed_chats: ""
+
+websearch:
+  # Web-search tool setup. Exported to CORAX_WEBSEARCH_* at runtime start.
+  # Edit here or via the runtime menu (option "W"). base_url is the self-hosted
+  # SearXNG instance (must be a local/private address, JSON format enabled).
+  # engines/language/safesearch are optional defaults (empty = unset). The
+  # optional proxy token is read from CORAX_WEBSEARCH_TOKEN and is NOT stored here.
+  base_url: http://192.168.0.14:8080
+  engines: ""
+  language: ""
+  safesearch: ""

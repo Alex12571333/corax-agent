@@ -136,6 +136,7 @@ class CoraxRuntime:
         self.log.info("starting runtime")
         self._apply_llm_environment()
         self._apply_telegram_environment()
+        self._apply_websearch_environment()
         self._populate_registries()
         self._running = True
         self._started_at = datetime.now(timezone.utc)
@@ -257,6 +258,30 @@ class CoraxRuntime:
             return
         os.environ["CORAX_TELEGRAM_BASE_URL"] = telegram.base_url
         os.environ["CORAX_TELEGRAM_ALLOWED_CHATS"] = telegram.allowed_chats
+
+    def _apply_websearch_environment(self) -> None:
+        """Export the menu-driven web-search setup so the ``web.search`` tool reads it.
+
+        The standalone tool resolves its SearXNG endpoint and default query knobs
+        from ``CORAX_WEBSEARCH_*``. ``base_url`` is always exported; the optional
+        defaults are exported only when set and cleared otherwise — an empty
+        ``safesearch`` must never be exported, or the tool would reject
+        ``int("")``. The optional proxy token stays env-only
+        (``CORAX_WEBSEARCH_TOKEN``) and is never stored in config.
+        """
+        websearch = getattr(self.config, "websearch", None)
+        if websearch is None:
+            return
+        os.environ["CORAX_WEBSEARCH_BASE_URL"] = websearch.base_url
+        for env_name, value in (
+            ("CORAX_WEBSEARCH_ENGINES", websearch.engines),
+            ("CORAX_WEBSEARCH_LANGUAGE", websearch.language),
+            ("CORAX_WEBSEARCH_SAFESEARCH", websearch.safesearch),
+        ):
+            if value:
+                os.environ[env_name] = value
+            else:
+                os.environ.pop(env_name, None)
 
     def _populate_registries(self) -> None:
         self._clear_registries()

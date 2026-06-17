@@ -120,6 +120,24 @@ class TestMenuFlows(unittest.TestCase):
         menu.run()
         self.assertEqual(menu.config.telegram.base_url, "https://tg.example/api")
 
+    def test_websearch_section_edits_base_url(self) -> None:
+        # W -> edit base_url (1) -> back -> exit
+        menu, _ = _menu(["W", "1", "http://192.168.0.50:8888", "", "0"])
+        menu.run()
+        self.assertEqual(menu.config.websearch.base_url, "http://192.168.0.50:8888")
+        self.assertTrue(menu.changed)
+
+    def test_websearch_section_edits_knobs(self) -> None:
+        # w -> engines (2) -> language (3) -> safesearch (4) -> unknown -> back -> exit
+        menu, capture = _menu(
+            ["w", "2", "brave", "3", "en", "4", "1", "zzz", "", "0"]
+        )
+        self.assertEqual(menu.run(), "discarded")
+        self.assertEqual(menu.config.websearch.engines, "brave")
+        self.assertEqual(menu.config.websearch.language, "en")
+        self.assertEqual(menu.config.websearch.safesearch, "1")
+        self.assertIn("unknown field", capture.text)
+
 
 class TestAppLifecycle(unittest.TestCase):
     def test_boot_creates_config_and_paths(self) -> None:

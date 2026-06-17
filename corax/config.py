@@ -36,6 +36,7 @@ REQUIRED_SECTIONS = (
     "ui",
     "llm",
     "telegram",
+    "websearch",
 )
 
 
@@ -166,6 +167,25 @@ class TelegramConfig:
 
 
 @dataclass
+class WebSearchConfig:
+    """Setup for the web-search tool capability (``web.search``).
+
+    Edited in the runtime menu and exported to ``CORAX_WEBSEARCH_*`` when the
+    runtime starts, so the standalone SearXNG tool picks up the operator's
+    endpoint and default query knobs without any per-capability wiring.
+    ``base_url`` is the self-hosted SearXNG instance (must be a local/private
+    address). ``engines`` / ``language`` / ``safesearch`` are optional defaults
+    (empty means "unset" and is not exported). The optional reverse-proxy token
+    is **never stored here** — it is read from ``CORAX_WEBSEARCH_TOKEN``.
+    """
+
+    base_url: str = "http://192.168.0.14:8080"
+    engines: str = ""
+    language: str = ""
+    safesearch: str = ""
+
+
+@dataclass
 class AgentConfig:
     agent: AgentMeta = field(default_factory=AgentMeta)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
@@ -178,6 +198,7 @@ class AgentConfig:
     ui: UIConfig = field(default_factory=UIConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
+    websearch: WebSearchConfig = field(default_factory=WebSearchConfig)
 
     def to_dict(self) -> dict[str, Any]:
         return config_to_dict(self)
@@ -233,6 +254,7 @@ def default_config() -> AgentConfig:
                 "gateway",
                 "llm.local",
                 "telegram.connector",
+                "web.search",
             ],
             available={
                 "echo": ProviderSpec(
@@ -275,6 +297,12 @@ def default_config() -> AgentConfig:
                     description="Telegram chat connector (streaming, commands, HTML formatting)",
                     path="../corax-telegram-connector",
                 ),
+                "web.search": ProviderSpec(
+                    enabled=True,
+                    type="tool",
+                    description="Web search via a self-hosted SearXNG instance",
+                    path="../corax-web-search-capability",
+                ),
             },
         ),
         security=SecurityConfig(
@@ -301,6 +329,12 @@ def default_config() -> AgentConfig:
         telegram=TelegramConfig(
             base_url="https://api.telegram.org",
             allowed_chats="",
+        ),
+        websearch=WebSearchConfig(
+            base_url="http://192.168.0.14:8080",
+            engines="",
+            language="",
+            safesearch="",
         ),
     )
 
@@ -376,6 +410,12 @@ def config_to_dict(config: AgentConfig) -> dict[str, Any]:
             "base_url": config.telegram.base_url,
             "allowed_chats": config.telegram.allowed_chats,
         },
+        "websearch": {
+            "base_url": config.websearch.base_url,
+            "engines": config.websearch.engines,
+            "language": config.websearch.language,
+            "safesearch": config.websearch.safesearch,
+        },
     }
 
 
@@ -392,6 +432,7 @@ def config_from_dict(data: dict[str, Any]) -> AgentConfig:
     ui = data.get("ui", {}) or {}
     llm = data.get("llm", {}) or {}
     telegram = data.get("telegram", {}) or {}
+    websearch = data.get("websearch", {}) or {}
 
     defaults = default_config()
     return AgentConfig(
@@ -454,6 +495,12 @@ def config_from_dict(data: dict[str, Any]) -> AgentConfig:
         telegram=TelegramConfig(
             base_url=str(telegram.get("base_url", defaults.telegram.base_url)),
             allowed_chats=str(telegram.get("allowed_chats", defaults.telegram.allowed_chats)),
+        ),
+        websearch=WebSearchConfig(
+            base_url=str(websearch.get("base_url", defaults.websearch.base_url)),
+            engines=str(websearch.get("engines", defaults.websearch.engines)),
+            language=str(websearch.get("language", defaults.websearch.language)),
+            safesearch=str(websearch.get("safesearch", defaults.websearch.safesearch)),
         ),
     )
 

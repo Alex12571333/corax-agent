@@ -51,6 +51,8 @@ class Menu:
             "L": self.llm_section,
             "t": self.telegram_section,
             "T": self.telegram_section,
+            "w": self.websearch_section,
+            "W": self.websearch_section,
         }
 
     # -- main loop ------------------------------------------------------- #
@@ -206,6 +208,24 @@ class Menu:
                 self._edit_scalar("telegram.base_url", "telegram api base url")
             elif choice == "2":
                 self._edit_scalar("telegram.allowed_chats", "allowed chat ids (comma)")
+            else:
+                self.term.write(f"  unknown field: {choice!r}")
+
+    def websearch_section(self) -> None:
+        while True:
+            self.term.header("Web Search (SearXNG)")
+            self.term.lines(screens.websearch_screen(self.config))
+            choice = self.term.read("edit # (enter to go back)> ")
+            if not choice:
+                return
+            if choice == "1":
+                self._edit_scalar("websearch.base_url", "searxng base url")
+            elif choice == "2":
+                self._edit_scalar("websearch.engines", "default engines (comma)")
+            elif choice == "3":
+                self._edit_scalar("websearch.language", "default language")
+            elif choice == "4":
+                self._edit_scalar("websearch.safesearch", "safesearch (0/1/2, empty=off)")
             else:
                 self.term.write(f"  unknown field: {choice!r}")
 
