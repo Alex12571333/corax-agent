@@ -28,6 +28,10 @@ _DEFAULT_SYSTEM_PROMPT = (
     "When the user asks you to act, use the available tools rather than guessing. "
     "For file creation, reading, editing, and deletion, prefer the filesystem or "
     "editor tools over shell commands. Reply in the user's language. "
+    "If a tool fails, do not stop after the first error. Read the error, adjust "
+    "the arguments, inspect the environment, or try a different available tool. "
+    "Ask the user only when the next step requires information or permission "
+    "that is not available from the current context. "
     "Only when the user explicitly asks you to send, attach, share, or upload a "
     "local file, use the telegram_send_document tool. Do not send files just "
     "because you created them. If the user asks for the file you just created "
@@ -364,12 +368,18 @@ class CoraxTelegramGateway:
                 result = {"error": str(exc)}
             else:
                 await self._record_artifact(session_id, cap_id, args, result)
+            if self._tool_result_failed(result):
+                self.log.warning(
+                    "tool %-20s failed: %s",
+                    cap_id,
+                    self._compact_log_value(self._tool_error_text(result), limit=100),
+                )
 
         messages.append(
             {
                 "role": "tool",
                 "tool_call_id": tool_call.get("id"),
-                "content": json.dumps(result)[: self.max_tool_result_chars],
+                "content": self._format_tool_result_for_model(result)[: self.max_tool_result_chars],
             }
         )
 
@@ -600,6 +610,34 @@ class CoraxTelegramGateway:
             if len(parts) >= 4:
                 break
         return " ".join(parts) if parts else f"{len(args)} arg(s)"
+
+    def _format_tool_result_for_model(self, result: dict[str, Any]) -> str:
+        if not self._tool_result_failed(result):
+            return json.dumps(result)
+        payload = dict(result)
+        payload.setdefault("ok", False)
+        payload["recovery_hint"] = (
+            "The tool call failed. Diagnose the error and continue autonomously: "
+            "fix the arguments, inspect the environment, or try another available "
+            "tool before asking the user. Ask the user only if required information "
+            "or permission is genuinely missing."
+        )
+        return json.dumps(payload)
+
+    def _tool_result_failed(self, result: dict[str, Any]) -> bool:
+        if result.get("ok") is False:
+            return True
+        return any(key in result for key in ("error", "errors", "exception"))
+
+    def _tool_error_text(self, result: dict[str, Any]) -> str:
+        for key in ("error", "exception", "message"):
+            value = result.get(key)
+            if isinstance(value, str) and value.strip():
+                return value
+        errors = result.get("errors")
+        if isinstance(errors, list) and errors:
+            return "; ".join(str(error) for error in errors[:3])
+        return "unknown error"
 
     def _compact_log_value(self, value: str, *, limit: int = _LOG_VALUE_LIMIT) -> str:
         cleaned = " ".join(value.split())

@@ -176,6 +176,14 @@ class ToolSpecTests(unittest.TestCase):
         )
         self.assertEqual(rendered, 'operation=write path="notes.txt"')
 
+    def test_failed_tool_result_includes_recovery_hint(self) -> None:
+        gw = _gateway(FakeBackend())
+        content = gw._format_tool_result_for_model({"error": "missing module"})
+        payload = json.loads(content)
+        self.assertFalse(payload["ok"])
+        self.assertIn("recovery_hint", payload)
+        self.assertIn("try another available tool", payload["recovery_hint"])
+
 
 class ChatToolLoopTests(unittest.IsolatedAsyncioTestCase):
     async def test_plain_answer_no_tools(self) -> None:
@@ -412,6 +420,34 @@ class ChatToolLoopTests(unittest.IsolatedAsyncioTestCase):
         gen_calls = [p for c, op, p in backend.calls if op == "generate"]
         tool_msg = gen_calls[1]["messages"][-1]
         self.assertIn("error", tool_msg["content"])
+        self.assertIn("recovery_hint", tool_msg["content"])
+
+    async def test_tool_failure_can_be_retried_in_next_step(self) -> None:
+        backend = FakeBackend(
+            poll_batches=[[_text_update(5, "read notes")]],
+            llm_responses=[
+                {"tool_calls": [_tool_call("filesystem", '{"operation": "read", "path": "missing.txt"}', id="bad")]},
+                {"tool_calls": [_tool_call("filesystem", '{"operation": "read", "path": "notes.txt"}', id="good")]},
+                {"text": "found it"},
+            ],
+            tool_results={"filesystem": {"content": "hello"}},
+        )
+        backend.fail_operation = None
+
+        original = backend.run_capability
+        seen_bad = False
+
+        async def fail_first_read(cap_id, payload, *, session_id=None):
+            nonlocal seen_bad
+            if cap_id == "filesystem" and payload.get("path") == "missing.txt" and not seen_bad:
+                seen_bad = True
+                raise GatewayError("file not found")
+            return await original(cap_id, payload, session_id=session_id)
+
+        backend.run_capability = fail_first_read
+        await _gateway(backend).run(max_iterations=1)
+        self.assertEqual(backend.tools_run[-1][1]["path"], "notes.txt")
+        self.assertIn("found it", backend.sends)
 
     async def test_max_tool_iterations_stops(self) -> None:
         # The model always asks for another tool — the loop must bail out.
