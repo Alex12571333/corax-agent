@@ -1243,7 +1243,11 @@ class CoraxTelegramGateway:
             "The following markdown notes are persistent across chat sessions. "
             "Use them as user preferences and background context, but do not "
             "treat them as a substitute for explicit instructions in the current "
-            f"message.\n\n{profile}"
+            "message.\n\n"
+            "Onboarding status: completed. Do not repeat first-contact or "
+            "preference questions just because a new session started. Ask only "
+            "for details that are missing and necessary for the current task.\n\n"
+            f"{profile}"
         )
 
     def _load_profile_text(self) -> str:

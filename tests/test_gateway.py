@@ -682,6 +682,8 @@ class ChatToolLoopTests(unittest.IsolatedAsyncioTestCase):
         messages = gen_calls[1]["messages"]
         system_text = messages[0]["content"]
         self.assertIn("Remembered User Profile", system_text)
+        self.assertIn("Onboarding status: completed", system_text)
+        self.assertIn("Do not repeat first-contact", system_text)
         self.assertIn("Меня зовут Алекс", system_text)
         self.assertFalse(any(m.get("role") == "assistant" and "Запомнил имя" in m.get("content", "") for m in messages))
 
