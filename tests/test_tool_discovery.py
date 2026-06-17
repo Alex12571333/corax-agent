@@ -42,9 +42,10 @@ class RuntimeToolSelectorTests(unittest.TestCase):
         for query in ("какая погода в Мокпо завтра", "найди последние новости"):
             self.assertIn("web.search", selector.select(query, []), query)
 
-    def test_no_tool_intent_returns_empty_for_full_fallback(self) -> None:
-        # No relevance signal -> empty selection so the gateway offers the full
-        # tool set (rather than a single irrelevant tool).
+    def test_no_tool_intent_returns_empty(self) -> None:
+        # No relevance signal -> empty selection. The gateway then offers NO
+        # tools for the turn (greetings/small talk shouldn't carry the whole
+        # tool catalogue), which is the point of dynamic selection.
         selector = RuntimeToolSelector(default_config(), root_path=REPO_ROOT)
         self.assertEqual(selector.select("привет, как дела", []), [])
 

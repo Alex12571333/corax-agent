@@ -752,9 +752,11 @@ class CoraxTelegramGateway:
             for spec in self._tool_specs
             if spec["function"]["name"] != _SEND_DOCUMENT_TOOL
         ]
-        selected_specs = base_specs
-        selected_ids: list[str] = []
-        if self.tool_selector is not None:
+        if self.tool_selector is None:
+            # No selector: static mode offers the whole tool set.
+            selected_specs = base_specs
+        else:
+            selector_failed = False
             try:
                 selected_ids = [
                     str(cap_id)
@@ -764,6 +766,7 @@ class CoraxTelegramGateway:
             except Exception as exc:  # noqa: BLE001 - selector must not break chat
                 self.log.debug("tool selector failed: %s", exc)
                 selected_ids = []
+                selector_failed = True
             if selected_ids:
                 selected_names = {self._cap_to_tool[cap_id] for cap_id in selected_ids}
                 selected_specs = [
@@ -771,12 +774,16 @@ class CoraxTelegramGateway:
                     for spec in base_specs
                     if spec["function"]["name"] in selected_names
                 ]
+            elif selector_failed:
+                # The selector errored — fall back to the full set so a broken
+                # selector never silently strips the model's tools.
+                selected_specs = base_specs
             else:
-                selected_specs = base_specs[: self.max_active_tools]
-        else:
-            selected_specs = base_specs
-
-        if self.tool_selector is not None:
+                # The selector ran and found nothing relevant for this turn (e.g.
+                # a greeting or small talk): offer no tools. Attaching every tool
+                # here would defeat the whole point of dynamic selection — a small
+                # prompt — and tempts a weak model into spurious tool calls.
+                selected_specs = []
             selected_specs = selected_specs[: self.max_active_tools]
 
         if allow_media and self._send_document_spec is not None:

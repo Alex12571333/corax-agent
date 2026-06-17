@@ -234,6 +234,22 @@ class ToolSpecTests(unittest.TestCase):
         names = {t["function"]["name"] for t in gw._active_tool_specs("read file", allow_media=False)}
         self.assertEqual(names, {"filesystem"})
 
+    def test_empty_selection_offers_no_tools(self) -> None:
+        # A no-intent turn (selector returns nothing) must carry no tools, not
+        # the whole catalogue — dynamic selection exists to keep the prompt small.
+        gw = _gateway(FakeBackend(), tool_selector=lambda _query, _specs: [])
+        specs = gw._active_tool_specs("привет", allow_media=False)
+        self.assertEqual(specs, [])
+
+    def test_selector_error_falls_back_to_all_tools(self) -> None:
+        # A broken selector must not strip the model's tools.
+        def boom(_query, _specs):
+            raise RuntimeError("selector down")
+
+        gw = _gateway(FakeBackend(), tool_selector=boom)
+        names = {t["function"]["name"] for t in gw._active_tool_specs("read file", allow_media=False)}
+        self.assertIn("filesystem", names)
+
     def test_send_document_is_active_only_when_user_requested_media(self) -> None:
         gw = _gateway(FakeBackend(), tool_selector=lambda _query, _specs: ["filesystem"])
         without_media = {t["function"]["name"] for t in gw._active_tool_specs("create file", allow_media=False)}
