@@ -48,6 +48,51 @@ _ROUTER_SYSTEM = (
 )
 
 
+# Contentless social replies that never need a tool. Kept high-precision so the
+# pre-filter only ever skips messages we are sure require no tool — anything not
+# obviously trivial still goes to the router.
+_TRIVIAL_WORDS = frozenset(
+    {
+        # greetings
+        "привет", "приветик", "прив", "здравствуй", "здравствуйте", "хай", "хелло",
+        "дарова", "даров", "здарова", "ку", "hi", "hello", "hey", "yo", "hiya", "hallo",
+        "добрый", "доброе", "утро", "день", "вечер",  # "добрый день" / "доброе утро"
+        # thanks
+        "спасибо", "спс", "спасибки", "благодарю", "пасиб", "пасибо", "мерси",
+        "thanks", "thank", "thx", "ty",
+        # acknowledgements / yes-no
+        "ок", "окей", "окей", "ok", "okay", "k", "kk", "угу", "ага", "ладно",
+        "хорошо", "понятно", "ясно", "принято", "да", "нет", "неа", "yes", "no",
+        "yep", "nope", "супер", "класс", "отлично", "круто", "cool", "nice", "great",
+        # farewells
+        "пока", "покеда", "бывай", "досвидания", "свидания", "споки", "bye", "goodbye",
+        "cya", "увидимся",
+        # laughter
+        "лол", "lol", "ха", "хах", "хаха", "хахаха", "хех", "haha", "hahaha", "lmao",
+        "рофл", "ржу",
+    }
+)
+_TRIVIAL_MAX_WORDS = 4
+_LETTERS_RE = re.compile(r"[^\W\d_]+", re.UNICODE)
+
+
+def is_trivial_chitchat(text: str) -> bool:
+    """True when a message is plainly social/contentless and needs no tool.
+
+    Conservative on purpose: emoji/punctuation/number-only pings and short
+    greeting/thanks/ack/farewell/laughter messages skip the router; everything
+    with real words is left for the model to route.
+    """
+    if not text or not text.strip():
+        return True
+    words = _LETTERS_RE.findall(text.lower())
+    if not words:
+        return True  # emoji-, punctuation-, or number-only (e.g. "👍", "?", "2+2")
+    if len(words) > _TRIVIAL_MAX_WORDS:
+        return False
+    return all(word in _TRIVIAL_WORDS for word in words)
+
+
 class LLMToolRouter:
     """Pick the active tool set for a turn by asking the LLM."""
 
@@ -62,6 +107,7 @@ class LLMToolRouter:
         top_k: int = 8,
         timeout: float = 12.0,
         max_tokens: int = 64,
+        skip_trivial: bool = True,
         log: logging.Logger | None = None,
     ) -> None:
         self._run = run_capability
@@ -71,6 +117,7 @@ class LLMToolRouter:
         self.top_k = max(1, top_k)
         self.timeout = timeout
         self.max_tokens = max_tokens
+        self.skip_trivial = skip_trivial
         self.log = log or logging.getLogger("corax.tool_router")
 
         self._ids = [str(cap["id"]) for cap in catalog if cap.get("id")]
@@ -84,6 +131,12 @@ class LLMToolRouter:
 
     async def route(self, user_text: str, specs: list[dict]) -> list[str]:
         """Return the selected capability ids ([] means 'no tool needed')."""
+        # Cheap, deterministic pre-filter: skip the LLM call entirely for plainly
+        # social messages (greetings, thanks, "ok", emoji) so the router does not
+        # fire on every reply — only on messages that might actually need a tool.
+        if self.skip_trivial and is_trivial_chitchat(user_text):
+            self.log.debug("skipped tool routing for trivial message")
+            return []
         try:
             ids = await asyncio.wait_for(self._route_via_llm(user_text), self.timeout)
         except Exception as exc:  # noqa: BLE001 - routing (incl. timeout) must never break a turn

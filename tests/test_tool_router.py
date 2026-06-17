@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import unittest
 
-from corax.tool_router import LLMToolRouter
+from corax.tool_router import LLMToolRouter, is_trivial_chitchat
 
 CATALOG = [
     {
@@ -29,6 +29,16 @@ def _runner(text):
 
 def _boom(_cap_id, _payload):
     raise RuntimeError("llm down")
+
+
+def _counting_runner(text):
+    calls = {"n": 0}
+
+    async def _run(_cap_id, _payload):
+        calls["n"] += 1
+        return {"text": text}
+
+    return _run, calls
 
 
 class RouteTests(unittest.IsolatedAsyncioTestCase):
@@ -104,6 +114,32 @@ class RouteTests(unittest.IsolatedAsyncioTestCase):
 
         router = LLMToolRouter(_run, catalog=CATALOG, fallback=lambda _q, _s: ["shell"])
         self.assertEqual(await router.route("x", []), ["shell"])
+
+    async def test_trivial_message_skips_llm_call(self) -> None:
+        for message in ("привет", "спасибо!", "ок", "👍", "lol", "  ", "2+2", "да", "пока"):
+            run, calls = _counting_runner('["filesystem"]')
+            router = LLMToolRouter(run, catalog=CATALOG)
+            self.assertEqual(await router.route(message, []), [], message)
+            self.assertEqual(calls["n"], 0, f"router fired for trivial message {message!r}")
+
+    async def test_real_request_still_calls_llm(self) -> None:
+        for message in ("удали файл x.txt", "ls", "какая погода завтра", "привет, удали файл"):
+            run, calls = _counting_runner('["filesystem"]')
+            router = LLMToolRouter(run, catalog=CATALOG)
+            await router.route(message, [])
+            self.assertEqual(calls["n"], 1, f"router did not fire for {message!r}")
+
+    async def test_skip_trivial_can_be_disabled(self) -> None:
+        run, calls = _counting_runner("[]")
+        router = LLMToolRouter(run, catalog=CATALOG, skip_trivial=False)
+        await router.route("привет", [])
+        self.assertEqual(calls["n"], 1)
+
+    def test_is_trivial_chitchat(self) -> None:
+        for trivial in ("привет", "Спасибо!", "ок", "👍", "", "?", "2+2", "хаха", "ok ok"):
+            self.assertTrue(is_trivial_chitchat(trivial), trivial)
+        for real in ("удали файл", "ls", "какая погода", "привет, найди новости", "спасибо за код, открой main.py"):
+            self.assertFalse(is_trivial_chitchat(real), real)
 
     async def test_menu_lists_operations(self) -> None:
         router = LLMToolRouter(_runner("[]"), catalog=CATALOG)
