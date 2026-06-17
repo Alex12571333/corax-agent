@@ -92,6 +92,21 @@ def _tool_capability_specs(runtime) -> list[dict]:
     return specs
 
 
+def _chat_system_prompt(root_path: str | Path) -> str | None:
+    """Load the operator-editable chat prompt files when present."""
+    prompt_dir = Path(root_path) / "prompts"
+    parts: list[str] = []
+    for name in ("system.md", "safety.md"):
+        path = prompt_dir / name
+        try:
+            text = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if text:
+            parts.append(text)
+    return "\n\n---\n\n".join(parts) if parts else None
+
+
 async def _run_chat(app: "CoraxApp", config_path: Path) -> int:
     """Run the Telegram gateway as an agent: the model can call every capability
     through the agent-core kernel (tool-calling), with results fed back to it.
@@ -114,6 +129,7 @@ async def _run_chat(app: "CoraxApp", config_path: Path) -> int:
     specs = _tool_capability_specs(runtime)
     selector = RuntimeToolSelector(app.config, root_path=runtime.root_path)
     stream_transport = _telegram_stream_transport()
+    system_prompt = _chat_system_prompt(runtime.root_path)
     tool_ids = [
         s["id"]
         for s in specs
@@ -136,15 +152,18 @@ async def _run_chat(app: "CoraxApp", config_path: Path) -> int:
         async with runtime.core.session(
             runtime.capabilities, policy=GatewayPolicyEngine()
         ) as kernel:
-            gateway = CoraxTelegramGateway(
-                run_capability=kernel.invoke,
-                stream_capability=kernel.stream_generate_events,
-                capabilities=specs,
-                model=app.config.llm.model,
-                workspace_path=runtime.workspace_path,
-                tool_selector=selector.select if selector.available else None,
-                stream_transport=stream_transport,
-            )
+            gateway_kwargs = {
+                "run_capability": kernel.invoke,
+                "stream_capability": kernel.stream_generate_events,
+                "capabilities": specs,
+                "model": app.config.llm.model,
+                "workspace_path": runtime.workspace_path,
+                "tool_selector": selector.select if selector.available else None,
+                "stream_transport": stream_transport,
+            }
+            if system_prompt is not None:
+                gateway_kwargs["system_prompt"] = system_prompt
+            gateway = CoraxTelegramGateway(**gateway_kwargs)
             print(_style("Corax Telegram gateway is running. Ctrl-C to stop.", _GREEN))
             outcome = await _run_gateway_until_stopped(gateway)
 
@@ -154,6 +173,7 @@ async def _run_chat(app: "CoraxApp", config_path: Path) -> int:
             specs = _tool_capability_specs(runtime)
             selector = RuntimeToolSelector(app.config, root_path=runtime.root_path)
             stream_transport = _telegram_stream_transport()
+            system_prompt = _chat_system_prompt(runtime.root_path)
             tool_ids = [
                 s["id"]
                 for s in specs

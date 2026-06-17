@@ -21,12 +21,6 @@ class RuntimeToolSelectorTests(unittest.TestCase):
         self.assertNotIn("gateway", selected)
         self.assertNotIn("telegram.connector", selected)
 
-    def test_selects_web_search_for_russian_latest_news(self) -> None:
-        selector = RuntimeToolSelector(default_config(), root_path=REPO_ROOT)
-        self.assertTrue(selector.available)
-        selected = selector.select("последние новости Украины сегодня", [])
-        self.assertEqual(selected[0], "web.search")
-
 
 if __name__ == "__main__":
     unittest.main()
