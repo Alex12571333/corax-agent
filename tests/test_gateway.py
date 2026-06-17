@@ -125,6 +125,10 @@ def _cmd_update(chat_id, command, args="", reply=None):
             "command": {"is_command": True, "command": command, "args": args, "reply": reply}}
 
 
+def _last_tool_message(messages):
+    return next(message for message in reversed(messages) if message.get("role") == "tool")
+
+
 async def _nosleep(_seconds):
     return None
 
@@ -183,6 +187,15 @@ class ToolSpecTests(unittest.TestCase):
         self.assertFalse(payload["ok"])
         self.assertIn("recovery_hint", payload)
         self.assertIn("try another available tool", payload["recovery_hint"])
+
+    def test_failed_tool_result_classifies_errors(self) -> None:
+        gw = _gateway(FakeBackend())
+        missing_file = json.loads(gw._format_tool_result_for_model({"error": "file not found"}))
+        dependency = json.loads(gw._format_tool_result_for_model({"error": "ModuleNotFoundError: bs4"}))
+        self.assertEqual(missing_file["error_kind"], "missing_file_or_resource")
+        self.assertTrue(any("nearby paths" in step for step in missing_file["recovery_steps"]))
+        self.assertEqual(dependency["error_kind"], "missing_dependency")
+        self.assertTrue(any("environment" in step for step in dependency["recovery_steps"]))
 
 
 class ChatToolLoopTests(unittest.IsolatedAsyncioTestCase):
@@ -255,7 +268,7 @@ class ChatToolLoopTests(unittest.IsolatedAsyncioTestCase):
         await gw.run(max_iterations=1)
         self.assertEqual(backend.documents, [])
         gen_calls = [p for _c, op, p in backend.calls if op == "generate"]
-        tool_msg = gen_calls[1]["messages"][-1]
+        tool_msg = _last_tool_message(gen_calls[1]["messages"])
         self.assertEqual(tool_msg["role"], "tool")
         self.assertIn("file delivery was not requested", tool_msg["content"])
 
@@ -387,7 +400,7 @@ class ChatToolLoopTests(unittest.IsolatedAsyncioTestCase):
         await gw.run(max_iterations=1)
         # second generate call carries a tool message with the error
         gen_calls = [p for c, op, p in backend.calls if op == "generate"]
-        tool_msg = gen_calls[1]["messages"][-1]
+        tool_msg = _last_tool_message(gen_calls[1]["messages"])
         self.assertEqual(tool_msg["role"], "tool")
         self.assertIn("unknown tool", tool_msg["content"])
 
@@ -418,7 +431,7 @@ class ChatToolLoopTests(unittest.IsolatedAsyncioTestCase):
         gw = _gateway(backend)
         await gw.run(max_iterations=1)
         gen_calls = [p for c, op, p in backend.calls if op == "generate"]
-        tool_msg = gen_calls[1]["messages"][-1]
+        tool_msg = _last_tool_message(gen_calls[1]["messages"])
         self.assertIn("error", tool_msg["content"])
         self.assertIn("recovery_hint", tool_msg["content"])
 
@@ -448,6 +461,36 @@ class ChatToolLoopTests(unittest.IsolatedAsyncioTestCase):
         await _gateway(backend).run(max_iterations=1)
         self.assertEqual(backend.tools_run[-1][1]["path"], "notes.txt")
         self.assertIn("found it", backend.sends)
+
+    async def test_gateway_forces_recovery_before_accepting_refusal_after_tool_error(self) -> None:
+        backend = FakeBackend(
+            poll_batches=[[_text_update(5, "read notes")]],
+            llm_responses=[
+                {"tool_calls": [_tool_call("filesystem", '{"operation": "read", "path": "missing.txt"}', id="bad")]},
+                {"text": "Не получилось. Выберите другой файл."},
+                {"tool_calls": [_tool_call("filesystem", '{"operation": "read", "path": "notes.txt"}', id="good")]},
+                {"text": "Нашел файл."},
+            ],
+            tool_results={"filesystem": {"content": "hello"}},
+        )
+        original = backend.run_capability
+        seen_bad = False
+
+        async def fail_first_read(cap_id, payload, *, session_id=None):
+            nonlocal seen_bad
+            if cap_id == "filesystem" and payload.get("path") == "missing.txt" and not seen_bad:
+                seen_bad = True
+                raise GatewayError("file not found")
+            return await original(cap_id, payload, session_id=session_id)
+
+        backend.run_capability = fail_first_read
+        await _gateway(backend).run(max_iterations=1)
+        gen_calls = [p for _c, op, p in backend.calls if op == "generate"]
+        self.assertTrue(
+            any("no recovery attempt" in (m.get("content") or "") for m in gen_calls[2]["messages"])
+        )
+        self.assertEqual(backend.tools_run[-1][1]["path"], "notes.txt")
+        self.assertIn("Нашел файл.", backend.sends)
 
     async def test_max_tool_iterations_stops(self) -> None:
         # The model always asks for another tool — the loop must bail out.

@@ -70,6 +70,7 @@ class CoraxTelegramGateway:
         poll_timeout: int = 30,
         idle_sleep: float = 1.0,
         max_tool_iterations: int = 6,
+        max_tool_recovery_prompts: int = 1,
         max_tool_result_chars: int = 4000,
         reveal_chunk: int = 64,
         reveal_delay: float = 0.2,
@@ -89,6 +90,7 @@ class CoraxTelegramGateway:
         self.poll_timeout = poll_timeout
         self.idle_sleep = idle_sleep
         self.max_tool_iterations = max_tool_iterations
+        self.max_tool_recovery_prompts = max(0, max_tool_recovery_prompts)
         self.max_tool_result_chars = max_tool_result_chars
         self.reveal_chunk = reveal_chunk
         self.reveal_delay = reveal_delay
@@ -251,6 +253,9 @@ class CoraxTelegramGateway:
         user_message = prepared["user_message"]
         messages = prepared["messages"]
         final_text = ""
+        recovery_needed = False
+        recovery_tool_attempted = False
+        recovery_prompts = 0
         for _ in range(self.max_tool_iterations):
             await self._typing(chat_id)  # show "typing…" while the agent works
             generate: dict[str, Any] = {
@@ -265,6 +270,16 @@ class CoraxTelegramGateway:
             response = await self._run(self.llm_id, generate, session_id=session_id)
             tool_calls = response.get("tool_calls") or []
             if not tool_calls:
+                if (
+                    recovery_needed
+                    and not recovery_tool_attempted
+                    and recovery_prompts < self.max_tool_recovery_prompts
+                    and self._tool_specs
+                ):
+                    recovery_prompts += 1
+                    self.log.info("tool recovery prompt inserted after failed step")
+                    messages.append({"role": "system", "content": self._tool_recovery_prompt()})
+                    continue
                 final_text = response.get("text") or ""
                 break
             messages.append(
@@ -274,8 +289,9 @@ class CoraxTelegramGateway:
                     "tool_calls": tool_calls,
                 }
             )
+            failed_tools = 0
             for tool_call in tool_calls:
-                await self._run_tool(
+                tool_failed = await self._run_tool(
                     messages,
                     tool_call,
                     chat_id=chat_id,
@@ -283,6 +299,14 @@ class CoraxTelegramGateway:
                     allow_media=allow_media,
                     user_text=text,
                 )
+                if tool_failed:
+                    failed_tools += 1
+            if failed_tools:
+                recovery_needed = True
+                recovery_tool_attempted = False
+            elif recovery_needed:
+                recovery_needed = False
+                recovery_tool_attempted = True
         else:
             final_text = "⚠️ Stopped: too many tool steps."
         delivered_text = await self._deliver_final(
@@ -338,7 +362,7 @@ class CoraxTelegramGateway:
         session_id: str,
         allow_media: bool,
         user_text: str,
-    ) -> None:
+    ) -> bool:
         function = tool_call.get("function") or {}
         name = function.get("name")
         cap_id = self._tool_to_cap.get(name)
@@ -382,6 +406,7 @@ class CoraxTelegramGateway:
                 "content": self._format_tool_result_for_model(result)[: self.max_tool_result_chars],
             }
         )
+        return self._tool_result_failed(result)
 
     async def _send(self, chat_id: Any, text: str) -> None:
         await self._run(
@@ -616,6 +641,10 @@ class CoraxTelegramGateway:
             return json.dumps(result)
         payload = dict(result)
         payload.setdefault("ok", False)
+        error_text = self._tool_error_text(result)
+        error_kind = self._classify_tool_error(error_text)
+        payload["error_kind"] = error_kind
+        payload["recovery_steps"] = self._recovery_steps_for_error(error_kind)
         payload["recovery_hint"] = (
             "The tool call failed. Diagnose the error and continue autonomously: "
             "fix the arguments, inspect the environment, or try another available "
@@ -623,6 +652,15 @@ class CoraxTelegramGateway:
             "or permission is genuinely missing."
         )
         return json.dumps(payload)
+
+    def _tool_recovery_prompt(self) -> str:
+        return (
+            "A tool failed on the previous step and no recovery attempt has been "
+            "made yet. Continue the task autonomously: call an available tool to "
+            "inspect the environment, verify assumptions, retry with corrected "
+            "arguments, or choose a safer alternate route. Do not ask the user to "
+            "choose an option unless required information or permission is missing."
+        )
 
     def _tool_result_failed(self, result: dict[str, Any]) -> bool:
         if result.get("ok") is False:
@@ -638,6 +676,74 @@ class CoraxTelegramGateway:
         if isinstance(errors, list) and errors:
             return "; ".join(str(error) for error in errors[:3])
         return "unknown error"
+
+    def _classify_tool_error(self, error_text: str) -> str:
+        text = error_text.lower()
+        if any(marker in text for marker in ("file not found", "no such file", "not found")):
+            return "missing_file_or_resource"
+        if any(marker in text for marker in ("permission denied", "not permitted", "forbidden", "unauthorized")):
+            return "permission_denied"
+        if any(
+            marker in text
+            for marker in ("module not found", "modulenotfounderror", "no module named", "importerror")
+        ):
+            return "missing_dependency"
+        if any(marker in text for marker in ("command not found", "not recognized", "executable not found")):
+            return "missing_command"
+        if any(marker in text for marker in ("timed out", "timeout", "deadline")):
+            return "timeout"
+        if any(marker in text for marker in ("connection", "dns", "network", "ssl", "http")):
+            return "network_or_remote"
+        if any(marker in text for marker in ("invalid", "schema", "argument", "required")):
+            return "bad_arguments"
+        return "unknown"
+
+    def _recovery_steps_for_error(self, error_kind: str) -> list[str]:
+        recipes = {
+            "missing_file_or_resource": [
+                "list or search nearby paths",
+                "check recent local files context",
+                "retry with the corrected path or explain if absent",
+            ],
+            "permission_denied": [
+                "try a read-only inspection command",
+                "avoid destructive escalation",
+                "ask the user only if permission is required",
+            ],
+            "missing_dependency": [
+                "check whether an alternate installed tool or stdlib path exists",
+                "inspect the environment",
+                "install only if the available policy/tooling permits it",
+            ],
+            "missing_command": [
+                "check command availability",
+                "use an alternate command or capability",
+                "retry with the available tool",
+            ],
+            "timeout": [
+                "retry with a narrower query or smaller workload",
+                "inspect partial state if available",
+                "use an alternate route",
+            ],
+            "network_or_remote": [
+                "retry with headers or a simpler request",
+                "try an alternate endpoint/source if available",
+                "summarize uncertainty if remote access is blocked",
+            ],
+            "bad_arguments": [
+                "compare the payload with the tool schema",
+                "remove unsupported fields or add required fields",
+                "retry with corrected arguments",
+            ],
+        }
+        return recipes.get(
+            error_kind,
+            [
+                "inspect the error and current context",
+                "try a smaller or safer tool call",
+                "ask the user only if blocked by missing information",
+            ],
+        )
 
     def _compact_log_value(self, value: str, *, limit: int = _LOG_VALUE_LIMIT) -> str:
         cleaned = " ".join(value.split())
