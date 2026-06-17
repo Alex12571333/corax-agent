@@ -244,9 +244,8 @@ class CoraxTelegramGateway:
         self._history: dict[str, list[dict[str, Any]]] = {}
         self._recent_files: dict[str, list[str]] = {}
         self._last_assistant_by_session: dict[str, str] = {}
-        if not self._has_gateway_capability:
-            self._load_fallback_state()
         self._offset: int | None = None
+        self._load_fallback_state()
         self._reload = False
         self._stop = False
 
@@ -289,6 +288,7 @@ class CoraxTelegramGateway:
         next_offset = result.get("next_offset")
         if isinstance(next_offset, int):
             self._offset = next_offset
+            self._save_fallback_state()
         updates = result.get("updates")
         return updates if isinstance(updates, list) else []
 
@@ -1344,6 +1344,11 @@ class CoraxTelegramGateway:
             return
         if not isinstance(data, dict):
             return
+        offset = data.get("offset")
+        if isinstance(offset, int):
+            self._offset = offset
+        if self._has_gateway_capability:
+            return
         self._sessions = {
             str(key): value
             for key, value in (data.get("sessions") or {}).items()
@@ -1357,6 +1362,7 @@ class CoraxTelegramGateway:
             return
         data = {
             "version": 1,
+            "offset": self._offset,
             "sessions": self._sessions,
             "history": self._history,
             "recent_files": self._recent_files,

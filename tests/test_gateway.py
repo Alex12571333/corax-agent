@@ -976,6 +976,26 @@ class LoopTests(unittest.IsolatedAsyncioTestCase):
         poll_calls = [p for c, op, p in backend.calls if op == "poll"]
         self.assertEqual(poll_calls[1]["offset"], 999)
 
+    async def test_poll_offset_survives_gateway_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "telegram-gateway-state.json"
+            first_backend = FakeBackend(poll_batches=[[]])
+            await _gateway(
+                first_backend,
+                capabilities=CAPS_WITH_GATEWAY,
+                state_path=state_path,
+            ).run(max_iterations=1)
+
+            second_backend = FakeBackend(poll_batches=[[]])
+            await _gateway(
+                second_backend,
+                capabilities=CAPS_WITH_GATEWAY,
+                state_path=state_path,
+            ).run(max_iterations=1)
+
+        poll_calls = [p for c, op, p in second_backend.calls if op == "poll"]
+        self.assertEqual(poll_calls[0]["offset"], 999)
+
     async def test_poll_failure_is_logged_not_fatal(self) -> None:
         backend = FakeBackend(poll_batches=[[_text_update(5, "hi")]])
         backend.fail_capability = "telegram.connector"
