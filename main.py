@@ -22,6 +22,13 @@ from corax.app import CoraxApp
 from corax.paths import default_config_path, ensure_paths
 from corax.ui.banner import BANNER
 
+_RESET = "\033[0m"
+_BOLD = "\033[1m"
+_DIM = "\033[2m"
+_GREEN = "\033[32m"
+_YELLOW = "\033[33m"
+_CYAN = "\033[36m"
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -108,11 +115,11 @@ async def _run_chat(app: "CoraxApp", config_path: Path) -> int:
         if s["id"] not in ("gateway", "llm.local", "telegram.connector")
     ]
     if not app.config.telegram.allowed_chats:
-        print(
-            "⚠️  SECURITY: no CORAX_TELEGRAM_ALLOWED_CHATS set — anyone who can "
-            "message the bot can drive these tools (incl. shell). Set an allow-list."
+        _print_warning(
+            "SECURITY",
+            "no CORAX_TELEGRAM_ALLOWED_CHATS set; anyone who can message the bot can drive these tools.",
         )
-    print(f"Tools exposed to the model: {', '.join(tool_ids) or '(none)'}")
+    _print_chat_dashboard(app, specs, tool_ids)
 
     while True:
         async with runtime.core.session(
@@ -124,15 +131,67 @@ async def _run_chat(app: "CoraxApp", config_path: Path) -> int:
                 model=app.config.llm.model,
                 workspace_path=runtime.workspace_path,
             )
-            print("Corax Telegram gateway is running (Ctrl-C to stop).")
+            print(_style("Corax Telegram gateway is running. Ctrl-C to stop.", _GREEN))
             outcome = await gateway.run()
 
         if outcome == "reload":
-            print("Reloading agent…")
+            print(_style("Reloading agent...", _YELLOW))
             await runtime.reload_config(config_mod.load_config(config_path))
             specs = _tool_capability_specs(runtime)
+            tool_ids = [
+                s["id"]
+                for s in specs
+                if s["id"] not in ("gateway", "llm.local", "telegram.connector")
+            ]
+            _print_chat_dashboard(app, specs, tool_ids)
             continue
         return 0
+
+
+def _print_chat_dashboard(app: "CoraxApp", specs: list[dict], tool_ids: list[str]) -> None:
+    runtime = app.runtime
+    executable = runtime.core.executable_ids(runtime.capabilities)
+    has_gateway = any(spec["id"] == "gateway" for spec in specs)
+    has_telegram = any(spec["id"] == "telegram.connector" for spec in specs)
+    allowed_chats = app.config.telegram.allowed_chats.strip() or "not set"
+    rows = [
+        ("mode", "telegram chat gateway"),
+        ("model", app.config.llm.model),
+        ("kernel", f"ready, {len(executable)} executable capability(ies)"),
+        ("gateway", "standalone capability" if has_gateway else "fallback in-process memory"),
+        ("connector", "telegram.connector" if has_telegram else "missing"),
+        ("tools", ", ".join(tool_ids) or "none"),
+        ("allowed chats", allowed_chats),
+        ("workspace", str(runtime.workspace_path)),
+    ]
+
+    print()
+    print(_style("Corax Chat Gateway", _BOLD + _CYAN))
+    print(_style("-" * 64, _DIM))
+    for label, value in rows:
+        print(f"{_style(label.rjust(13), _DIM)}  {_style(value, _GREEN if label in {'kernel', 'gateway'} else '')}")
+    print(_style("-" * 64, _DIM))
+
+
+def _print_warning(title: str, message: str) -> None:
+    print()
+    print(_style(f"! {title}", _YELLOW + _BOLD))
+    print(_style(f"  {message}", _YELLOW))
+
+
+def _style(text: str, color: str) -> str:
+    if not color or not _color_enabled():
+        return text
+    return f"{color}{text}{_RESET}"
+
+
+def _color_enabled() -> bool:
+    mode = os.getenv("CORAX_COLOR", "auto").strip().lower()
+    if mode in {"1", "true", "yes", "always", "on"}:
+        return True
+    if mode in {"0", "false", "no", "never", "off"}:
+        return False
+    return sys.stdout.isatty()
 
 
 def _do_init(config_path: Path) -> int:
