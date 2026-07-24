@@ -55,6 +55,7 @@ def build_parser() -> argparse.ArgumentParser:
             "status",
             "security",
             "mcp",
+            "skills",
             "init",
             "menu",
         ),
@@ -125,6 +126,22 @@ async def _run(args: argparse.Namespace) -> int:
                 manager_id,
                 {"operation": operation},
                 session_id="mcp-control",
+            )
+            print(result)
+            return 0
+        elif command == "skills":
+            service_id = app.config.extensions.bindings.get(
+                "skills", "skills.runtime"
+            )
+            if not app.runtime.services.has(service_id):
+                print("skills.runtime is not loaded.")
+                return 1
+            requested = args.command_args[0] if args.command_args else "status"
+            operation = requested if requested in {"list", "reload"} else "status"
+            result = await app.runtime.invoke_extension(
+                service_id,
+                {"operation": operation},
+                session_id="skills-control",
             )
             print(result)
             return 0

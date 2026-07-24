@@ -427,6 +427,7 @@ def default_config() -> AgentConfig:
                     "memory.loop",
                     "context.manager",
                     "mcp.manager",
+                    "skills.runtime",
                 ],
                 "storage_provider": ["state.file"],
             },
@@ -439,6 +440,7 @@ def default_config() -> AgentConfig:
                 "state": "state.file",
                 "context": "context.manager",
                 "mcp": "mcp.manager",
+                "skills": "skills.runtime",
             },
             available={
                 "stub": ExtensionSpec(
@@ -475,6 +477,11 @@ def default_config() -> AgentConfig:
                     kind="runtime_service",
                     description="Official-SDK MCP client and tool bridge",
                     path="../corax-mcp-manager",
+                ),
+                "skills.runtime": ExtensionSpec(
+                    kind="runtime_service",
+                    description="Portable progressive Agent Skills loader",
+                    path="../corax-skills-runtime",
                 ),
                 "terminal": ExtensionSpec(
                     kind="channel_connector",
@@ -927,6 +934,7 @@ def validate_config(config: AgentConfig) -> list[str]:
         "state": "storage_provider",
         "context": "runtime_service",
         "mcp": "runtime_service",
+        "skills": "runtime_service",
     }
     for role, extension_id in config.extensions.bindings.items():
         spec = config.extensions.available.get(extension_id)

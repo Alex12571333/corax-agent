@@ -130,6 +130,10 @@ budget without adding another model call.
 tools only after connection. Those proxies still execute through Agent Core and
 cannot bypass schema validation or the active policy.
 
+`skills.runtime` implements progressive disclosure for portable Agent Skills.
+It reads metadata from bounded, trusted roots and injects only selected
+instructions before the shared context-compaction boundary.
+
 `RuntimeStatus` is a serialisable snapshot (`to_dict()` / `render()`), exposed
 both via `await runtime.status()` and the synchronous `runtime.snapshot()`
 (used by the blocking menu).

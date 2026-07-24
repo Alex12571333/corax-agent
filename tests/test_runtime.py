@@ -40,6 +40,7 @@ CAPABILITY_ROOTS = {
     "state.file": REPO_ROOT.parent / "corax-state-store",
     "context.manager": REPO_ROOT.parent / "corax-context-manager",
     "mcp.manager": REPO_ROOT.parent / "corax-mcp-manager",
+    "skills.runtime": REPO_ROOT.parent / "corax-skills-runtime",
 }
 
 
@@ -81,6 +82,9 @@ class TestRuntime(unittest.TestCase):
             if CAPABILITY_ROOTS["mcp.manager"].is_dir():
                 self.assertTrue(self.runtime.services.has("mcp.manager"))
                 self.assertIsNotNone(self.runtime.active_mcp_manager())
+            if CAPABILITY_ROOTS["skills.runtime"].is_dir():
+                self.assertTrue(self.runtime.services.has("skills.runtime"))
+                self.assertIsNotNone(self.runtime.active_skills_runtime())
         self.assertFalse(self.runtime.capabilities.has("llm.local"))
         self.assertFalse(self.runtime.capabilities.has("telegram.connector"))
         self.assertFalse(self.runtime.capabilities.has("gateway"))
@@ -108,7 +112,13 @@ class TestRuntime(unittest.TestCase):
         self.assertEqual(status.registry_counts["model_provider"], 2)
         self.assertEqual(
             status.active_by_kind["runtime_service"],
-            ["gateway", "memory.loop", "context.manager", "mcp.manager"],
+            [
+                "gateway",
+                "memory.loop",
+                "context.manager",
+                "mcp.manager",
+                "skills.runtime",
+            ],
         )
         self.assertEqual(status.active_by_kind["storage_provider"], ["state.file"])
         self.assertIn("RUNNING", status.render())
@@ -241,6 +251,42 @@ class TestRuntime(unittest.TestCase):
         self.assertLess(len(compacted), len(messages))
         self.assertEqual(compacted[0]["content"], "safety")
         self.assertEqual(compacted[-1]["content"], "current")
+
+    def test_skills_runtime_augments_only_matching_turn(self) -> None:
+        import os
+        import tempfile
+
+        old_value = os.environ.get("CORAX_SKILLS_PATHS")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            skill_dir = root / "code-review"
+            skill_dir.mkdir()
+            (skill_dir / "SKILL.md").write_text(
+                "---\n"
+                "name: code-review\n"
+                "description: Review source code changes and diffs.\n"
+                "---\n\n"
+                "Inspect the complete diff before reviewing.\n",
+                encoding="utf-8",
+            )
+            os.environ["CORAX_SKILLS_PATHS"] = str(root)
+            runtime = CoraxRuntime(cfg.default_config())
+            asyncio.run(runtime.start())
+            try:
+                messages = asyncio.run(
+                    runtime.augment_with_skills(
+                        [{"role": "user", "content": "Review this code diff"}],
+                        session_id="skills-test",
+                    )
+                )
+                self.assertEqual(messages[-1]["role"], "user")
+                self.assertIn("complete diff", messages[-2]["content"])
+            finally:
+                asyncio.run(runtime.stop())
+                if old_value is None:
+                    os.environ.pop("CORAX_SKILLS_PATHS", None)
+                else:
+                    os.environ["CORAX_SKILLS_PATHS"] = old_value
 
     def test_start_keeps_custom_gateway_state_path(self) -> None:
         import os

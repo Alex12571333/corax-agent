@@ -293,6 +293,41 @@ class CoraxRuntime:
             return self.services.get(service_id)
         return None
 
+    def active_skills_runtime(self) -> Any | None:
+        """Return the configured progressive Agent Skills service."""
+
+        service_id = self.config.extensions.bindings.get("skills", "")
+        if service_id and self.services.has(service_id):
+            return self.services.get(service_id)
+        return None
+
+    async def augment_with_skills(
+        self,
+        messages: tuple | list,
+        *,
+        prompt: str = "",
+        session_id: str = "",
+    ) -> list:
+        service = self.active_skills_runtime()
+        original = list(messages)
+        if service is None:
+            return original
+        try:
+            result = await service.handle(
+                ExtensionRequest(
+                    operation="augment",
+                    payload={"messages": original, "query": prompt},
+                    session_id=session_id,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - optional skills are fail-soft
+            self.log.debug("skill selection failed: %s", exc)
+            return original
+        augmented = (result.payload or {}).get("messages", [])
+        return augmented if getattr(result, "is_success", False) and isinstance(
+            augmented, list
+        ) else original
+
     async def compact_messages(
         self,
         messages: tuple | list,
@@ -429,12 +464,18 @@ class CoraxRuntime:
                 f"{extension_id!r} is a tool; invoke it through agent-core"
             )
         if kind is ExtensionKind.MODEL_PROVIDER:
-            messages = await self.compact_messages(
+            prompt = str(data.pop("prompt", ""))
+            messages = await self.augment_with_skills(
                 tuple(data.pop("messages", ())),
+                prompt=prompt,
+                session_id=session_id,
+            )
+            messages = await self.compact_messages(
+                messages,
                 session_id=session_id,
             )
             request = ModelRequest(
-                prompt=str(data.pop("prompt", "")),
+                prompt=prompt,
                 messages=tuple(messages),
                 model=data.pop("model", None),
                 modalities=tuple(data.pop("modalities", ("text",))),
@@ -543,12 +584,18 @@ class CoraxRuntime:
             raise TypeError(f"model provider {extension_id!r} does not support streaming")
         data = dict(payload or {})
         data.pop("operation", None)
-        messages = await self.compact_messages(
+        prompt = str(data.pop("prompt", ""))
+        messages = await self.augment_with_skills(
             tuple(data.pop("messages", ())),
+            prompt=prompt,
+            session_id=session_id,
+        )
+        messages = await self.compact_messages(
+            messages,
             session_id=session_id,
         )
         request = ModelRequest(
-            prompt=str(data.pop("prompt", "")),
+            prompt=prompt,
             messages=tuple(messages),
             model=data.pop("model", None),
             modalities=tuple(data.pop("modalities", ("text",))),
@@ -596,6 +643,7 @@ class CoraxRuntime:
         self._apply_gateway_environment()
         self._apply_state_environment()
         self._apply_security_environment()
+        self._apply_skills_environment()
 
     def _apply_llm_environment(self) -> None:
         llm = self.config.llm
@@ -643,4 +691,15 @@ class CoraxRuntime:
         os.environ.setdefault(
             "CORAX_SECURITY_AUDIT_PATH",
             str(self.data_path / "security-policy.audit.jsonl"),
+        )
+
+    def _apply_skills_environment(self) -> None:
+        os.environ.setdefault(
+            "CORAX_SKILLS_PATHS",
+            os.pathsep.join(
+                (
+                    str(self.root_path / "skills"),
+                    str(self.root_path / ".agents" / "skills"),
+                )
+            ),
         )

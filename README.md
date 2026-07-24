@@ -46,6 +46,8 @@ corax security status       # show ask / auto / full
 corax security mode auto    # switch permission mode
 corax mcp status            # connected MCP servers and errors
 corax mcp tools             # discovered policy-gated MCP tools
+corax skills list           # installed portable Agent Skills
+corax skills reload         # rescan trusted skill roots
 corax init                  # create config + workspace/data/logs and exit
 corax --config ./corax.yaml setup
 ```
@@ -100,7 +102,8 @@ The default `corax.yaml` groups packages under `extensions.active`:
 - models: `stub`, `llm.local`;
 - memory: `memory.none`;
 - policy: `security.policy`;
-- services: `gateway`, `memory.loop`, `context.manager`, `mcp.manager`.
+- services: `gateway`, `memory.loop`, `context.manager`, `mcp.manager`,
+  `skills.runtime`.
 - storage: `state.file`.
 
 Each external package is loaded from its root `extension.json`. The runtime
@@ -120,6 +123,8 @@ instructions and the active turn while compacting stale history to a fixed budge
 Configured stdio or Streamable HTTP MCP servers are connected by `mcp.manager`.
 Their tools become high-risk Corax tools and cross the normal Agent Core policy
 checkpoint.
+`skills.runtime` indexes `name` and `description` from trusted `SKILL.md`
+directories, then loads only the instructions relevant to the current turn.
 
 Security mode can also be controlled by an authorised Telegram operator:
 

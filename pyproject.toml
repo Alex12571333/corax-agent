@@ -28,6 +28,7 @@ dependencies = [
     "corax-state-store @ git+https://github.com/Alex12571333/corax-state-store.git",
     "corax-context-manager @ git+https://github.com/Alex12571333/corax-context-manager.git",
     "corax-mcp-manager @ git+https://github.com/Alex12571333/corax-mcp-manager.git",
+    "corax-skills-runtime @ git+https://github.com/Alex12571333/corax-skills-runtime.git",
 ]
 
 [project.optional-dependencies]
