@@ -111,6 +111,7 @@ The default `corax.yaml` groups packages under `extensions.active`:
   `skills.runtime`, `hooks.runtime`, `subagents.orchestrator`,
   `sandbox.executor`.
 - storage: `state.file`.
+- observability: `observability.jsonl`.
 
 Each external package is loaded from its root `extension.json`. The runtime
 validates that the entrypoint implements the declared kind before adding it to
@@ -142,6 +143,13 @@ child environment, limits resources and writes, and fails closed when no
 Seatbelt/Docker backend is available.
 `model.router` is the default primary model provider. It delegates to existing
 providers and falls back only after retryable failures.
+`observability.jsonl` receives host and kernel traces, omits prompts, outputs
+and messages by default, redacts secret-looking metadata, and rotates a bounded
+local file. Inspect it with `corax observability`.
+`corax eval` runs the separately packaged, deterministic manifest,
+composition and core-independence checks when the `dev` extra is installed.
+`corax doctor` checks the selected model, policy, sandbox, state,
+observability, workspace and core locally without contacting external services.
 
 Security mode can also be controlled by an authorised Telegram operator:
 

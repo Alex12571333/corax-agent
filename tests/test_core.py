@@ -136,6 +136,36 @@ class TestCoreEngine(unittest.TestCase):
         self.assertEqual(task.status, TaskStatus.COMPLETED)
         self.assertEqual(adder.calls, [5])
 
+    def test_session_forwards_core_traces_to_observability_provider(self) -> None:
+        adder = _make_adder()
+
+        class _Sink:
+            def __init__(self) -> None:
+                self.records = []
+
+            async def record(self, record) -> None:
+                self.records.append(record)
+
+        sink = _Sink()
+
+        async def go() -> None:
+            async with self.engine.session(
+                [("adder", adder)],
+                observability=sink,
+            ) as kernel:
+                await kernel.run_task(
+                    required_capability="adder",
+                    input={"a": 1, "b": 1},
+                )
+
+        asyncio.run(go())
+        stages = {
+            getattr(record.stage, "value", str(record.stage))
+            for record in sink.records
+        }
+        self.assertIn("capability_called", stages)
+        self.assertIn("capability_completed", stages)
+
     def test_invoke_parks_and_resumes_after_confirmation(self) -> None:
         writer = _make_confirmed_writer()
 

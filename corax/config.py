@@ -433,6 +433,7 @@ def default_config() -> AgentConfig:
                     "sandbox.executor",
                 ],
                 "storage_provider": ["state.file"],
+                "observability": ["observability.jsonl"],
             },
             bindings={
                 "planner": "stub",
@@ -448,6 +449,7 @@ def default_config() -> AgentConfig:
                 "hooks": "hooks.runtime",
                 "subagents": "subagents.orchestrator",
                 "sandbox": "sandbox.executor",
+                "observability": "observability.jsonl",
             },
             available={
                 "stub": ExtensionSpec(
@@ -504,6 +506,11 @@ def default_config() -> AgentConfig:
                     kind="runtime_service",
                     description="Fail-closed Seatbelt or Docker shell backend",
                     path="../corax-sandbox-executor",
+                ),
+                "observability.jsonl": ExtensionSpec(
+                    kind="observability",
+                    description="Privacy-first bounded JSONL execution traces",
+                    path="../corax-observability",
                 ),
                 "terminal": ExtensionSpec(
                     kind="channel_connector",

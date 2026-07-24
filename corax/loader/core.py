@@ -54,6 +54,16 @@ _DECLARATION_ATTRS = (
 _echo_wrapper_cache: dict[int, type] = {}
 
 
+class _ExtensionTraceWriter:
+    """Adapt a typed observability provider to agent-core's trace writer port."""
+
+    def __init__(self, provider: Any) -> None:
+        self._provider = provider
+
+    async def write(self, record: Any) -> None:
+        await self._provider.record(record)
+
+
 def _echo_wrapper_class(ac: Any) -> type:
     """Build (once) a Capability subclass that auto-echoes its result to state.
 
@@ -344,6 +354,7 @@ class CoreEngine:
         capabilities: Iterable[Any] = (),
         *,
         policy: Any | None = None,
+        observability: Any | None = None,
     ) -> AsyncIterator[RunningCore]:
         """Build, start, yield and tear down a fresh kernel in the current loop.
 
@@ -362,6 +373,8 @@ class CoreEngine:
         task_store = ac.InMemoryTaskStore()
         bus = ac.InMemoryEventBus()
         trace = ac.TraceManager()
+        if observability is not None and hasattr(observability, "record"):
+            await trace.add_writer(_ExtensionTraceWriter(observability))
         policy = policy if policy is not None else ac.DefaultPolicyEngine()
         router = ac.Router(registry)
         executor = ac.Executor(

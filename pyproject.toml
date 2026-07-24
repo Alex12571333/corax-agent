@@ -33,6 +33,7 @@ dependencies = [
     "corax-subagents @ git+https://github.com/Alex12571333/corax-subagents.git",
     "corax-sandbox-executor @ git+https://github.com/Alex12571333/corax-sandbox-executor.git",
     "corax-model-router @ git+https://github.com/Alex12571333/corax-model-router.git",
+    "corax-observability @ git+https://github.com/Alex12571333/corax-observability.git",
 ]
 
 [project.optional-dependencies]
@@ -41,7 +42,11 @@ dependencies = [
 # recommended for full YAML fidelity.
 yaml = ["pyyaml>=6.0"]
 # Tooling for the test/coverage workflow.
-dev = ["pytest>=7.0", "pytest-cov>=4.0"]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "corax-evals @ git+https://github.com/Alex12571333/corax-evals.git",
+]
 
 [project.scripts]
 corax = "main:main"

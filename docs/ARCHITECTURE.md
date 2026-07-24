@@ -150,6 +150,10 @@ fail-closed inside Seatbelt or Docker.
 routes by modalities and context size, supports model overrides, and performs
 fallback only for retryable failures.
 
+`observability.jsonl` is an `observability` provider. The host adapts it to the
+kernel trace-writer port and emits model lifecycle records directly. It never
+enters tool routing, and telemetry failures are isolated from execution.
+
 `RuntimeStatus` is a serialisable snapshot (`to_dict()` / `render()`), exposed
 both via `await runtime.status()` and the synchronous `runtime.snapshot()`
 (used by the blocking menu).

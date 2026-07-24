@@ -45,6 +45,7 @@ CAPABILITY_ROOTS = {
     "subagents.orchestrator": REPO_ROOT.parent / "corax-subagents",
     "sandbox.executor": REPO_ROOT.parent / "corax-sandbox-executor",
     "model.router": REPO_ROOT.parent / "corax-model-router",
+    "observability.jsonl": REPO_ROOT.parent / "corax-observability",
 }
 
 
@@ -102,6 +103,11 @@ class TestRuntime(unittest.TestCase):
             if CAPABILITY_ROOTS["model.router"].is_dir():
                 self.assertTrue(self.runtime.models.has("model.router"))
                 self.assertIsNotNone(self.runtime.active_model_router())
+            if CAPABILITY_ROOTS["observability.jsonl"].is_dir():
+                self.assertTrue(
+                    self.runtime.observability.has("observability.jsonl")
+                )
+                self.assertIsNotNone(self.runtime.active_observability())
         self.assertFalse(self.runtime.capabilities.has("llm.local"))
         self.assertFalse(self.runtime.capabilities.has("telegram.connector"))
         self.assertFalse(self.runtime.capabilities.has("gateway"))
@@ -142,6 +148,10 @@ class TestRuntime(unittest.TestCase):
             ],
         )
         self.assertEqual(status.active_by_kind["storage_provider"], ["state.file"])
+        self.assertEqual(
+            status.active_by_kind["observability"],
+            ["observability.jsonl"],
+        )
         self.assertIn("RUNNING", status.render())
         self.assertIn("running", status.to_dict())
 

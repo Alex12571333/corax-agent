@@ -10,6 +10,9 @@ Usage:
     corax status                   # print runtime status and exit
     corax security status          # show the active permission mode
     corax security mode auto       # switch ask / auto / full
+    corax observability            # show the local trace sink status
+    corax eval                     # run deterministic ecosystem checks
+    corax doctor                   # check local runtime readiness
     corax init                     # create config + workspace/data/logs and exit
     corax --config PATH setup      # use an explicit config file
 """
@@ -60,6 +63,9 @@ def build_parser() -> argparse.ArgumentParser:
             "subagents",
             "sandbox",
             "models",
+            "observability",
+            "eval",
+            "doctor",
             "init",
             "menu",
         ),
@@ -198,6 +204,30 @@ async def _run(args: argparse.Namespace) -> int:
                 return 1
             print(router.status())
             return 0
+        elif command == "observability":
+            provider = app.runtime.active_observability()
+            if provider is None or not hasattr(provider, "status"):
+                print("observability.jsonl is not loaded.")
+                return 1
+            print(provider.status())
+            return 0
+        elif command == "eval":
+            try:
+                from corax_evals import run_evaluations
+            except ImportError:
+                print(
+                    "corax-evals is not installed; install the 'dev' extra "
+                    "or the corax-evals package."
+                )
+                return 1
+            report = run_evaluations(
+                app.runtime.root_path,
+                app.runtime.root_path.parent,
+            )
+            print(report.render())
+            return 0 if report.ok else 1
+        elif command == "doctor":
+            return await _run_doctor(app)
         elif command == "gateway":
             return await _run_chat(app, config_path)
         elif command == "chat":
@@ -223,6 +253,61 @@ def _resolve_command(args: argparse.Namespace) -> str:
     if args.command == "menu":
         return "settings"
     return args.command or "chat"
+
+
+async def _run_doctor(app: "CoraxApp") -> int:
+    """Report local composition readiness without making network requests."""
+
+    runtime = app.runtime
+    config_errors = config_mod.validate_config(app.config)
+    model_id = app.config.extensions.bindings.get("primary_model", "")
+    checks = [
+        ("config", not config_errors, "; ".join(config_errors) or "valid"),
+        (
+            "agent-core",
+            runtime.core.available,
+            "available" if runtime.core.available else "missing",
+        ),
+        (
+            "primary model",
+            bool(model_id and runtime.models.has(model_id)),
+            model_id or "not configured",
+        ),
+        (
+            "security policy",
+            runtime.active_policy() is not None,
+            app.config.extensions.bindings.get("policy", "not configured"),
+        ),
+        (
+            "sandbox",
+            runtime.active_sandbox_executor() is not None,
+            app.config.extensions.bindings.get("sandbox", "not configured"),
+        ),
+        (
+            "state",
+            runtime.active_state_store() is not None,
+            app.config.extensions.bindings.get("state", "not configured"),
+        ),
+        (
+            "observability",
+            runtime.active_observability() is not None,
+            app.config.extensions.bindings.get(
+                "observability",
+                "not configured",
+            ),
+        ),
+        (
+            "workspace",
+            runtime.workspace_path.is_dir()
+            and os.access(runtime.workspace_path, os.R_OK | os.W_OK),
+            str(runtime.workspace_path),
+        ),
+    ]
+    passed = sum(ok for _, ok, _ in checks)
+    print(f"Corax doctor: {passed}/{len(checks)} passed")
+    for name, ok, detail in checks:
+        print(f"  {'PASS' if ok else 'FAIL'}  {name}: {detail}")
+    return 0 if passed == len(checks) else 1
 
 
 async def _run_setup_wizard(config_path: Path, *, first_run: bool) -> int:
@@ -371,6 +456,7 @@ async def _run_console_chat(app: "CoraxApp") -> int:
     async with runtime.core.session(
         runtime.tools,
         policy=runtime.active_policy(),
+        observability=runtime.active_observability(),
     ) as kernel:
         async def run_model(payload, *, session_id):
             return await runtime.invoke_extension(
@@ -615,6 +701,7 @@ async def _run_chat(app: "CoraxApp", config_path: Path) -> int:
         async with runtime.core.session(
             runtime.tools,
             policy=runtime.active_policy(),
+            observability=runtime.active_observability(),
         ) as kernel:
             async def invoke_component(
                 extension_id: str,

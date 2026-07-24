@@ -41,6 +41,8 @@ extensions:
       - sandbox.executor
     storage_provider:
       - state.file
+    observability:
+      - observability.jsonl
   bindings:
     planner: stub
     primary_model: model.router
@@ -55,6 +57,7 @@ extensions:
     hooks: hooks.runtime
     subagents: subagents.orchestrator
     sandbox: sandbox.executor
+    observability: observability.jsonl
   available:
     stub:
       kind: model_provider
@@ -109,6 +112,11 @@ extensions:
       enabled: true
       description: "Fail-closed Seatbelt or Docker shell backend"
       path: ../corax-sandbox-executor
+    observability.jsonl:
+      kind: observability
+      enabled: true
+      description: "Privacy-first bounded JSONL execution traces"
+      path: ../corax-observability
     state.file:
       kind: storage_provider
       enabled: true

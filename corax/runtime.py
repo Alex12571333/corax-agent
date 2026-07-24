@@ -22,6 +22,8 @@ from agent_core import (
     MemoryQuery,
     MemoryRecord,
     ModelRequest,
+    TraceRecord,
+    TraceStage,
 )
 
 from .capabilities import EchoCapability
@@ -139,6 +141,7 @@ class CoraxRuntime:
         self.policies = self.extensions.registry(ExtensionKind.POLICY_PROVIDER)
         self.services = self.extensions.registry(ExtensionKind.RUNTIME_SERVICE)
         self.storage = self.extensions.registry(ExtensionKind.STORAGE_PROVIDER)
+        self.observability = self.extensions.registry(ExtensionKind.OBSERVABILITY)
 
         # 0.1 aliases. Crucially, ``capabilities`` aliases tools only.
         self.capabilities = self.tools
@@ -171,11 +174,21 @@ class CoraxRuntime:
         )
         self._running = True
         self._started_at = datetime.now(timezone.utc)
+        await self.record_observation(
+            TraceStage.SESSION_ACQUIRED,
+            correlation_id=f"runtime-{self._started_at.isoformat()}",
+            metadata={"event": "runtime_start", "mode": self.config.agent.mode},
+        )
         self.log.info("runtime started: %s", self.extensions.active_by_kind())
 
     async def stop(self) -> None:
         if not self._running:
             return
+        await self.record_observation(
+            TraceStage.RESULT_PUBLISHED,
+            correlation_id=f"runtime-{datetime.now(timezone.utc).isoformat()}",
+            metadata={"event": "runtime_stop"},
+        )
         await self._dispatch_hooks("runtime_stop", {"root_path": str(self.root_path)})
         for entry in reversed(list(self.extensions)):
             try:
@@ -240,7 +253,11 @@ class CoraxRuntime:
         timeout: float = 5.0,
     ) -> Any:
         """Compatibility name for executing one LLM-callable tool."""
-        async with self.core.session(self.tools, policy=self.active_policy()) as kernel:
+        async with self.core.session(
+            self.tools,
+            policy=self.active_policy(),
+            observability=self.active_observability(),
+        ) as kernel:
             return await kernel.run_task(
                 required_capability=required_capability,
                 input=input,
@@ -337,6 +354,44 @@ class CoraxRuntime:
         if router_id and self.models.has(router_id):
             return self.models.get(router_id)
         return None
+
+    def active_observability(self) -> Any | None:
+        """Return the selected host-only trace/audit sink."""
+
+        provider_id = self.config.extensions.bindings.get("observability", "")
+        if provider_id and self.observability.has(provider_id):
+            return self.observability.get(provider_id)
+        return None
+
+    async def record_observation(
+        self,
+        stage: TraceStage,
+        *,
+        correlation_id: str,
+        session_id: str = "",
+        capability_id: str | None = None,
+        duration_ms: float | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Emit a host-level record without letting telemetry break execution."""
+
+        provider = self.active_observability()
+        if provider is None:
+            return
+        try:
+            await provider.record(
+                TraceRecord(
+                    correlation_id=correlation_id,
+                    session_id=session_id,
+                    stage=stage,
+                    message="",
+                    capability_id=capability_id,
+                    duration_ms=duration_ms,
+                    metadata=dict(metadata or {}),
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - telemetry is fail-soft
+            self.log.debug("observability provider failed: %s", exc)
 
     async def _dispatch_hooks(
         self,
@@ -632,18 +687,57 @@ class CoraxRuntime:
                 parameters=data,
                 session_id=session_id,
             )
-            if operation == "plan" and hasattr(item, "plan"):
-                from agent_core import CapabilityRequest
+            correlation_id = getattr(request, "request_id", "") or f"model-{session_id}"
+            await self.record_observation(
+                TraceStage.PLANNER_CALLED,
+                correlation_id=correlation_id,
+                session_id=session_id,
+                capability_id=extension_id,
+                metadata={
+                    "model": request.model or "",
+                    "modalities": list(request.modalities),
+                    "operation": operation or "generate",
+                },
+            )
+            try:
+                if operation == "plan" and hasattr(item, "plan"):
+                    from agent_core import CapabilityRequest
 
-                result = await item.plan(
-                    CapabilityRequest(
-                        task_id=f"plan-{request.request_id if hasattr(request, 'request_id') else 'request'}",
-                        session_id=session_id,
-                        input={"goal": request.prompt, **request.parameters},
+                    result = await item.plan(
+                        CapabilityRequest(
+                            task_id=f"plan-{request.request_id if hasattr(request, 'request_id') else 'request'}",
+                            session_id=session_id,
+                            input={"goal": request.prompt, **request.parameters},
+                        )
                     )
+                else:
+                    result = await item.generate(request)
+            except Exception as exc:
+                await self.record_observation(
+                    TraceStage.ERROR,
+                    correlation_id=correlation_id,
+                    session_id=session_id,
+                    capability_id=extension_id,
+                    metadata={
+                        "error_type": type(exc).__name__,
+                        "operation": operation or "generate",
+                    },
                 )
-            else:
-                result = await item.generate(request)
+                raise
+            await self.record_observation(
+                TraceStage.RESULT_PUBLISHED,
+                correlation_id=correlation_id,
+                session_id=session_id,
+                capability_id=extension_id,
+                metadata={
+                    "status": getattr(
+                        getattr(result, "status", None),
+                        "value",
+                        "",
+                    ),
+                    "operation": operation or "generate",
+                },
+            )
             await self._dispatch_hooks(
                 "post_model_call",
                 {
@@ -716,6 +810,11 @@ class CoraxRuntime:
                 await item.delete(key, namespace=namespace)
                 return None
             raise ValueError("storage operation must be read, write or delete")
+        elif kind is ExtensionKind.OBSERVABILITY:
+            raise TypeError(
+                "observability providers receive records from the host and "
+                "cannot be invoked as commands"
+            )
         elif hasattr(item, "invoke"):
             result = await item.invoke(
                 ExtensionRequest(operation=operation, payload=data, session_id=session_id)
@@ -766,9 +865,38 @@ class CoraxRuntime:
             parameters=data,
             session_id=session_id,
         )
+        correlation_id = getattr(request, "request_id", "") or f"stream-{session_id}"
+        await self.record_observation(
+            TraceStage.PLANNER_CALLED,
+            correlation_id=correlation_id,
+            session_id=session_id,
+            capability_id=extension_id,
+            metadata={
+                "model": request.model or "",
+                "modalities": list(request.modalities),
+                "operation": "stream",
+            },
+        )
         try:
             async for event in item.stream_generate_events(request):
                 yield event
+        except Exception as exc:
+            await self.record_observation(
+                TraceStage.ERROR,
+                correlation_id=correlation_id,
+                session_id=session_id,
+                capability_id=extension_id,
+                metadata={"error_type": type(exc).__name__, "operation": "stream"},
+            )
+            raise
+        else:
+            await self.record_observation(
+                TraceStage.RESULT_PUBLISHED,
+                correlation_id=correlation_id,
+                session_id=session_id,
+                capability_id=extension_id,
+                metadata={"operation": "stream"},
+            )
         finally:
             await self._dispatch_hooks(
                 "post_model_call",
@@ -819,6 +947,7 @@ class CoraxRuntime:
         self._apply_security_environment()
         self._apply_skills_environment()
         self._apply_sandbox_environment()
+        self._apply_observability_environment()
 
     def _apply_llm_environment(self) -> None:
         llm = self.config.llm
@@ -882,3 +1011,9 @@ class CoraxRuntime:
     def _apply_sandbox_environment(self) -> None:
         os.environ["CORAX_SHELL_REQUIRE_SANDBOX"] = "true"
         os.environ["CORAX_SANDBOX_WORKSPACE"] = str(self.workspace_path)
+
+    def _apply_observability_environment(self) -> None:
+        os.environ.setdefault(
+            "CORAX_OBSERVABILITY_PATH",
+            str(self.data_path / "observability" / "traces.jsonl"),
+        )
