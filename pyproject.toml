@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "corax-agent"
-version = "0.1.0"
-description = "Corax Agent — minimal agent scaffold (runtime, config, settings menu, extension points)."
+version = "0.2.0"
+description = "Corax Agent — typed extension runtime with strict tool and infrastructure boundaries."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
@@ -21,6 +21,7 @@ dependencies = [
     "corax-llm-local-connector @ git+https://github.com/Alex12571333/corax-llm-local-connector.git",
     "corax-telegram-connector @ git+https://github.com/Alex12571333/corax-telegram-connector.git",
     "corax-web-search-capability @ git+https://github.com/Alex12571333/corax-web-search-capability.git",
+    "corax-runtime-gateway @ git+https://github.com/Alex12571333/corax-gateway-capability.git",
 ]
 
 [project.optional-dependencies]

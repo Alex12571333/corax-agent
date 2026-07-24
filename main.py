@@ -99,11 +99,11 @@ def _resolve_command(args: argparse.Namespace) -> str:
 
 
 def _tool_capability_specs(runtime) -> list[dict]:
-    """Describe the kernel-executable capabilities as tool specs for the model."""
+    """Describe only kernel-executable tools for the model."""
     from corax.loader.core import _as_pairs
 
     specs: list[dict] = []
-    for cap_id, item in _as_pairs(runtime.capabilities):
+    for cap_id, item in _as_pairs(runtime.tools):
         if not runtime.core.is_executable(item):
             continue
         specs.append(
@@ -136,20 +136,15 @@ def _resolve_tool_routing(app: "CoraxApp", selector_available: bool) -> tuple[st
 
 
 def _build_tool_routing(
-    routing_mode: str, kernel, specs: list[dict], selector, app: "CoraxApp"
+    routing_mode: str, invoke_extension, specs: list[dict], selector, app: "CoraxApp"
 ) -> dict:
     """Build the gateway's tool-selection kwargs for the resolved routing mode."""
     if routing_mode == "llm":
         from corax.tool_router import LLMToolRouter
 
-        catalog = [
-            s
-            for s in specs
-            if s["id"] not in ("gateway", "llm.local", "telegram.connector")
-        ]
         router = LLMToolRouter(
-            kernel.invoke,
-            catalog=catalog,
+            invoke_extension,
+            catalog=specs,
             model=app.config.llm.model,
             fallback=selector.select if selector.available else None,
             log=logging.getLogger("corax.tool_router"),
@@ -186,8 +181,11 @@ async def _run_chat(app: "CoraxApp", config_path: Path) -> int:
     if not (os.getenv("CORAX_TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")):
         print("Set CORAX_TELEGRAM_BOT_TOKEN before running --chat.")
         return 1
-    if "llm.local" not in runtime.capabilities:
-        print("llm.local capability is not loaded; cannot run the chat.")
+    if not runtime.models.has("llm.local"):
+        print("llm.local model provider is not loaded; cannot run the chat.")
+        return 1
+    if not runtime.channels.has("telegram.connector"):
+        print("telegram.connector channel is not loaded; cannot run the chat.")
         return 1
 
     from corax.gateway import CoraxTelegramGateway
@@ -202,7 +200,7 @@ async def _run_chat(app: "CoraxApp", config_path: Path) -> int:
     tool_ids = [
         s["id"]
         for s in specs
-        if s["id"] not in ("gateway", "llm.local", "telegram.connector")
+        if s["id"]
     ]
     if not app.config.telegram.allowed_chats:
         _print_warning(
@@ -218,13 +216,31 @@ async def _run_chat(app: "CoraxApp", config_path: Path) -> int:
     )
 
     while True:
-        async with runtime.core.session(
-            runtime.capabilities, policy=GatewayPolicyEngine()
-        ) as kernel:
+        async with runtime.core.session(runtime.tools, policy=GatewayPolicyEngine()) as kernel:
+            async def invoke_component(
+                extension_id: str,
+                payload: dict | None = None,
+                *,
+                session_id: str = "",
+            ):
+                if runtime.tools.has(extension_id):
+                    return await kernel.invoke(
+                        extension_id,
+                        payload,
+                        session_id=session_id or None,
+                    )
+                return await runtime.invoke_extension(
+                    extension_id,
+                    payload,
+                    session_id=session_id,
+                )
+
             gateway_kwargs = {
-                "run_capability": kernel.invoke,
-                "stream_capability": kernel.stream_generate_events,
+                "run_capability": invoke_component,
+                "stream_capability": runtime.stream_extension,
                 "capabilities": specs,
+                "gateway_available": runtime.services.has("gateway"),
+                "telegram_available": runtime.channels.has("telegram.connector"),
                 "model": app.config.llm.model,
                 "workspace_path": runtime.workspace_path,
                 "state_path": runtime.data_path / "telegram-gateway-fallback-state.json",
@@ -232,7 +248,13 @@ async def _run_chat(app: "CoraxApp", config_path: Path) -> int:
                 "stream_transport": stream_transport,
             }
             gateway_kwargs.update(
-                _build_tool_routing(routing_mode, kernel, specs, selector, app)
+                _build_tool_routing(
+                    routing_mode,
+                    runtime.invoke_extension,
+                    specs,
+                    selector,
+                    app,
+                )
             )
             if system_prompt is not None:
                 gateway_kwargs["system_prompt"] = system_prompt
@@ -251,7 +273,7 @@ async def _run_chat(app: "CoraxApp", config_path: Path) -> int:
             tool_ids = [
                 s["id"]
                 for s in specs
-                if s["id"] not in ("gateway", "llm.local", "telegram.connector")
+                if s["id"]
             ]
             _print_chat_dashboard(
                 app,
@@ -319,15 +341,15 @@ def _print_chat_dashboard(
     stream_transport: str = "edit",
 ) -> None:
     runtime = app.runtime
-    executable = runtime.core.executable_ids(runtime.capabilities)
-    has_gateway = any(spec["id"] == "gateway" for spec in specs)
-    has_telegram = any(spec["id"] == "telegram.connector" for spec in specs)
+    executable = runtime.core.executable_ids(runtime.tools)
+    has_gateway = runtime.services.has("gateway")
+    has_telegram = runtime.channels.has("telegram.connector")
     allowed_chats = app.config.telegram.allowed_chats.strip() or "not set"
     rows = [
         ("mode", "telegram chat gateway"),
         ("model", app.config.llm.model),
         ("kernel", f"ready, {len(executable)} executable capability(ies)"),
-        ("gateway", "standalone capability" if has_gateway else "fallback local state"),
+        ("gateway", "runtime service" if has_gateway else "fallback local state"),
         ("connector", "telegram.connector" if has_telegram else "missing"),
         ("streaming", f"{stream_transport} transport"),
         ("tool mode", tool_mode),

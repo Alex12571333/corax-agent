@@ -1,9 +1,9 @@
-"""Corax runtime.
+"""Typed Corax runtime composition root.
 
-Owns the four registries and populates them from config. The planner,
-memory and connectors are still backed by built-in placeholders;
-capabilities are either the in-tree :class:`EchoCapability` or standalone
-SDK packages loaded through :class:`~corax.loader.CapabilityLoader`.
+Every installable component is an extension, but extensions are partitioned by
+role.  Only the ``tool`` registry is handed to the agent-core task executor.
+Channels, models, memory and runtime services are invoked by the host through
+their role-specific contracts.
 """
 
 from __future__ import annotations
@@ -15,43 +15,55 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from .capabilities import EchoCapability
-from .config import AgentConfig
-from .connectors import TerminalConnector
-from .loader import CapabilityLoader, CoreEngine
-from .memory import NullMemory
-from .planner import StubPlanner
-from .registry import (
-    CapabilityRegistryAdapter,
-    ConnectorRegistry,
-    MemoryRegistry,
-    ProviderRegistry,
+from agent_core import (
+    ChannelMessage,
+    ExtensionKind,
+    ExtensionRequest,
+    MemoryQuery,
+    MemoryRecord,
+    ModelRequest,
 )
 
-# Built-in factories keyed by the provider id used in corax.yaml. Real
-# implementations register additional ids here later.
-_PLANNER_FACTORIES: dict[str, Callable[[], Any]] = {"stub": StubPlanner}
-_MEMORY_FACTORIES: dict[str, Callable[[], Any]] = {"none": NullMemory}
-_CONNECTOR_FACTORIES: dict[str, Callable[[], Any]] = {"terminal": TerminalConnector}
-_CAPABILITY_FACTORIES: dict[str, Callable[[], Any]] = {"echo": EchoCapability}
+from .capabilities import EchoCapability
+from .config import AgentConfig, ExtensionSpec
+from .connectors import TerminalConnector
+from .loader import CoreEngine, ExtensionLoader
+from .memory import NullMemory
+from .planner import StubPlanner
+from .registry import ExtensionCatalog
+
+_BUILTIN_FACTORIES: dict[str, Callable[[], Any]] = {
+    "stub": StubPlanner,
+    "memory.none": NullMemory,
+    "terminal": TerminalConnector,
+    "echo": EchoCapability,
+}
 
 
 @dataclass
 class RuntimeStatus:
-    """A snapshot of the runtime, safe to print or serialise."""
+    """A serialisable snapshot of role activation and kernel state."""
 
     running: bool
     started_at: str | None
     uptime_seconds: float
     agent_name: str
     mode: str
-    planner_active: str
-    memory_active: str
-    connectors_active: list[str] = field(default_factory=list)
-    capabilities_enabled: list[str] = field(default_factory=list)
+    active_by_kind: dict[str, list[str]] = field(default_factory=dict)
+    bindings: dict[str, str] = field(default_factory=dict)
     registry_counts: dict[str, int] = field(default_factory=dict)
     core_available: bool = False
-    core_capabilities: list[str] = field(default_factory=list)
+    core_tools: list[str] = field(default_factory=list)
+
+    # Deprecated 0.1 status views.
+    planner_active: str = ""
+    memory_active: str = ""
+    connectors_active: list[str] = field(default_factory=list)
+    capabilities_enabled: list[str] = field(default_factory=list)
+
+    @property
+    def core_capabilities(self) -> list[str]:
+        return self.core_tools
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -60,39 +72,43 @@ class RuntimeStatus:
             "uptime_seconds": round(self.uptime_seconds, 3),
             "agent_name": self.agent_name,
             "mode": self.mode,
+            "active_by_kind": self.active_by_kind,
+            "bindings": self.bindings,
+            "registry_counts": self.registry_counts,
+            "core_available": self.core_available,
+            "core_tools": self.core_tools,
             "planner_active": self.planner_active,
             "memory_active": self.memory_active,
             "connectors_active": self.connectors_active,
             "capabilities_enabled": self.capabilities_enabled,
-            "registry_counts": self.registry_counts,
-            "core_available": self.core_available,
-            "core_capabilities": self.core_capabilities,
         }
 
     def render(self) -> str:
-        lines = [
+        rows = [
             f"  state          : {'RUNNING' if self.running else 'stopped'}",
             f"  agent / mode   : {self.agent_name} / {self.mode}",
             f"  started_at     : {self.started_at or '-'}",
             f"  uptime         : {self.uptime_seconds:.1f}s",
-            f"  planner        : {self.planner_active}",
-            f"  memory         : {self.memory_active}",
-            f"  connectors     : {', '.join(self.connectors_active) or '-'}",
-            f"  capabilities   : {', '.join(self.capabilities_enabled) or '-'}",
-            "  registries     : "
-            + ", ".join(f"{k}={v}" for k, v in self.registry_counts.items()),
-            "  core (kernel)  : "
-            + (
-                f"ready — executes {', '.join(self.core_capabilities) or 'no capabilities'}"
-                if self.core_available
-                else "unavailable (agent-core not installed)"
-            ),
         ]
-        return "\n".join(lines)
+        for kind, extension_ids in sorted(self.active_by_kind.items()):
+            rows.append(f"  {kind:<15}: {', '.join(extension_ids) or '-'}")
+        rows.extend(
+            [
+                "  bindings       : "
+                + ", ".join(f"{role}={value}" for role, value in self.bindings.items()),
+                "  core (tools)   : "
+                + (
+                    f"ready — {', '.join(self.core_tools) or 'no tools'}"
+                    if self.core_available
+                    else "unavailable (agent-core not installed)"
+                ),
+            ]
+        )
+        return "\n".join(rows)
 
 
 class CoraxRuntime:
-    """Lifecycle owner for the agent's registries."""
+    """Load, validate, start and invoke typed extensions."""
 
     def __init__(
         self,
@@ -101,7 +117,7 @@ class CoraxRuntime:
         *,
         root_path: str | Path | None = None,
         workspace_path: str | Path | None = None,
-        core_version: str = "0.1.0",
+        core_version: str = "0.2.0",
     ) -> None:
         self.config = config
         self.log = logger or logging.getLogger("corax.runtime")
@@ -109,68 +125,62 @@ class CoraxRuntime:
         self.workspace_path = Path(
             workspace_path or self.root_path / config.runtime.workspace_path
         ).resolve()
-        self.data_path = Path(self.root_path / config.runtime.data_path).resolve()
+        self.data_path = (self.root_path / config.runtime.data_path).resolve()
         self.core_version = core_version
 
-        self.connectors = ConnectorRegistry()
-        self.memory = MemoryRegistry()
-        self.providers = ProviderRegistry()
-        self.capabilities = CapabilityRegistryAdapter()
+        self.extensions = ExtensionCatalog()
+        self.tools = self.extensions.registry(ExtensionKind.TOOL)
+        self.channels = self.extensions.registry(ExtensionKind.CHANNEL_CONNECTOR)
+        self.models = self.extensions.registry(ExtensionKind.MODEL_PROVIDER)
+        self.memories = self.extensions.registry(ExtensionKind.MEMORY_PROVIDER)
+        self.services = self.extensions.registry(ExtensionKind.RUNTIME_SERVICE)
 
-        self.capability_loader = CapabilityLoader(
+        # 0.1 aliases. Crucially, ``capabilities`` aliases tools only.
+        self.capabilities = self.tools
+        self.connectors = self.channels
+        self.providers = self.models
+        self.memory = self.memories
+
+        self.extension_loader = ExtensionLoader(
             root_path=self.root_path,
             workspace_path=self.workspace_path,
             core_version=self.core_version,
             log=self.log,
         )
-        # Seam onto the agent-core execution kernel (lazy; runs on demand).
+        self.capability_loader = self.extension_loader
         self.core = CoreEngine(self.config, log=self.log)
-
         self._running = False
         self._started_at: datetime | None = None
 
-    # -- lifecycle ------------------------------------------------------- #
     async def start(self) -> None:
         if self._running:
-            self.log.debug("runtime already running")
             return
-        self.log.info("starting runtime")
-        self._apply_llm_environment()
-        self._apply_telegram_environment()
-        self._apply_websearch_environment()
-        self._apply_gateway_environment()
-        self._populate_registries()
+        self._apply_environment()
+        self._populate_extensions()
+        for entry in self.extensions:
+            await entry.item.start()
         self._running = True
         self._started_at = datetime.now(timezone.utc)
-        self.log.info(
-            "runtime started: planner=%s memory=%s connectors=%s capabilities=%s",
-            self.config.planner.active,
-            self.config.memory.active,
-            self.config.connectors.active,
-            self.config.capabilities.enabled,
-        )
-        if self.core.available:
-            self.log.info(
-                "agent-core kernel available: executes %s",
-                self.core.executable_ids(self.capabilities) or "no capabilities yet",
-            )
-        else:
-            self.log.info("agent-core not installed — execution kernel disabled")
+        self.log.info("runtime started: %s", self.extensions.active_by_kind())
 
     async def stop(self) -> None:
         if not self._running:
             return
-        self.log.info("stopping runtime")
-        self._clear_registries()
+        for entry in reversed(list(self.extensions)):
+            try:
+                await entry.item.stop()
+            except Exception as exc:  # noqa: BLE001
+                self.log.warning("failed stopping extension '%s': %s", entry.id, exc)
+        self.extensions.clear()
         self._running = False
         self._started_at = None
 
     async def reload_config(self, config: AgentConfig | None = None) -> None:
-        """Re-apply config: stop, swap, repopulate."""
         was_running = self._running
         await self.stop()
         if config is not None:
             self.config = config
+            self.core.config = config
         if was_running:
             await self.start()
 
@@ -178,30 +188,31 @@ class CoraxRuntime:
         return self.snapshot()
 
     def snapshot(self) -> RuntimeStatus:
-        """Synchronous status snapshot (safe to call from the blocking menu)."""
         uptime = 0.0
         started = None
         if self._started_at is not None:
             started = self._started_at.isoformat()
             uptime = (datetime.now(timezone.utc) - self._started_at).total_seconds()
+        active = self.extensions.active_by_kind()
+        bindings = dict(self.config.extensions.bindings)
         return RuntimeStatus(
             running=self._running,
             started_at=started,
             uptime_seconds=uptime,
             agent_name=self.config.agent.name,
             mode=self.config.agent.mode,
-            planner_active=self.config.planner.active,
-            memory_active=self.config.memory.active,
-            connectors_active=list(self.config.connectors.active),
-            capabilities_enabled=list(self.config.capabilities.enabled),
+            active_by_kind=active,
+            bindings=bindings,
             registry_counts={
-                "providers": len(self.providers),
-                "memory": len(self.memory),
-                "connectors": len(self.connectors),
-                "capabilities": len(self.capabilities),
+                kind: len(self.extensions.registry(kind))
+                for kind in active
             },
             core_available=self.core.available,
-            core_capabilities=self.core.executable_ids(self.capabilities),
+            core_tools=self.core.executable_ids(self.tools),
+            planner_active=bindings.get("planner", ""),
+            memory_active=bindings.get("memory", ""),
+            connectors_active=active.get("channel_connector", []),
+            capabilities_enabled=active.get("tool", []),
         )
 
     @property
@@ -216,14 +227,8 @@ class CoraxRuntime:
         task_type: str = "generic",
         timeout: float = 5.0,
     ) -> Any:
-        """Run one task through the agent-core kernel and return the final Task.
-
-        Spins up an ephemeral kernel from the currently-registered capabilities,
-        executes ``required_capability`` against ``input``, then tears the kernel
-        down. Requires ``agent-core`` (raises ``RuntimeError`` otherwise) and a
-        capability the kernel can run (a real ``agent_core.Capability``).
-        """
-        async with self.core.session(self.capabilities) as kernel:
+        """Compatibility name for executing one LLM-callable tool."""
+        async with self.core.session(self.tools) as kernel:
             return await kernel.run_task(
                 required_capability=required_capability,
                 input=input,
@@ -231,49 +236,183 @@ class CoraxRuntime:
                 wait_timeout=timeout,
             )
 
-    # -- internals ------------------------------------------------------- #
-    def _apply_llm_environment(self) -> None:
-        """Export the menu-driven LLM setup so the ``llm.local`` connector reads it.
+    async def invoke_extension(
+        self,
+        extension_id: str,
+        payload: dict | None = None,
+        *,
+        session_id: str = "",
+    ) -> Any:
+        """Invoke a host-level extension through its role contract.
 
-        The standalone connector resolves its endpoint, model and enabled input
-        modalities from ``CORAX_LLM_*`` environment variables. Mirroring the
-        config here keeps the runtime menu the single place an operator picks
-        modalities, with no per-capability constructor wiring.
+        Tools intentionally are not handled here; they must cross the kernel
+        boundary so schema validation, policy and tracing remain active.
         """
-        llm = getattr(self.config, "llm", None)
-        if llm is None:
-            return
+        item = self.extensions.get(extension_id)
+        kind = item.kind
+        data = dict(payload or {})
+        operation = str(data.pop("operation", ""))
+        if kind is ExtensionKind.TOOL:
+            raise TypeError(
+                f"{extension_id!r} is a tool; invoke it through agent-core"
+            )
+        if kind is ExtensionKind.MODEL_PROVIDER:
+            request = ModelRequest(
+                prompt=str(data.pop("prompt", "")),
+                messages=tuple(data.pop("messages", ())),
+                model=data.pop("model", None),
+                modalities=tuple(data.pop("modalities", ("text",))),
+                parameters=data,
+                session_id=session_id,
+            )
+            if operation == "plan" and hasattr(item, "plan"):
+                from agent_core import CapabilityRequest
+
+                result = await item.plan(
+                    CapabilityRequest(
+                        task_id=f"plan-{request.request_id if hasattr(request, 'request_id') else 'request'}",
+                        session_id=session_id,
+                        input={"goal": request.prompt, **request.parameters},
+                    )
+                )
+            else:
+                result = await item.generate(request)
+        elif kind is ExtensionKind.MEMORY_PROVIDER:
+            if operation == "remember":
+                result = await item.remember(
+                    MemoryRecord(
+                        content=str(data.pop("content", "")),
+                        kind=str(data.pop("kind", "fact")),
+                        scope=dict(data.pop("scope", {})),
+                        metadata=data,
+                    )
+                )
+            elif operation == "forget":
+                result = await item.forget(
+                    str(data.pop("memory_id", "")),
+                    scope=dict(data.pop("scope", {})),
+                )
+            else:
+                result = await item.recall(
+                    MemoryQuery(
+                        text=str(data.pop("text", data.pop("query", ""))),
+                        scopes=tuple(data.pop("scopes", ())),
+                        limit=int(data.pop("limit", 10)),
+                        metadata=data,
+                    )
+                )
+        elif kind is ExtensionKind.CHANNEL_CONNECTOR:
+            if hasattr(item, "handle") and operation not in {"send", "receive"}:
+                result = await item.handle(
+                    ExtensionRequest(operation=operation, payload=data, session_id=session_id)
+                )
+            elif operation == "receive":
+                return await item.receive(limit=int(data.get("limit", 1)))
+            else:
+                result = await item.send(
+                    ChannelMessage(
+                        channel=str(data.pop("channel", extension_id)),
+                        conversation_id=str(
+                            data.pop("conversation_id", data.pop("chat_id", ""))
+                        ),
+                        text=str(data.pop("text", "")),
+                        parts=tuple(data.pop("parts", ())),
+                        metadata=data,
+                    )
+                )
+        elif kind is ExtensionKind.RUNTIME_SERVICE:
+            result = await item.handle(
+                ExtensionRequest(operation=operation, payload=data, session_id=session_id)
+            )
+        elif hasattr(item, "invoke"):
+            result = await item.invoke(
+                ExtensionRequest(operation=operation, payload=data, session_id=session_id)
+            )
+        else:
+            raise TypeError(f"unsupported extension kind: {kind.value}")
+        if getattr(result, "is_success", False):
+            return result.payload
+        error = getattr(result, "error", None)
+        raise RuntimeError(
+            getattr(error, "message", None)
+            or f"extension {extension_id!r} failed"
+        )
+
+    async def stream_extension(
+        self,
+        extension_id: str,
+        payload: dict | None = None,
+        *,
+        session_id: str = "",
+    ):
+        """Stream from a model provider without admitting it to the tool kernel."""
+        item = self.models.get(extension_id)
+        if not hasattr(item, "stream_generate_events"):
+            raise TypeError(f"model provider {extension_id!r} does not support streaming")
+        data = dict(payload or {})
+        data.pop("operation", None)
+        request = ModelRequest(
+            prompt=str(data.pop("prompt", "")),
+            messages=tuple(data.pop("messages", ())),
+            model=data.pop("model", None),
+            modalities=tuple(data.pop("modalities", ("text",))),
+            parameters=data,
+            session_id=session_id,
+        )
+        async for event in item.stream_generate_events(request):
+            yield event
+
+    def _populate_extensions(self) -> None:
+        self.extensions.clear()
+        for kind_name, extension_ids in self.config.extensions.active.items():
+            try:
+                expected_kind = ExtensionKind(kind_name)
+            except ValueError:
+                self.log.warning("unknown extension kind '%s' — skipping", kind_name)
+                continue
+            for extension_id in extension_ids:
+                spec = self.config.extensions.available.get(extension_id)
+                if spec is None or not spec.enabled:
+                    continue
+                item = self._build_extension(extension_id, spec)
+                if item is None:
+                    continue
+                if item.kind is not expected_kind:
+                    self.log.warning(
+                        "extension '%s' loaded as %s, configured as %s",
+                        extension_id,
+                        item.kind.value,
+                        expected_kind.value,
+                    )
+                    continue
+                self.extensions.register(extension_id, item)
+
+    def _build_extension(self, extension_id: str, spec: ExtensionSpec) -> Any | None:
+        factory = _BUILTIN_FACTORIES.get(extension_id)
+        if factory is not None:
+            return factory()
+        return self.extension_loader.load(extension_id, spec)
+
+    def _apply_environment(self) -> None:
+        self._apply_llm_environment()
+        self._apply_telegram_environment()
+        self._apply_websearch_environment()
+        self._apply_gateway_environment()
+
+    def _apply_llm_environment(self) -> None:
+        llm = self.config.llm
         os.environ["CORAX_LLM_BASE_URL"] = llm.base_url
         os.environ["CORAX_LLM_MODEL"] = llm.model
         os.environ["CORAX_LLM_ENABLE_IMAGE"] = "true" if llm.enable_image else "false"
         os.environ["CORAX_LLM_ENABLE_VIDEO"] = "true" if llm.enable_video else "false"
 
     def _apply_telegram_environment(self) -> None:
-        """Export the menu-driven Telegram setup so the connector reads it.
-
-        Only the non-secret settings are mirrored here; the bot token is read by
-        the connector straight from ``CORAX_TELEGRAM_BOT_TOKEN`` and is never
-        stored in the agent config.
-        """
-        telegram = getattr(self.config, "telegram", None)
-        if telegram is None:
-            return
+        telegram = self.config.telegram
         os.environ["CORAX_TELEGRAM_BASE_URL"] = telegram.base_url
         os.environ["CORAX_TELEGRAM_ALLOWED_CHATS"] = telegram.allowed_chats
 
     def _apply_websearch_environment(self) -> None:
-        """Export the menu-driven web-search setup so the ``web.search`` tool reads it.
-
-        The standalone tool resolves its SearXNG endpoint and default query knobs
-        from ``CORAX_WEBSEARCH_*``. ``base_url`` is always exported; the optional
-        defaults are exported only when set and cleared otherwise — an empty
-        ``safesearch`` must never be exported, or the tool would reject
-        ``int("")``. The optional proxy token stays env-only
-        (``CORAX_WEBSEARCH_TOKEN``) and is never stored in config.
-        """
-        websearch = getattr(self.config, "websearch", None)
-        if websearch is None:
-            return
+        websearch = self.config.websearch
         os.environ["CORAX_WEBSEARCH_BASE_URL"] = websearch.base_url
         for env_name, value in (
             ("CORAX_WEBSEARCH_ENGINES", websearch.engines),
@@ -286,72 +425,7 @@ class CoraxRuntime:
                 os.environ.pop(env_name, None)
 
     def _apply_gateway_environment(self) -> None:
-        """Give the standalone gateway a durable local state file.
-
-        Session memory belongs to the gateway capability, but it is loaded
-        through the generic SDK interface, so constructor wiring would couple the
-        agent to one capability. A non-secret env var keeps the package
-        standalone while making Telegram restarts reuse the same conversation
-        context.
-        """
         os.environ.setdefault(
             "CORAX_GATEWAY_STATE_PATH",
             str(self.data_path / "gateway-state.json"),
         )
-
-    def _populate_registries(self) -> None:
-        self._clear_registries()
-
-        # Planner (single active provider -> ProviderRegistry).
-        planner_id = self.config.planner.active
-        item = self._build(_PLANNER_FACTORIES, planner_id, "planner")
-        if item is not None:
-            self.providers.register(planner_id, item)
-
-        # Memory (single active backend).
-        memory_id = self.config.memory.active
-        item = self._build(_MEMORY_FACTORIES, memory_id, "memory")
-        if item is not None:
-            self.memory.register(memory_id, item)
-
-        # Connectors (list of active ids).
-        for cid in self.config.connectors.active:
-            spec = self.config.connectors.providers.get(cid)
-            if spec is not None and not spec.enabled:
-                continue
-            item = self._build(_CONNECTOR_FACTORIES, cid, "connector")
-            if item is not None:
-                self.connectors.register(cid, item)
-
-        # Capabilities (list of enabled ids).
-        for cap_id in self.config.capabilities.enabled:
-            spec = self.config.capabilities.available.get(cap_id)
-            if spec is not None and not spec.enabled:
-                continue
-            item = self._build_capability(cap_id)
-            if item is not None:
-                self.capabilities.register(cap_id, item)
-
-    def _build(self, factories: dict[str, Callable[[], Any]], id: str, role: str) -> Any:
-        factory = factories.get(id)
-        if factory is None:
-            self.log.warning(
-                "no built-in for %s '%s' — skipping (will be provided by a real module later)",
-                role,
-                id,
-            )
-            return None
-        return factory()
-
-    def _build_capability(self, id: str) -> Any:
-        factory = _CAPABILITY_FACTORIES.get(id)
-        if factory is not None:
-            return factory()
-        spec = self.config.capabilities.available.get(id)
-        return self.capability_loader.load(id, spec)
-
-    def _clear_registries(self) -> None:
-        self.connectors.clear()
-        self.memory.clear()
-        self.providers.clear()
-        self.capabilities.clear()

@@ -1,18 +1,4 @@
-"""Capability package loader.
-
-Richer capabilities (filesystem, editor, shell, …) ship as standalone
-SDK packages rather than in-tree code. Each package declares a root
-``capability.json`` manifest and a ``main.py`` entrypoint. This loader:
-
-1. resolves the package path (relative paths are anchored at the repo root),
-2. loads and validates the manifest against the core version,
-3. confirms the manifest's declared id matches what config asked for,
-4. instantiates the capability through ``agent-sdk``'s ``load_instance``.
-
-``agent-sdk`` is imported **lazily**, inside :meth:`CapabilityLoader.load`,
-so the scaffold (menu, config, built-in components) runs on a pure-stdlib
-install. The dependency is only required to load real capability packages.
-"""
+"""Typed extension package loader."""
 
 from __future__ import annotations
 
@@ -20,22 +6,20 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from ..config import ProviderSpec
+from ..config import ExtensionSpec
 
-# Capabilities that should be sandboxed to the agent workspace receive it
-# as a constructor keyword. Extend this as new workspace-confined tools land.
 _WORKSPACE_CONFINED = {"filesystem", "editor"}
 
 
-class CapabilityLoader:
-    """Builds capability instances from standalone SDK packages."""
+class ExtensionLoader:
+    """Load one package after manifest, kind and contract validation."""
 
     def __init__(
         self,
         *,
         root_path: str | Path,
         workspace_path: str | Path,
-        core_version: str = "0.1.0",
+        core_version: str = "0.2.0",
         log: logging.Logger | None = None,
     ) -> None:
         self.root_path = Path(root_path)
@@ -43,64 +27,80 @@ class CapabilityLoader:
         self.core_version = core_version
         self.log = log or logging.getLogger("corax.loader")
 
-    def load(self, capability_id: str, spec: ProviderSpec | None) -> Any | None:
-        """Return a capability instance for ``capability_id`` or ``None``.
-
-        Never raises: any failure is logged and reported as ``None`` so a
-        single broken capability cannot stop the runtime from starting.
-        """
+    def load(
+        self,
+        extension_id: str,
+        spec: ExtensionSpec | None,
+    ) -> Any | None:
         if spec is None or not spec.path:
             self.log.warning(
-                "no capability package path configured for '%s' — skipping",
-                capability_id,
+                "no extension package path configured for '%s' — skipping",
+                extension_id,
             )
             return None
-
         try:
-            from agent_sdk import CapabilityManifest, load_instance, validate_manifest
+            from agent_sdk import (
+                ExtensionManifest,
+                load_extension_instance,
+                validate_extension_manifest,
+            )
         except ImportError:
             self.log.warning(
-                "agent-sdk not installed — cannot load capability package '%s'",
-                capability_id,
+                "agent-sdk not installed — cannot load extension '%s'",
+                extension_id,
             )
             return None
 
         package_path = self._resolve_package_path(spec.path)
         try:
-            manifest = CapabilityManifest.load(package_path)
-            result = validate_manifest(manifest, core_version=self.core_version)
+            manifest = ExtensionManifest.load(package_path)
+            result = validate_extension_manifest(
+                manifest,
+                core_version=self.core_version,
+            )
             if not result.ok:
                 self.log.warning(
-                    "invalid capability manifest for '%s': %s",
-                    capability_id,
+                    "invalid extension manifest for '%s': %s",
+                    extension_id,
                     "; ".join(result.errors),
                 )
                 return None
-            if manifest.id != capability_id:
+            if manifest.id != extension_id:
                 self.log.warning(
-                    "capability id mismatch for '%s': manifest declares '%s'",
-                    capability_id,
+                    "extension id mismatch for '%s': manifest declares '%s'",
+                    extension_id,
                     manifest.id,
                 )
                 return None
-            return load_instance(
+            if manifest.kind.value != spec.kind:
+                self.log.warning(
+                    "extension kind mismatch for '%s': config=%s manifest=%s",
+                    extension_id,
+                    spec.kind,
+                    manifest.kind.value,
+                )
+                return None
+            return load_extension_instance(
                 manifest,
                 package_path,
                 core_version=self.core_version,
-                kwargs=self._kwargs(capability_id),
+                kwargs=self._kwargs(extension_id),
             )
-        except Exception as exc:  # noqa: BLE001 - startup should report and continue
-            self.log.warning("failed loading capability '%s': %s", capability_id, exc)
+        except Exception as exc:  # noqa: BLE001
+            self.log.warning("failed loading extension '%s': %s", extension_id, exc)
             return None
 
-    # -- internals ------------------------------------------------------- #
     def _resolve_package_path(self, value: str) -> Path:
         candidate = Path(value).expanduser()
         if not candidate.is_absolute():
             candidate = self.root_path / candidate
         return candidate.resolve()
 
-    def _kwargs(self, capability_id: str) -> dict[str, Any]:
-        if capability_id in _WORKSPACE_CONFINED:
+    def _kwargs(self, extension_id: str) -> dict[str, Any]:
+        if extension_id in _WORKSPACE_CONFINED:
             return {"workspace_root": self.workspace_path}
         return {}
+
+
+# Compatibility import for 0.1 callers.
+CapabilityLoader = ExtensionLoader

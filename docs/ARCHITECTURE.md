@@ -1,7 +1,7 @@
 # Architecture
 
-Corax Agent is built as a thin **lifecycle + extension** layer. The guiding
-rule: *scaffold first, real capabilities later — without restructuring.*
+Corax Agent is a **lifecycle + typed extension** layer. A common package format
+does not imply a common execution role.
 
 ## Layers
 
@@ -19,13 +19,15 @@ CoraxApp (corax/app.py)        boot / run_menu / shutdown
    ├── ui/             terminal menu, screens, banner (injectable I/O)
    │
    └── CoraxRuntime (corax/runtime.py)
-          ├── ProviderRegistry          (planner lives here)
-          ├── MemoryRegistry
-          ├── ConnectorRegistry
-          └── CapabilityRegistryAdapter
+          └── ExtensionCatalog
+                  ├── ToolRegistry
+                  ├── ChannelRegistry
+                  ├── ModelRegistry
+                  ├── MemoryRegistry
+                  └── ServiceRegistry
                   ▲
-                  ├── built-ins:  planner/ · connectors/ · memory/ · capabilities/
-                  └── loader/:    SDK capability packages (filesystem, editor, shell)
+                  ├── built-ins: planner/ · connectors/ · memory/ · capabilities/
+                  └── loader/: typed SDK extension packages
 
    CoreEngine (corax/loader/core.py)   ← agent-core execution kernel (lazy)
           Executor · Router · Policy · Session/State/Task stores · EventBus · Tracer
@@ -60,26 +62,26 @@ it changed and stops the runtime.
 
 ## Runtime & registries
 
-`CoraxRuntime` owns four registries and fills them on `start()` from the
-active config:
+`CoraxRuntime` owns an `ExtensionCatalog` and fills its role registries from
+`extensions.active`:
 
-| Config section | Registry                    | Built-in registered      |
-|----------------|-----------------------------|--------------------------|
-| `planner`      | `ProviderRegistry`          | `StubPlanner`            |
-| `memory`       | `MemoryRegistry`            | `NullMemory`             |
-| `connectors`   | `ConnectorRegistry`         | `TerminalConnector`      |
-| `capabilities` | `CapabilityRegistryAdapter` | `EchoCapability` + packages |
+| Kind | Registry | Built-in |
+| --- | --- | --- |
+| `tool` | `ToolRegistry` | `EchoCapability` |
+| `channel_connector` | `ChannelRegistry` | `TerminalConnector` |
+| `model_provider` | `ModelRegistry` | `StubPlanner` |
+| `memory_provider` | `MemoryRegistry` | `NullMemory` |
+| `runtime_service` | `ServiceRegistry` | external gateway |
 
 Mapping from a config id to a concrete class lives in the small factory
 tables at the top of `runtime.py` (`_PLANNER_FACTORIES`, …). Adding a real
 implementation = adding an entry there. The start/stop/status/reload lifecycle
 never changes.
 
-Capability **packages** (filesystem, editor, shell) are not in the factory
-table; they are loaded by `CapabilityLoader`, which reads each package's root
-`capability.json`, validates it against the core version and instantiates it
-through `agent-sdk`. That dependency is imported lazily, so the scaffold runs
-on a pure-stdlib install — packages are simply skipped with a warning.
+External packages are loaded by `ExtensionLoader`, which reads each root
+`extension.json`, validates it against Core/SDK versions, instantiates it, and
+verifies the declared kind against the Python contract. That dependency is
+imported lazily.
 
 ## Execution kernel (agent-core)
 
@@ -98,12 +100,16 @@ used and torn down inside the caller's loop:
 task = await runtime.execute("filesystem", input={"operation": "read", "path": "x"})
 ```
 
-`runtime.execute()` opens `core.session(self.capabilities)`, which registers only
-the **real** `agent_core.Capability` instances (the SDK-loaded ones; built-in
-placeholders like `echo` are skipped), starts the executor worker, runs one task
+`runtime.execute()` opens `core.session(self.tools)`, registers only
+`agent_core.ToolCapability` instances, starts the executor worker, runs one task
 through the full route → policy → execute → settle pipeline, and shuts down. When
 `agent-core` is absent, `runtime.core.available` is `False`, `RuntimeStatus`
 reports the kernel as unavailable, and `execute()` raises a clear `RuntimeError`.
+
+Models, channels, memory and services never enter that tool registry. They are
+called by `runtime.invoke_extension()` (or model streaming) through their own
+contracts and are selected through config bindings such as `primary_model` and
+`memory`.
 
 `RuntimeStatus` is a serialisable snapshot (`to_dict()` / `render()`), exposed
 both via `await runtime.status()` and the synchronous `runtime.snapshot()`

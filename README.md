@@ -1,26 +1,21 @@
 # Corax Agent
 
-A **minimal agent scaffold** — runtime, configuration, a terminal settings
-menu, registries and clean extension points. This is the *landing site* for a
-real agent: memory, connectors, capabilities and an LLM planner all plug in
-later **without changing this structure**.
-
-> This stage is intentionally inert. The planner, memory and connectors are
-> built-in placeholders; the only real tools are the workspace-confined
-> filesystem, editor and shell capability packages. No LLM, Telegram or MCP yet
-> — those arrive through the registries.
+A typed agent runtime with configuration, lifecycle, a terminal settings menu,
+an execution kernel and role-specific extension registries. Tools, channels,
+models, memory and runtime services share one package format without sharing
+one execution contract.
 
 ## What it does today
 
 1. Starts and stops cleanly.
 2. Reads / writes config (`corax.yaml`, JSON fallback).
 3. Shows a terminal settings menu and persists settings.
-4. Builds a runtime from built-in components plus standalone SDK capabilities.
-5. Loads `filesystem`, `editor` and `shell` capabilities from sibling repos.
-6. Lists capabilities / connectors / memory / providers from config.
-7. When `agent-core` is installed, runs tasks through the real execution
-   kernel (`runtime.execute(...)`); otherwise degrades gracefully.
-8. Exposes clear, role-based extension points for future modules.
+4. Discovers and validates standalone `extension.json` packages.
+5. Registers each package by kind: tools, channels, models, memory or services.
+6. Exposes only tools to the planner and Agent Core execution kernel.
+7. Invokes infrastructure through its typed runtime contract.
+8. Supports the local model, Telegram channel, gateway and memory adapters
+   without placing them in the tool list.
 
 ## Requirements
 
@@ -28,9 +23,9 @@ later **without changing this structure**.
 * Optional: `pyyaml` for full YAML fidelity. Without it, the scaffold uses the
   built-in minimal YAML reader/writer (`corax/yaml_lite.py`), or a `corax.json`
   config.
-* The capability **packages** (`filesystem`, `editor`, `shell`) need
+* External extension packages need
   `agent-sdk` / `agent-core`. The scaffold itself runs without them — those
-  capabilities are simply skipped with a warning.
+  packages are simply skipped with a warning.
 
 ```bash
 pip install -e ".[yaml,dev]"
@@ -66,8 +61,8 @@ corax-agent/
 │   ├── yaml_lite.py        # minimal YAML reader/writer (PyYAML-optional)
 │   ├── health.py           # uniform Health payload
 │   ├── ui/                 # menu · terminal · screens · banner
-│   ├── registry/           # capabilities · connectors · memory · providers
-│   ├── loader/             # agent-sdk capability packages + agent-core kernel
+│   ├── registry/           # role-specific extension registries
+│   ├── loader/             # agent-sdk extension packages + agent-core kernel
 │   ├── planner/            # StubPlanner (built-in)
 │   ├── connectors/         # TerminalConnector (built-in)
 │   ├── memory/             # NullMemory (built-in)
@@ -81,19 +76,20 @@ corax-agent/
 Code is grouped **by role** — a real `OpenAIPlanner` lands in `corax/planner/`
 next to `StubPlanner`, a `TelegramConnector` in `corax/connectors/`, and so on.
 
-## Capability integration
+## Extension integration
 
-The default `corax.yaml` enables:
+The default `corax.yaml` groups packages under `extensions.active`:
 
-* `echo` — built-in, returns its input unchanged
-* `filesystem` from `../corax-filesystem-capability`
-* `editor` from `../corax-editor-capability`
-* `shell` from `../corax-shell-capability`
+- tools: `echo`, `filesystem`, `editor`, `shell`, `web.search`;
+- channels: `terminal`, `telegram.connector`;
+- models: `stub`, `llm.local`;
+- memory: `memory.none`;
+- services: `gateway`.
 
-Each package is loaded by `corax/loader/capabilities.py` from its root
-`capability.json` manifest and `main.py` entrypoint. The runtime passes the
-agent workspace to filesystem and editor so their sandbox is the same
-`workspace/` directory the agent manages.
+Each external package is loaded from its root `extension.json`. The runtime
+validates that the entrypoint implements the declared kind before adding it to
+the corresponding registry. Only tools pass through `runtime.execute(...)`;
+channels, models, memory and services use `runtime.invoke_extension(...)`.
 
 ## Tests
 
@@ -105,14 +101,13 @@ python -m unittest discover -s tests -t .
 pytest --cov=corax
 ```
 
-The capability-integration test runs only when `agent-core` / `agent-sdk` and
-the sibling capability repos are present; otherwise it is skipped.
+Integration tests exercise every sibling package when the repositories are
+present.
 
 ## What's next
 
-These slot into the existing registries with no architectural change:
-`TelegramConnector`, `OpenAIPlanner`, `SQLiteMemory`, `MCPAdapter`. See
-[docs/EXTENDING.md](docs/EXTENDING.md).
+See [docs/EXTENDING.md](docs/EXTENDING.md) for the developer contract and the
+rule for choosing an extension kind.
 
 ## Related (existing, do not modify)
 

@@ -43,8 +43,9 @@ message.
 
 ## Architecture Awareness
 
-Corax capabilities are installed as standalone packages with `capability.json`
-manifests. The runtime injects the live tool list for each request. Never
+Corax extensions are installed as standalone packages with `extension.json`
+manifests. Only tools enter the live tool list. The runtime injects that list
+for each request. Never
 hard-code tools from this prompt, and never assume a tool exists unless it is
 present in the tool list you received.
 

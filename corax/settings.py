@@ -16,7 +16,7 @@ from __future__ import annotations
 from dataclasses import fields, is_dataclass
 from typing import Any
 
-from .config import AgentConfig, ProviderSpec
+from .config import AgentConfig, ExtensionSpec, ProviderSpec
 
 # Sections whose ``active`` is a single id vs. a list of ids.
 _SCALAR_ACTIVE = {"planner", "memory"}
@@ -112,6 +112,40 @@ def _provider_catalogue(config: AgentConfig, section: str) -> dict[str, Provider
     return getattr(getattr(config, section), _PROVIDER_FIELD[section])
 
 
+def _canonical_id(section: str, provider_id: str) -> str:
+    if section == "memory" and provider_id == "none":
+        return "memory.none"
+    return provider_id
+
+
+def _kind_for_section(section: str) -> str:
+    return {
+        "planner": "model_provider",
+        "memory": "memory_provider",
+        "connectors": "channel_connector",
+        "capabilities": "tool",
+    }[section]
+
+
+def _extension_spec(
+    config: AgentConfig,
+    section: str,
+    provider_id: str,
+) -> tuple[str, ExtensionSpec]:
+    if section not in _PROVIDER_FIELD:
+        raise SettingError(f"unknown provider section '{section}'")
+    extension_id = _canonical_id(section, provider_id)
+    try:
+        spec = config.extensions.available[extension_id]
+    except KeyError:
+        raise SettingError(f"{section} has no provider '{provider_id}'") from None
+    if spec.kind != _kind_for_section(section):
+        raise SettingError(
+            f"{provider_id!r} is {spec.kind}, not {_kind_for_section(section)}"
+        )
+    return extension_id, spec
+
+
 def toggle_provider(
     config: AgentConfig, section: str, provider_id: str, enabled: bool
 ) -> AgentConfig:
@@ -120,21 +154,17 @@ def toggle_provider(
     Disabling a provider also removes it from any active/enabled list so
     the config stays internally consistent.
     """
-    catalogue = _provider_catalogue(config, section)
-    if provider_id not in catalogue:
-        raise SettingError(f"{section} has no provider '{provider_id}'")
-    catalogue[provider_id].enabled = bool(enabled)
+    extension_id, spec = _extension_spec(config, section, provider_id)
+    spec.enabled = bool(enabled)
 
     if not enabled:
-        if section in _LIST_ACTIVE:
-            attr = _LIST_ACTIVE[section]
-            active_list = getattr(getattr(config, section), attr)
-            if provider_id in active_list:
-                active_list.remove(provider_id)
-        elif section in _SCALAR_ACTIVE:
-            sect = getattr(config, section)
-            if sect.active == provider_id:
-                sect.active = "none" if section == "memory" else ""
+        active = config.extensions.active.setdefault(spec.kind, [])
+        if extension_id in active:
+            active.remove(extension_id)
+        binding = "memory" if section == "memory" else "planner"
+        if section in _SCALAR_ACTIVE and config.extensions.bindings.get(binding) == extension_id:
+            config.extensions.bindings[binding] = ""
+    config.refresh_legacy_views()
     return config
 
 
@@ -145,21 +175,23 @@ def set_active_provider(config: AgentConfig, section: str, provider_id: str) -> 
     sections (connectors/capabilities) it adds the id to the active list.
     The provider must exist and be enabled.
     """
-    catalogue = _provider_catalogue(config, section)
-    if provider_id not in catalogue:
-        raise SettingError(f"{section} has no provider '{provider_id}'")
-    if not catalogue[provider_id].enabled:
+    extension_id, spec = _extension_spec(config, section, provider_id)
+    if not spec.enabled:
         raise SettingError(f"{section} provider '{provider_id}' is disabled")
 
     if section in _SCALAR_ACTIVE:
-        getattr(config, section).active = provider_id
+        binding = "memory" if section == "memory" else "planner"
+        config.extensions.bindings[binding] = extension_id
+        active = config.extensions.active.setdefault(spec.kind, [])
+        if extension_id not in active:
+            active.append(extension_id)
     elif section in _LIST_ACTIVE:
-        attr = _LIST_ACTIVE[section]
-        active_list = getattr(getattr(config, section), attr)
-        if provider_id not in active_list:
-            active_list.append(provider_id)
+        active = config.extensions.active.setdefault(spec.kind, [])
+        if extension_id not in active:
+            active.append(extension_id)
     else:
         raise SettingError(f"section '{section}' has no active selection")
+    config.refresh_legacy_views()
     return config
 
 
@@ -167,8 +199,9 @@ def deactivate_provider(config: AgentConfig, section: str, provider_id: str) -> 
     """Remove ``provider_id`` from a list-based active selection."""
     if section not in _LIST_ACTIVE:
         raise SettingError(f"section '{section}' does not support deactivation")
-    attr = _LIST_ACTIVE[section]
-    active_list = getattr(getattr(config, section), attr)
-    if provider_id in active_list:
-        active_list.remove(provider_id)
+    extension_id, spec = _extension_spec(config, section, provider_id)
+    active = config.extensions.active.setdefault(spec.kind, [])
+    if extension_id in active:
+        active.remove(extension_id)
+    config.refresh_legacy_views()
     return config

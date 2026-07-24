@@ -1,7 +1,7 @@
 """agent-core execution-kernel seam.
 
 The mirror image of :mod:`corax.loader.capabilities`: where that loader pulls
-**capabilities** from standalone SDK packages, this one wires the **execution
+typed extensions from standalone SDK packages, this one wires the **execution
 kernel** from ``agent-core``. ``agent-core`` is imported **lazily**, so the
 scaffold (menu, config, built-ins) runs on a pure-stdlib install — the kernel
 is simply unavailable, and the runtime degrades gracefully.
@@ -9,7 +9,7 @@ is simply unavailable, and the runtime degrades gracefully.
 `CoreEngine` is the seam the runtime owns. It does two things:
 
 * *introspect* — report whether ``agent-core`` is installed and which of the
-  runtime's loaded capabilities are real ``agent_core.Capability`` instances
+  runtime's loaded tools are real ``agent_core.ToolCapability`` instances
   (the only ones the kernel can execute);
 * *run* — assemble a fresh, fully-wired kernel (registry, router, policy,
   session/state/task stores, event bus, tracer and the async ``Executor``),
@@ -35,8 +35,9 @@ class KernelInvocationError(RuntimeError):
 
 
 _DECLARATION_ATTRS = (
-    "id", "name", "description", "version", "tags", "permission_level",
-    "required_scopes", "risk_level", "side_effects", "input_schema", "output_schema",
+    "id", "name", "description", "version", "kind", "interfaces", "tags",
+    "permission_level", "required_scopes", "risk_level", "side_effects",
+    "config_schema", "secrets", "input_schema", "output_schema",
 )
 _echo_wrapper_cache: dict[int, type] = {}
 
@@ -270,8 +271,8 @@ class CoreEngine:
         return self.probe()
 
     def is_executable(self, item: Any) -> bool:
-        """True if ``item`` is a real ``agent_core.Capability`` the kernel can run."""
-        return self.probe() and isinstance(item, self._ac.Capability)
+        """True only for an LLM-callable ``agent_core.ToolCapability``."""
+        return self.probe() and isinstance(item, self._ac.ToolCapability)
 
     def executable_ids(self, capabilities: Any) -> list[str]:
         """Ids in ``capabilities`` that the kernel can actually execute."""
@@ -289,9 +290,9 @@ class CoreEngine:
     ) -> AsyncIterator[RunningCore]:
         """Build, start, yield and tear down a fresh kernel in the current loop.
 
-        Only the real ``agent_core.Capability`` instances among ``capabilities``
-        are registered; everything else (e.g. the built-in echo placeholder) is
-        skipped. A custom ``policy`` (any ``agent_core.PolicyEngine``) may be
+        Only real ``agent_core.ToolCapability`` instances among ``capabilities``
+        are registered; every runtime-only extension is skipped. A custom
+        ``policy`` (any ``agent_core.PolicyEngine``) may be
         injected; otherwise the conservative ``DefaultPolicyEngine`` is used.
         """
         if not self.probe():
@@ -322,7 +323,7 @@ class CoreEngine:
         streamers: dict[str, Any] = {}
         echo_cls = _echo_wrapper_class(ac)
         for cap_id, item in _as_pairs(capabilities):
-            if not isinstance(item, ac.Capability):
+            if not isinstance(item, ac.ToolCapability):
                 continue
             try:
                 # Register a wrapper that auto-echoes the result to session state,

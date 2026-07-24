@@ -140,6 +140,8 @@ class CoraxTelegramGateway:
         gateway_id: str = "gateway",
         llm_id: str = "llm.local",
         telegram_id: str = "telegram.connector",
+        gateway_available: bool | None = None,
+        telegram_available: bool | None = None,
         model: str | None = None,
         poll_timeout: int = 30,
         idle_sleep: float = 1.0,
@@ -200,8 +202,14 @@ class CoraxTelegramGateway:
         self._cap_to_tool: dict[str, str] = {}
         self._send_document_spec: dict[str, Any] | None = None
         capability_list = list(capabilities)
-        self._has_gateway_capability = any(cap.get("id") == gateway_id for cap in capability_list)
-        has_telegram_connector = any(cap.get("id") == telegram_id for cap in capability_list)
+        discovered_gateway = any(cap.get("id") == gateway_id for cap in capability_list)
+        discovered_telegram = any(cap.get("id") == telegram_id for cap in capability_list)
+        self._has_gateway_capability = (
+            discovered_gateway if gateway_available is None else gateway_available
+        )
+        has_telegram_connector = (
+            discovered_telegram if telegram_available is None else telegram_available
+        )
         for cap in capability_list:
             cap_id = cap.get("id")
             if not cap_id or cap_id in (gateway_id, llm_id, telegram_id):

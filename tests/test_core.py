@@ -75,9 +75,9 @@ class TestCoreEngine(unittest.TestCase):
 
     def test_executable_ids_filters_non_core(self) -> None:
         pairs = [("adder", _make_adder()), ("echo", EchoCapability())]
-        # Only the real agent_core.Capability is executable; the built-in
-        # echo placeholder is not.
-        self.assertEqual(self.engine.executable_ids(pairs), ["adder"])
+        # Both are real tool contracts; runtime infrastructure is kept in
+        # separate registries before this boundary.
+        self.assertEqual(self.engine.executable_ids(pairs), ["adder", "echo"])
 
     def test_executes_task_through_kernel(self) -> None:
         from agent_core import TaskStatus
@@ -139,7 +139,7 @@ class TestRuntimeCore(unittest.TestCase):
         snap = asyncio.run(go())
         self.assertTrue(snap.core_available)
         self.assertIn("core_available", snap.to_dict())
-        self.assertIn("core (kernel)", snap.render())
+        self.assertIn("core (tools)", snap.render())
 
 
 if __name__ == "__main__":

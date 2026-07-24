@@ -24,13 +24,21 @@ from . import yaml_lite
 
 VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 VALID_SECURITY_MODES = {"normal", "strict", "paranoid"}
+VALID_EXTENSION_KINDS = {
+    "tool",
+    "channel_connector",
+    "model_provider",
+    "memory_provider",
+    "policy_provider",
+    "runtime_service",
+    "storage_provider",
+    "observability",
+    "adapter",
+}
 REQUIRED_SECTIONS = (
     "agent",
     "runtime",
-    "planner",
-    "memory",
-    "connectors",
-    "capabilities",
+    "extensions",
     "security",
     "limits",
     "ui",
@@ -85,6 +93,56 @@ class ProviderSpec:
         if self.path:
             data["path"] = self.path
         return data
+
+
+@dataclass
+class ExtensionSpec:
+    """Configuration for one installable typed extension."""
+
+    kind: str = "tool"
+    enabled: bool = True
+    description: str = ""
+    path: str = ""
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ExtensionSpec":
+        # ``type`` is accepted for pre-0.2 configuration imports.
+        return cls(
+            kind=str(data.get("kind", data.get("type", "tool"))),
+            enabled=bool(data.get("enabled", True)),
+            description=str(data.get("description", "")),
+            path=str(data.get("path", "")),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "kind": self.kind,
+            "enabled": self.enabled,
+            "description": self.description,
+        }
+        if self.path:
+            data["path"] = self.path
+        return data
+
+    def as_legacy(self) -> ProviderSpec:
+        return ProviderSpec(
+            enabled=self.enabled,
+            type=self.kind,
+            description=self.description,
+            path=self.path,
+        )
+
+
+@dataclass
+class ExtensionsConfig:
+    """Single extension catalogue plus activation and role bindings."""
+
+    active: dict[str, list[str]] = field(default_factory=dict)
+    bindings: dict[str, str] = field(default_factory=dict)
+    available: dict[str, ExtensionSpec] = field(default_factory=dict)
+
+    def active_for(self, kind: str) -> list[str]:
+        return list(self.active.get(kind, ()))
 
 
 @dataclass
@@ -193,6 +251,7 @@ class AgentConfig:
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     connectors: ConnectorsConfig = field(default_factory=ConnectorsConfig)
     capabilities: CapabilitiesConfig = field(default_factory=CapabilitiesConfig)
+    extensions: ExtensionsConfig = field(default_factory=ExtensionsConfig)
     security: SecurityConfig = field(default_factory=SecurityConfig)
     limits: LimitsConfig = field(default_factory=LimitsConfig)
     ui: UIConfig = field(default_factory=UIConfig)
@@ -203,13 +262,50 @@ class AgentConfig:
     def to_dict(self) -> dict[str, Any]:
         return config_to_dict(self)
 
+    def refresh_legacy_views(self) -> None:
+        """Populate deprecated 0.1 config views from the canonical catalogue."""
+
+        self.planner = PlannerConfig(
+            active=self.extensions.bindings.get("planner", ""),
+            providers={
+                extension_id: spec.as_legacy()
+                for extension_id, spec in self.extensions.available.items()
+                if spec.kind == "model_provider"
+            },
+        )
+        memory_active = self.extensions.bindings.get("memory", "")
+        self.memory = MemoryConfig(
+            active=memory_active,
+            providers={
+                extension_id: spec.as_legacy()
+                for extension_id, spec in self.extensions.available.items()
+                if spec.kind == "memory_provider"
+            },
+        )
+        self.connectors = ConnectorsConfig(
+            active=self.extensions.active_for("channel_connector"),
+            providers={
+                extension_id: spec.as_legacy()
+                for extension_id, spec in self.extensions.available.items()
+                if spec.kind == "channel_connector"
+            },
+        )
+        self.capabilities = CapabilitiesConfig(
+            enabled=self.extensions.active_for("tool"),
+            available={
+                extension_id: spec.as_legacy()
+                for extension_id, spec in self.extensions.available.items()
+                if spec.kind == "tool"
+            },
+        )
+
 
 # --------------------------------------------------------------------------- #
 # Defaults
 # --------------------------------------------------------------------------- #
 def default_config() -> AgentConfig:
     """Return the in-memory default configuration (matches agent.yaml)."""
-    return AgentConfig(
+    config = AgentConfig(
         agent=AgentMeta(name="corax", profile="default", mode="local", first_run=True),
         runtime=RuntimeConfig(
             autostart=False,
@@ -305,6 +401,94 @@ def default_config() -> AgentConfig:
                 ),
             },
         ),
+        extensions=ExtensionsConfig(
+            active={
+                "tool": [
+                    "echo",
+                    "filesystem",
+                    "editor",
+                    "shell",
+                    "web.search",
+                ],
+                "channel_connector": [
+                    "terminal",
+                    "telegram.connector",
+                ],
+                "model_provider": ["stub", "llm.local"],
+                "memory_provider": ["memory.none"],
+                "runtime_service": ["gateway"],
+            },
+            bindings={
+                "planner": "stub",
+                "primary_model": "llm.local",
+                "memory": "memory.none",
+            },
+            available={
+                "stub": ExtensionSpec(
+                    kind="model_provider",
+                    description="Built-in deterministic planner",
+                ),
+                "memory.none": ExtensionSpec(
+                    kind="memory_provider",
+                    description="Built-in no-op memory provider",
+                ),
+                "memory.uam": ExtensionSpec(
+                    kind="memory_provider",
+                    enabled=False,
+                    description="Universal Agent Memory provider",
+                    path="../universal-agent-memory/agent-integrations/corax",
+                ),
+                "memory.mnemonic-vault": ExtensionSpec(
+                    kind="memory_provider",
+                    enabled=False,
+                    description="Mnemonic Vault file-first memory provider",
+                    path="../mnemonic-vault/integrations/corax",
+                ),
+                "terminal": ExtensionSpec(
+                    kind="channel_connector",
+                    description="Built-in terminal connector",
+                ),
+                "echo": ExtensionSpec(
+                    kind="tool",
+                    description="Built-in echo tool",
+                ),
+                "filesystem": ExtensionSpec(
+                    kind="tool",
+                    description="Workspace-confined filesystem tool",
+                    path="../corax-filesystem-capability",
+                ),
+                "editor": ExtensionSpec(
+                    kind="tool",
+                    description="Workspace-confined editor tool",
+                    path="../corax-editor-capability",
+                ),
+                "shell": ExtensionSpec(
+                    kind="tool",
+                    description="Guarded local shell tool",
+                    path="../corax-shell-capability",
+                ),
+                "web.search": ExtensionSpec(
+                    kind="tool",
+                    description="SearXNG web search tool",
+                    path="../corax-web-search-capability",
+                ),
+                "gateway": ExtensionSpec(
+                    kind="runtime_service",
+                    description="Channel-neutral gateway/session service",
+                    path="../corax-gateway-capability",
+                ),
+                "llm.local": ExtensionSpec(
+                    kind="model_provider",
+                    description="Local OpenAI-compatible model provider",
+                    path="../corax-llm-local-connector",
+                ),
+                "telegram.connector": ExtensionSpec(
+                    kind="channel_connector",
+                    description="Telegram channel connector",
+                    path="../corax-telegram-connector",
+                ),
+            },
+        ),
         security=SecurityConfig(
             mode="normal",
             core_readonly=True,
@@ -337,6 +521,8 @@ def default_config() -> AgentConfig:
             safesearch="",
         ),
     )
+    config.refresh_legacy_views()
+    return config
 
 
 # --------------------------------------------------------------------------- #
@@ -348,6 +534,112 @@ def _providers_to_dict(providers: dict[str, ProviderSpec]) -> dict[str, Any]:
 
 def _providers_from_dict(data: dict[str, Any]) -> dict[str, ProviderSpec]:
     return {pid: ProviderSpec.from_dict(spec or {}) for pid, spec in (data or {}).items()}
+
+
+def _extensions_to_dict(config: ExtensionsConfig) -> dict[str, Any]:
+    return {
+        "active": {
+            kind: list(extension_ids)
+            for kind, extension_ids in sorted(config.active.items())
+        },
+        "bindings": dict(sorted(config.bindings.items())),
+        "available": {
+            extension_id: spec.to_dict()
+            for extension_id, spec in sorted(config.available.items())
+        },
+    }
+
+
+def _extensions_from_dict(data: dict[str, Any]) -> ExtensionsConfig:
+    return ExtensionsConfig(
+        active={
+            str(kind): list(extension_ids or [])
+            for kind, extension_ids in (data.get("active", {}) or {}).items()
+        },
+        bindings={
+            str(role): str(extension_id)
+            for role, extension_id in (data.get("bindings", {}) or {}).items()
+        },
+        available={
+            extension_id: ExtensionSpec.from_dict(spec or {})
+            for extension_id, spec in (data.get("available", {}) or {}).items()
+        },
+    )
+
+
+def _extensions_from_legacy(data: dict[str, Any]) -> ExtensionsConfig:
+    """Import a 0.1 config without preserving its incorrect role grouping."""
+
+    planner = data.get("planner", {}) or {}
+    memory = data.get("memory", {}) or {}
+    connectors = data.get("connectors", {}) or {}
+    capabilities = data.get("capabilities", {}) or {}
+    available: dict[str, ExtensionSpec] = {}
+
+    for extension_id, raw in (planner.get("providers", {}) or {}).items():
+        spec = ExtensionSpec.from_dict(raw or {})
+        spec.kind = "model_provider"
+        available[extension_id] = spec
+    for extension_id, raw in (memory.get("providers", {}) or {}).items():
+        spec = ExtensionSpec.from_dict(raw or {})
+        spec.kind = "memory_provider"
+        canonical_id = (
+            "memory.none" if extension_id == "none" else extension_id
+        )
+        available[canonical_id] = spec
+    for extension_id, raw in (connectors.get("providers", {}) or {}).items():
+        spec = ExtensionSpec.from_dict(raw or {})
+        spec.kind = "channel_connector"
+        available[extension_id] = spec
+
+    legacy_kind_map = {
+        "tool": "tool",
+        "connector": "channel_connector",
+        "memory": "memory_provider",
+        "planner": "model_provider",
+        "service": "runtime_service",
+        "adapter": "adapter",
+    }
+    for extension_id, raw in (capabilities.get("available", {}) or {}).items():
+        spec = ExtensionSpec.from_dict(raw or {})
+        spec.kind = legacy_kind_map.get(spec.kind, spec.kind)
+        # Known 0.1 packages had misleading connector/tool labels.
+        if extension_id == "llm.local":
+            spec.kind = "model_provider"
+        elif extension_id == "telegram.connector":
+            spec.kind = "channel_connector"
+        elif extension_id == "gateway":
+            spec.kind = "runtime_service"
+        available[extension_id] = spec
+
+    enabled = list(capabilities.get("enabled", []) or [])
+    active: dict[str, list[str]] = {}
+    for extension_id, spec in available.items():
+        should_activate = (
+            extension_id in enabled
+            or extension_id in (connectors.get("active", []) or [])
+            or extension_id == planner.get("active")
+            or extension_id == memory.get("active")
+            or (
+                extension_id == "memory.none"
+                and memory.get("active") == "none"
+            )
+        )
+        if should_activate and spec.enabled:
+            active.setdefault(spec.kind, []).append(extension_id)
+    return ExtensionsConfig(
+        active=active,
+        bindings={
+            "planner": str(planner.get("active", "stub")),
+            "primary_model": "llm.local",
+            "memory": (
+                "memory.none"
+                if memory.get("active", "none") == "none"
+                else str(memory.get("active"))
+            ),
+        },
+        available=available,
+    )
 
 
 def config_to_dict(config: AgentConfig) -> dict[str, Any]:
@@ -365,22 +657,7 @@ def config_to_dict(config: AgentConfig) -> dict[str, Any]:
             "data_path": config.runtime.data_path,
             "logs_path": config.runtime.logs_path,
         },
-        "planner": {
-            "active": config.planner.active,
-            "providers": _providers_to_dict(config.planner.providers),
-        },
-        "memory": {
-            "active": config.memory.active,
-            "providers": _providers_to_dict(config.memory.providers),
-        },
-        "connectors": {
-            "active": list(config.connectors.active),
-            "providers": _providers_to_dict(config.connectors.providers),
-        },
-        "capabilities": {
-            "enabled": list(config.capabilities.enabled),
-            "available": _providers_to_dict(config.capabilities.available),
-        },
+        "extensions": _extensions_to_dict(config.extensions),
         "security": {
             "mode": config.security.mode,
             "core_readonly": config.security.core_readonly,
@@ -423,10 +700,11 @@ def config_from_dict(data: dict[str, Any]) -> AgentConfig:
     data = data or {}
     agent = data.get("agent", {}) or {}
     runtime = data.get("runtime", {}) or {}
-    planner = data.get("planner", {}) or {}
-    memory = data.get("memory", {}) or {}
-    connectors = data.get("connectors", {}) or {}
-    capabilities = data.get("capabilities", {}) or {}
+    extensions = (
+        _extensions_from_dict(data.get("extensions", {}) or {})
+        if "extensions" in data
+        else _extensions_from_legacy(data)
+    )
     security = data.get("security", {}) or {}
     limits = data.get("limits", {}) or {}
     ui = data.get("ui", {}) or {}
@@ -435,7 +713,7 @@ def config_from_dict(data: dict[str, Any]) -> AgentConfig:
     websearch = data.get("websearch", {}) or {}
 
     defaults = default_config()
-    return AgentConfig(
+    config = AgentConfig(
         agent=AgentMeta(
             name=agent.get("name", defaults.agent.name),
             profile=agent.get("profile", defaults.agent.profile),
@@ -449,22 +727,7 @@ def config_from_dict(data: dict[str, Any]) -> AgentConfig:
             data_path=str(runtime.get("data_path", defaults.runtime.data_path)),
             logs_path=str(runtime.get("logs_path", defaults.runtime.logs_path)),
         ),
-        planner=PlannerConfig(
-            active=str(planner.get("active", defaults.planner.active)),
-            providers=_providers_from_dict(planner.get("providers", {})),
-        ),
-        memory=MemoryConfig(
-            active=str(memory.get("active", defaults.memory.active)),
-            providers=_providers_from_dict(memory.get("providers", {})),
-        ),
-        connectors=ConnectorsConfig(
-            active=list(connectors.get("active", []) or []),
-            providers=_providers_from_dict(connectors.get("providers", {})),
-        ),
-        capabilities=CapabilitiesConfig(
-            enabled=list(capabilities.get("enabled", []) or []),
-            available=_providers_from_dict(capabilities.get("available", {})),
-        ),
+        extensions=extensions,
         security=SecurityConfig(
             mode=str(security.get("mode", defaults.security.mode)),
             core_readonly=bool(security.get("core_readonly", defaults.security.core_readonly)),
@@ -503,6 +766,8 @@ def config_from_dict(data: dict[str, Any]) -> AgentConfig:
             safesearch=str(websearch.get("safesearch", defaults.websearch.safesearch)),
         ),
     )
+    config.refresh_legacy_views()
+    return config
 
 
 # --------------------------------------------------------------------------- #
@@ -571,31 +836,62 @@ def validate_config(config: AgentConfig) -> list[str]:
             f"(expected one of {sorted(VALID_SECURITY_MODES)})"
         )
 
-    # Active planner must exist and be enabled.
-    if config.planner.active not in config.planner.providers:
-        errors.append(f"planner.active '{config.planner.active}' has no matching provider")
-    elif not config.planner.providers[config.planner.active].enabled:
-        errors.append(f"planner.active '{config.planner.active}' is disabled")
+    for extension_id, spec in config.extensions.available.items():
+        if spec.kind not in VALID_EXTENSION_KINDS:
+            errors.append(
+                f"extensions.available.{extension_id}.kind "
+                f"{spec.kind!r} is invalid"
+            )
 
-    # Active memory must exist and be enabled.
-    if config.memory.active not in config.memory.providers:
-        errors.append(f"memory.active '{config.memory.active}' has no matching provider")
-    elif not config.memory.providers[config.memory.active].enabled:
-        errors.append(f"memory.active '{config.memory.active}' is disabled")
+    active_ids: set[str] = set()
+    for kind, extension_ids in config.extensions.active.items():
+        if kind not in VALID_EXTENSION_KINDS:
+            errors.append(f"extensions.active kind {kind!r} is invalid")
+        for extension_id in extension_ids:
+            spec = config.extensions.available.get(extension_id)
+            if spec is None:
+                errors.append(
+                    f"extensions.active.{kind} references unknown "
+                    f"{extension_id!r}"
+                )
+                continue
+            if spec.kind != kind:
+                errors.append(
+                    f"extensions.active.{kind} contains {extension_id!r}, "
+                    f"declared as {spec.kind!r}"
+                )
+            if not spec.enabled:
+                errors.append(f"active extension {extension_id!r} is disabled")
+            if extension_id in active_ids:
+                errors.append(
+                    f"extension {extension_id!r} is active in multiple roles"
+                )
+            active_ids.add(extension_id)
 
-    # Active connectors must exist.
-    for cid in config.connectors.active:
-        if cid not in config.connectors.providers:
-            errors.append(f"connectors.active '{cid}' has no matching provider")
-        elif not config.connectors.providers[cid].enabled:
-            errors.append(f"connectors.active '{cid}' is disabled")
-
-    # Enabled capabilities must exist.
-    for cap in config.capabilities.enabled:
-        if cap not in config.capabilities.available:
-            errors.append(f"capabilities.enabled '{cap}' is not available")
-        elif not config.capabilities.available[cap].enabled:
-            errors.append(f"capabilities.enabled '{cap}' is disabled")
+    binding_kinds = {
+        "planner": "model_provider",
+        "primary_model": "model_provider",
+        "memory": "memory_provider",
+    }
+    for role, extension_id in config.extensions.bindings.items():
+        spec = config.extensions.available.get(extension_id)
+        if spec is None:
+            errors.append(
+                f"extensions.bindings.{role} references unknown "
+                f"{extension_id!r}"
+            )
+            continue
+        expected_kind = binding_kinds.get(role)
+        if expected_kind is not None and spec.kind != expected_kind:
+            errors.append(
+                f"extensions.bindings.{role} requires {expected_kind}, "
+                f"got {spec.kind}"
+            )
+        if extension_id not in active_ids:
+            errors.append(
+                f"extensions.bindings.{role} references inactive "
+                f"{extension_id!r}"
+            )
 
     # Limits must be positive.
     for name in (

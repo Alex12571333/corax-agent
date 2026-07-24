@@ -1,33 +1,45 @@
-"""The ``none`` memory backend.
-
-Stores nothing and always reports empty. Useful so the memory registry is
-never empty and call sites can assume a backend exists. A SQLite / vector
-store replaces it under the same ``memory`` role.
-"""
+"""Built-in no-op memory provider."""
 
 from __future__ import annotations
 
-from typing import Any
-
-from ..health import Health
+from agent_core import (
+    HealthStatus,
+    MemoryProvider,
+    MemoryQuery,
+    MemoryRecord,
+    Result,
+)
+from agent_sdk import memory_provider
 
 MEMORY_ID = "memory.none"
 
 
-class NullMemory:
-    id = MEMORY_ID
-    kind = "memory"
+@memory_provider(
+    id=MEMORY_ID,
+    name="No Memory",
+    description="No-op memory provider.",
+    version="0.2.0",
+    entrypoint="corax.memory.none:NullMemory",
+)
+class NullMemory(MemoryProvider):
+    async def remember(self, record: MemoryRecord) -> Result:
+        return Result.ok({"stored": False}, session_id="")
 
-    def describe(self) -> str:
-        return "No-op memory — nothing is persisted, queries return empty."
+    async def recall(self, query: MemoryQuery) -> Result:
+        return Result.ok({"results": [], "query": query.text}, session_id="")
 
-    async def store(self, *args: Any, **kwargs: Any) -> bool:
-        """Pretend to store; always reports failure (no memory configured)."""
+    async def forget(self, memory_id: str, *, scope=None) -> Result:
+        return Result.ok(
+            {"forgotten": False, "memory_id": memory_id},
+            session_id="",
+        )
+
+    async def health_check(self) -> HealthStatus:
+        return HealthStatus.DEGRADED
+
+    # 0.1 compatibility.
+    async def store(self, *args, **kwargs) -> bool:
         return False
 
-    async def query(self, *args: Any, **kwargs: Any) -> list[Any]:
-        """Always return an empty result set."""
+    async def query(self, *args, **kwargs) -> list:
         return []
-
-    async def health(self) -> Health:
-        return Health(id=self.id, kind=self.kind, detail="no persistent memory")

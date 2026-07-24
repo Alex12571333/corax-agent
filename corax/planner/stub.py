@@ -1,40 +1,44 @@
-"""Built-in stub planner.
-
-Does not call an LLM. Given a goal, it returns a single, trivial echo
-task so the rest of the pipeline has something well-formed to carry. A
-real planner (e.g. an LLM-backed one) replaces it under the same
-``planner`` role — see docs/EXTENDING.md.
-"""
+"""Built-in deterministic planner provider."""
 
 from __future__ import annotations
 
-from typing import Any
+from agent_core import (
+    CapabilityRequest,
+    HealthStatus,
+    PlannerProvider,
+    Result,
+)
+from agent_sdk import model_provider
 
-from ..health import Health
-
-PLANNER_ID = "planner.stub"
+PLANNER_ID = "stub"
 
 
-class StubPlanner:
-    id = PLANNER_ID
-    kind = "planner"
+@model_provider(
+    id=PLANNER_ID,
+    name="Stub Planner",
+    description="Produce one deterministic echo task without model inference.",
+    version="0.2.0",
+    interfaces=("agent.model/v1", "agent.planner/v1"),
+    entrypoint="corax.planner.stub:StubPlanner",
+)
+class StubPlanner(PlannerProvider):
+    async def plan(self, request: CapabilityRequest | str) -> Result | dict:
+        legacy = isinstance(request, str)
+        goal = request if legacy else str(request.input.get("goal", ""))
+        tasks = [
+            {
+                "id": "task-1",
+                "capability": "echo",
+                "input": {"text": goal},
+            }
+        ]
+        if legacy:
+            return {"goal": goal, "correlation_id": None, "tasks": tasks}
+        return Result.ok(
+            {"tasks": tasks},
+            session_id=request.session_id,
+            task_id=request.task_id,
+        )
 
-    def describe(self) -> str:
-        return "Local stub planner — produces a single echo task, no LLM."
-
-    async def plan(self, goal: str, *, correlation_id: str | None = None) -> dict[str, Any]:
-        """Return a minimal, deterministic plan for ``goal``."""
-        return {
-            "goal": goal,
-            "correlation_id": correlation_id,
-            "tasks": [
-                {
-                    "id": "task-1",
-                    "capability": "echo",
-                    "input": {"text": goal},
-                }
-            ],
-        }
-
-    async def health(self) -> Health:
-        return Health(id=self.id, kind=self.kind, detail="planner stub ready")
+    async def health_check(self) -> HealthStatus:
+        return HealthStatus.HEALTHY

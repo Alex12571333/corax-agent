@@ -49,23 +49,31 @@ class TestRuntime(unittest.TestCase):
         asyncio.run(self.runtime.start())
         self.assertTrue(self.runtime.running)
         self.assertIsInstance(self.runtime.providers.get("stub"), StubPlanner)
-        self.assertIsInstance(self.runtime.memory.get("none"), NullMemory)
+        self.assertIsInstance(self.runtime.memory.get("memory.none"), NullMemory)
         self.assertIsInstance(self.runtime.connectors.get("terminal"), TerminalConnector)
         self.assertIsInstance(self.runtime.capabilities.get("echo"), EchoCapability)
         # The package capabilities load only when agent-sdk is installed AND the
         # sibling repos are present on disk.
         if HAS_AGENT_SDK:
-            for cap_id in ("filesystem", "editor", "shell", "gateway"):
+            for cap_id in ("filesystem", "editor", "shell"):
                 if CAPABILITY_ROOTS[cap_id].is_dir():
                     self.assertTrue(self.runtime.capabilities.has(cap_id))
+            if CAPABILITY_ROOTS["gateway"].is_dir():
+                self.assertTrue(self.runtime.services.has("gateway"))
+        self.assertFalse(self.runtime.capabilities.has("llm.local"))
+        self.assertFalse(self.runtime.capabilities.has("telegram.connector"))
+        self.assertFalse(self.runtime.capabilities.has("gateway"))
 
     def test_status_after_start(self) -> None:
         asyncio.run(self.runtime.start())
         status = asyncio.run(self.runtime.status())
         self.assertTrue(status.running)
         self.assertEqual(status.planner_active, "stub")
-        self.assertEqual(status.memory_active, "none")
-        self.assertEqual(status.connectors_active, ["terminal"])
+        self.assertEqual(status.memory_active, "memory.none")
+        self.assertEqual(
+            status.connectors_active,
+            ["terminal", "telegram.connector"],
+        )
         self.assertEqual(
             status.capabilities_enabled,
             [
@@ -73,13 +81,11 @@ class TestRuntime(unittest.TestCase):
                 "filesystem",
                 "editor",
                 "shell",
-                "gateway",
-                "llm.local",
-                "telegram.connector",
                 "web.search",
             ],
         )
-        self.assertEqual(status.registry_counts["providers"], 1)
+        self.assertEqual(status.registry_counts["model_provider"], 2)
+        self.assertEqual(status.active_by_kind["runtime_service"], ["gateway"])
         self.assertIn("RUNNING", status.render())
         self.assertIn("running", status.to_dict())
 
@@ -98,13 +104,15 @@ class TestRuntime(unittest.TestCase):
     def test_reload_config_keeps_running(self) -> None:
         asyncio.run(self.runtime.start())
         new_config = cfg.default_config()
-        new_config.connectors.active = []  # drop the terminal connector
+        new_config.extensions.active["channel_connector"] = []
+        new_config.refresh_legacy_views()
         asyncio.run(self.runtime.reload_config(new_config))
         self.assertTrue(self.runtime.running)
         self.assertEqual(len(self.runtime.connectors), 0)
 
     def test_unknown_provider_is_skipped(self) -> None:
-        self.config.planner.active = "openai"  # no built-in for it
+        self.config.extensions.active["model_provider"] = ["openai"]
+        self.config.extensions.bindings["planner"] = "openai"
         asyncio.run(self.runtime.start())
         self.assertFalse(self.runtime.providers.has("openai"))
         self.assertEqual(len(self.runtime.providers), 0)
@@ -211,7 +219,7 @@ class TestCapabilityIntegration(unittest.TestCase):
         workspace = Path(self.tempdir.name)
         config = cfg.default_config()
         for cap_id, path in CAPABILITY_ROOTS.items():
-            config.capabilities.available[cap_id].path = str(path)
+            config.extensions.available[cap_id].path = str(path)
         self.runtime = CoraxRuntime(
             config,
             root_path=REPO_ROOT,

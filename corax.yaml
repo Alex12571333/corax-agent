@@ -11,75 +11,90 @@ runtime:
   data_path: ./data
   logs_path: ./logs
 
-planner:
-  active: stub
-  providers:
-    stub:
-      enabled: true
-      type: planner
-      description: "Local stub planner for scaffold testing"
-
-memory:
-  active: none
-  providers:
-    none:
-      enabled: true
-      type: memory
-      description: "No persistent memory yet"
-
-connectors:
+extensions:
   active:
-    - terminal
-  providers:
-    terminal:
-      enabled: true
-      type: connector
-      description: "Terminal connector placeholder"
-
-capabilities:
-  enabled:
-    - echo
-    - filesystem
-    - editor
-    - shell
-    - llm.local
-    - telegram.connector
-    - web.search
+    tool:
+      - echo
+      - filesystem
+      - editor
+      - shell
+      - web.search
+    channel_connector:
+      - terminal
+      - telegram.connector
+    model_provider:
+      - stub
+      - llm.local
+    memory_provider:
+      - memory.none
+    runtime_service:
+      - gateway
+  bindings:
+    planner: stub
+    primary_model: llm.local
+    memory: memory.none
   available:
+    stub:
+      kind: model_provider
+      enabled: true
+      description: "Built-in deterministic planner"
+    memory.none:
+      kind: memory_provider
+      enabled: true
+      description: "Built-in no-op memory provider"
+    memory.uam:
+      kind: memory_provider
+      enabled: false
+      description: "Universal Agent Memory provider"
+      path: ../universal-agent-memory/agent-integrations/corax
+    memory.mnemonic-vault:
+      kind: memory_provider
+      enabled: false
+      description: "Mnemonic Vault file-first memory provider"
+      path: ../mnemonic-vault/integrations/corax
+    terminal:
+      kind: channel_connector
+      enabled: true
+      description: "Built-in terminal connector"
     echo:
+      kind: tool
       enabled: true
-      type: tool
-      description: "Built-in echo capability"
+      description: "Built-in echo tool"
     filesystem:
+      kind: tool
       enabled: true
-      type: tool
-      description: "Workspace-confined filesystem capability"
+      description: "Workspace-confined filesystem tool"
       path: ../corax-filesystem-capability
     editor:
+      kind: tool
       enabled: true
-      type: tool
-      description: "Workspace-confined text editor capability"
+      description: "Workspace-confined text editor tool"
       path: ../corax-editor-capability
     shell:
+      kind: tool
       enabled: true
-      type: tool
-      description: "Guarded local shell command capability"
+      description: "Guarded local shell command tool"
       path: ../corax-shell-capability
-    llm.local:
-      enabled: true
-      type: connector
-      description: "Local Spark LLM connector (text + optional image/video)"
-      path: ../corax-llm-local-connector
-    telegram.connector:
-      enabled: true
-      type: connector
-      description: "Telegram chat connector (streaming, commands, HTML formatting)"
-      path: ../corax-telegram-connector
     web.search:
+      kind: tool
       enabled: true
-      type: tool
       description: "Web search via a self-hosted SearXNG instance"
       path: ../corax-web-search-capability
+    gateway:
+      kind: runtime_service
+      enabled: true
+      description: "Channel-neutral gateway/session service"
+      path: ../corax-gateway-capability
+    llm.local:
+      kind: model_provider
+      enabled: true
+      description: "Local Spark model provider (text + optional image/video)"
+      path: ../corax-llm-local-connector
+    telegram.connector:
+      kind: channel_connector
+      enabled: true
+      description: "Telegram chat connector (streaming, commands, HTML formatting)"
+      path: ../corax-telegram-connector
 
 security:
   mode: normal

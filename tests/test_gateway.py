@@ -1105,9 +1105,8 @@ class GatewayPolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse((await policy.evaluate(None, None, ctx(PermissionLevel.BLOCKED))).allowed)
 
 
-class CoreRoundTripTests(unittest.IsolatedAsyncioTestCase):
-    """Run a capability through the real kernel under the gateway policy and read
-    its output back from core session state."""
+class HostRoleRoundTripTests(unittest.IsolatedAsyncioTestCase):
+    """Infrastructure crosses host role ports and never enters the tool kernel."""
 
     async def asyncSetUp(self) -> None:
         if not HAS_CORE:
@@ -1120,51 +1119,52 @@ class CoreRoundTripTests(unittest.IsolatedAsyncioTestCase):
         from corax.runtime import CoraxRuntime
 
         config = cfg.default_config()
-        config.capabilities.available["telegram.connector"].path = str(TELEGRAM_REPO)
-        config.capabilities.available["llm.local"].path = str(LLM_REPO)
+        config.extensions.available["telegram.connector"].path = str(TELEGRAM_REPO)
+        config.extensions.available["llm.local"].path = str(LLM_REPO)
         self.runtime = CoraxRuntime(config, root_path=REPO_ROOT)
         await self.runtime.start()
 
     async def asyncTearDown(self) -> None:
         await self.runtime.stop()
 
-    async def test_invoke_routes_through_core_and_returns_payload(self) -> None:
-        async with self.runtime.core.session(
-            self.runtime.capabilities, policy=GatewayPolicyEngine()
-        ) as kernel:
-            output = await kernel.invoke(
-                "telegram.connector",
-                {"operation": "poll", "mock": True,
-                 "mock_updates": [{"update_id": 1, "message": {"text": "/new", "chat": {"id": 7}}}]},
-                wait_timeout=10,
-            )
+    async def test_channel_invokes_through_host_port(self) -> None:
+        output = await self.runtime.invoke_extension(
+            "telegram.connector",
+            {
+                "operation": "poll",
+                "mock": True,
+                "mock_updates": [
+                    {
+                        "update_id": 1,
+                        "message": {"text": "/new", "chat": {"id": 7}},
+                    }
+                ],
+            },
+        )
         self.assertEqual(output["count"], 1)
         self.assertEqual(output["updates"][0]["command"]["command"], "new_session")
+        self.assertFalse(self.runtime.tools.has("telegram.connector"))
 
-    async def test_invoke_raises_with_reason_on_failure(self) -> None:
-        from corax.loader.core import KernelInvocationError
-
-        async with self.runtime.core.session(
-            self.runtime.capabilities, policy=GatewayPolicyEngine()
-        ) as kernel:
-            with self.assertRaises(KernelInvocationError) as ctx:
-                await kernel.invoke("telegram.connector", {"operation": "nope"}, wait_timeout=10)
+    async def test_host_port_raises_with_reason_on_failure(self) -> None:
+        with self.assertRaises(RuntimeError) as ctx:
+            await self.runtime.invoke_extension(
+                "telegram.connector",
+                {"operation": "nope"},
+            )
         self.assertIn("unsupported operation", str(ctx.exception))
 
-    async def test_stream_generate_events_routes_from_kernel_session(self) -> None:
-        async with self.runtime.core.session(
-            self.runtime.capabilities, policy=GatewayPolicyEngine()
-        ) as kernel:
-            events = [
-                event
-                async for event in kernel.stream_generate_events(
-                    "llm.local",
-                    {"prompt": "hi", "mock_response": "hello"},
-                    session_id="stream-test",
-                )
-            ]
+    async def test_stream_generate_events_routes_from_model_provider(self) -> None:
+        events = [
+            event
+            async for event in self.runtime.stream_extension(
+                "llm.local",
+                {"prompt": "hi", "mock_response": "hello"},
+                session_id="stream-test",
+            )
+        ]
         self.assertEqual(events[0], {"type": "delta", "content": "hello"})
         self.assertEqual(events[-1]["type"], "done")
+        self.assertFalse(self.runtime.tools.has("llm.local"))
 
 
 class EchoWrapperTests(unittest.IsolatedAsyncioTestCase):

@@ -7,11 +7,11 @@ the built-in :class:`~corax.connectors.terminal.TerminalConnector`.
 
 from __future__ import annotations
 
-from . import Registry
+from agent_core import ExtensionKind
+
+from .extensions import TypedExtensionRegistry
 
 
-class ConnectorRegistry(Registry):
-    kind = "connector"
-
+class ConnectorRegistry(TypedExtensionRegistry):
     def __init__(self) -> None:
-        super().__init__("ConnectorRegistry")
+        super().__init__(ExtensionKind.CHANNEL_CONNECTOR)

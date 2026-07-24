@@ -1,33 +1,45 @@
-"""Terminal connector.
-
-Represents the ``terminal`` connector slot. It performs no real chat or
-I/O yet — only health/status — so the connector registry has a concrete
-member. Telegram / HTTP connectors slot in under the same role later.
-"""
+"""Built-in terminal channel connector."""
 
 from __future__ import annotations
 
-from ..health import Health
+from agent_core import (
+    ChannelConnector,
+    ChannelMessage,
+    HealthStatus,
+    Result,
+)
+from agent_sdk import channel_connector
 
-CONNECTOR_ID = "connector.terminal"
+CONNECTOR_ID = "terminal"
 
 
-class TerminalConnector:
-    id = CONNECTOR_ID
-    kind = "connector"
-
+@channel_connector(
+    id=CONNECTOR_ID,
+    name="Terminal",
+    description="Built-in terminal channel.",
+    version="0.2.0",
+    entrypoint="corax.connectors.terminal:TerminalConnector",
+)
+class TerminalConnector(ChannelConnector):
     def __init__(self, provider_id: str = "terminal") -> None:
         self.provider_id = provider_id
 
-    def describe(self) -> str:
-        return f"Terminal connector placeholder ('{self.provider_id}') — no real I/O yet."
+    async def receive(self, *, limit: int = 1):
+        return []
 
-    async def health(self) -> Health:
-        return Health(
-            id=self.id,
-            kind=self.kind,
-            detail=f"connector '{self.provider_id}' placeholder",
+    async def send(self, message: ChannelMessage) -> Result:
+        return Result.ok(
+            {
+                "sent": False,
+                "channel": "terminal",
+                "conversation_id": message.conversation_id,
+                "text": message.text,
+            },
+            session_id="",
         )
+
+    async def health_check(self) -> HealthStatus:
+        return HealthStatus.DEGRADED
 
     async def status(self) -> dict[str, object]:
         return {"id": self.id, "provider": self.provider_id, "connected": False}

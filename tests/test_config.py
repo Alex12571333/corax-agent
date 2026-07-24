@@ -26,12 +26,13 @@ class TestDefaultConfig(unittest.TestCase):
 
     def test_default_active_references_exist(self) -> None:
         config = cfg.default_config()
-        self.assertIn(config.planner.active, config.planner.providers)
-        self.assertIn(config.memory.active, config.memory.providers)
-        for cid in config.connectors.active:
-            self.assertIn(cid, config.connectors.providers)
-        for cap in config.capabilities.enabled:
-            self.assertIn(cap, config.capabilities.available)
+        for kind, extension_ids in config.extensions.active.items():
+            for extension_id in extension_ids:
+                self.assertIn(extension_id, config.extensions.available)
+                self.assertEqual(
+                    config.extensions.available[extension_id].kind,
+                    kind,
+                )
 
 
 class TestValidation(unittest.TestCase):
@@ -46,9 +47,9 @@ class TestValidation(unittest.TestCase):
 
     def test_missing_active_planner_flagged(self) -> None:
         config = cfg.default_config()
-        config.planner.active = "ghost"
+        config.extensions.bindings["planner"] = "ghost"
         errors = cfg.validate_config(config)
-        self.assertTrue(any("planner.active" in e for e in errors))
+        self.assertTrue(any("bindings.planner" in e for e in errors))
 
     def test_non_positive_limit_flagged(self) -> None:
         config = cfg.default_config()
@@ -93,11 +94,13 @@ class TestLLMConfig(unittest.TestCase):
         self.assertEqual(config.llm.model, "google/gemma-4-12B-it")
         self.assertFalse(config.llm.enable_image)
         self.assertFalse(config.llm.enable_video)
-        # The connector is registered as an installable, enabled capability.
-        self.assertIn("llm.local", config.capabilities.enabled)
-        self.assertIn("llm.local", config.capabilities.available)
+        self.assertIn("llm.local", config.extensions.active["model_provider"])
         self.assertEqual(
-            config.capabilities.available["llm.local"].path,
+            config.extensions.available["llm.local"].kind,
+            "model_provider",
+        )
+        self.assertEqual(
+            config.extensions.available["llm.local"].path,
             "../corax-llm-local-connector",
         )
 
@@ -120,9 +123,12 @@ class TestTelegramConfig(unittest.TestCase):
         config = cfg.default_config()
         self.assertEqual(config.telegram.base_url, "https://api.telegram.org")
         self.assertEqual(config.telegram.allowed_chats, "")
-        self.assertIn("telegram.connector", config.capabilities.enabled)
+        self.assertIn(
+            "telegram.connector",
+            config.extensions.active["channel_connector"],
+        )
         self.assertEqual(
-            config.capabilities.available["telegram.connector"].path,
+            config.extensions.available["telegram.connector"].path,
             "../corax-telegram-connector",
         )
 
@@ -140,10 +146,13 @@ class TestTelegramConfig(unittest.TestCase):
 class TestGatewayConfig(unittest.TestCase):
     def test_default_gateway_section_and_registration(self) -> None:
         config = cfg.default_config()
-        self.assertIn("gateway", config.capabilities.enabled)
-        self.assertIn("gateway", config.capabilities.available)
+        self.assertIn("gateway", config.extensions.active["runtime_service"])
         self.assertEqual(
-            config.capabilities.available["gateway"].path,
+            config.extensions.available["gateway"].kind,
+            "runtime_service",
+        )
+        self.assertEqual(
+            config.extensions.available["gateway"].path,
             "../corax-gateway-capability",
         )
 
@@ -155,11 +164,10 @@ class TestWebSearchConfig(unittest.TestCase):
         self.assertEqual(config.websearch.engines, "")
         self.assertEqual(config.websearch.language, "")
         self.assertEqual(config.websearch.safesearch, "")
-        # The tool is registered as an installable, enabled capability.
-        self.assertIn("web.search", config.capabilities.enabled)
-        self.assertIn("web.search", config.capabilities.available)
+        self.assertIn("web.search", config.extensions.active["tool"])
+        self.assertEqual(config.extensions.available["web.search"].kind, "tool")
         self.assertEqual(
-            config.capabilities.available["web.search"].path,
+            config.extensions.available["web.search"].path,
             "../corax-web-search-capability",
         )
 

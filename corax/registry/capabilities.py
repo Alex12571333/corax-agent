@@ -9,11 +9,13 @@ itself. For now it behaves like a plain :class:`Registry`.
 
 from __future__ import annotations
 
-from . import Registry
+from agent_core import ExtensionKind
+
+from .extensions import TypedExtensionRegistry
 
 
-class CapabilityRegistryAdapter(Registry):
-    kind = "capability"
+class CapabilityRegistryAdapter(TypedExtensionRegistry):
+    """Compatibility name for the tool-only registry."""
 
     def __init__(self) -> None:
-        super().__init__("CapabilityRegistryAdapter")
+        super().__init__(ExtensionKind.TOOL)
