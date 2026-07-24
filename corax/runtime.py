@@ -165,6 +165,10 @@ class CoraxRuntime:
         for entry in self.extensions:
             await entry.item.start()
         self._wire_runtime_services()
+        await self._dispatch_hooks(
+            "runtime_start",
+            {"root_path": str(self.root_path), "workspace_path": str(self.workspace_path)},
+        )
         self._running = True
         self._started_at = datetime.now(timezone.utc)
         self.log.info("runtime started: %s", self.extensions.active_by_kind())
@@ -172,6 +176,7 @@ class CoraxRuntime:
     async def stop(self) -> None:
         if not self._running:
             return
+        await self._dispatch_hooks("runtime_stop", {"root_path": str(self.root_path)})
         for entry in reversed(list(self.extensions)):
             try:
                 await entry.item.stop()
@@ -301,6 +306,71 @@ class CoraxRuntime:
             return self.services.get(service_id)
         return None
 
+    def active_hooks_runtime(self) -> Any | None:
+        """Return the configured consent-gated lifecycle hook service."""
+
+        service_id = self.config.extensions.bindings.get("hooks", "")
+        if service_id and self.services.has(service_id):
+            return self.services.get(service_id)
+        return None
+
+    async def _dispatch_hooks(
+        self,
+        event: str,
+        payload: dict[str, Any],
+        *,
+        subject: str = "",
+    ) -> list[dict[str, Any]]:
+        service = self.active_hooks_runtime()
+        if service is None or not hasattr(service, "dispatch"):
+            return []
+        try:
+            result = await service.dispatch(event, payload, subject=subject)
+        except Exception as exc:  # noqa: BLE001 - hooks cannot crash the host
+            self.log.debug("hook dispatch failed: %s", exc)
+            return []
+        return result if isinstance(result, list) else []
+
+    async def augment_with_hooks(
+        self,
+        messages: tuple | list,
+        *,
+        prompt: str = "",
+        session_id: str = "",
+    ) -> list:
+        original = list(messages)
+        results = await self._dispatch_hooks(
+            "pre_model_call",
+            {
+                "session_id": session_id,
+                "prompt": prompt,
+                "messages": original,
+            },
+        )
+        contexts = [
+            str(item.get("context", "")).strip()
+            for item in results
+            if isinstance(item, dict) and str(item.get("context", "")).strip()
+        ]
+        if not contexts:
+            return original
+        context = "\n\n".join(contexts)[:32_000]
+        insert_at = len(original)
+        for index in range(len(original) - 1, -1, -1):
+            if isinstance(original[index], dict) and original[index].get("role") == "user":
+                insert_at = index
+                break
+        original.insert(
+            insert_at,
+            {
+                "role": "system",
+                "content": (
+                    "Operator-approved pre-model hook context follows:\n\n" + context
+                ),
+            },
+        )
+        return original
+
     async def augment_with_skills(
         self,
         messages: tuple | list,
@@ -421,6 +491,18 @@ class CoraxRuntime:
                     self.log.warning("MCP tool id collision: %s", proxy.id)
                     continue
                 self.tools.register(proxy.id, proxy)
+        hooks = self.active_hooks_runtime()
+        if (
+            hooks is not None
+            and hasattr(hooks, "wrap_tool")
+            and (
+                not hasattr(hooks, "has_event")
+                or hooks.has_event("pre_tool_call")
+                or hooks.has_event("post_tool_call")
+            )
+        ):
+            for entry in self.tools.list_all():
+                entry.item = hooks.wrap_tool(entry.item)
 
     async def security_control(
         self,
@@ -470,6 +552,11 @@ class CoraxRuntime:
                 prompt=prompt,
                 session_id=session_id,
             )
+            messages = await self.augment_with_hooks(
+                messages,
+                prompt=prompt,
+                session_id=session_id,
+            )
             messages = await self.compact_messages(
                 messages,
                 session_id=session_id,
@@ -494,6 +581,15 @@ class CoraxRuntime:
                 )
             else:
                 result = await item.generate(request)
+            await self._dispatch_hooks(
+                "post_model_call",
+                {
+                    "session_id": session_id,
+                    "model": request.model or "",
+                    "status": getattr(getattr(result, "status", None), "value", ""),
+                    "output": getattr(result, "payload", None),
+                },
+            )
         elif kind is ExtensionKind.MEMORY_PROVIDER:
             if operation == "remember":
                 result = await item.remember(
@@ -590,6 +686,11 @@ class CoraxRuntime:
             prompt=prompt,
             session_id=session_id,
         )
+        messages = await self.augment_with_hooks(
+            messages,
+            prompt=prompt,
+            session_id=session_id,
+        )
         messages = await self.compact_messages(
             messages,
             session_id=session_id,
@@ -602,8 +703,18 @@ class CoraxRuntime:
             parameters=data,
             session_id=session_id,
         )
-        async for event in item.stream_generate_events(request):
-            yield event
+        try:
+            async for event in item.stream_generate_events(request):
+                yield event
+        finally:
+            await self._dispatch_hooks(
+                "post_model_call",
+                {
+                    "session_id": session_id,
+                    "model": request.model or "",
+                    "streamed": True,
+                },
+            )
 
     def _populate_extensions(self) -> None:
         self.extensions.clear()

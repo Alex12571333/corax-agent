@@ -41,6 +41,7 @@ CAPABILITY_ROOTS = {
     "context.manager": REPO_ROOT.parent / "corax-context-manager",
     "mcp.manager": REPO_ROOT.parent / "corax-mcp-manager",
     "skills.runtime": REPO_ROOT.parent / "corax-skills-runtime",
+    "hooks.runtime": REPO_ROOT.parent / "corax-hooks-runtime",
 }
 
 
@@ -85,6 +86,9 @@ class TestRuntime(unittest.TestCase):
             if CAPABILITY_ROOTS["skills.runtime"].is_dir():
                 self.assertTrue(self.runtime.services.has("skills.runtime"))
                 self.assertIsNotNone(self.runtime.active_skills_runtime())
+            if CAPABILITY_ROOTS["hooks.runtime"].is_dir():
+                self.assertTrue(self.runtime.services.has("hooks.runtime"))
+                self.assertIsNotNone(self.runtime.active_hooks_runtime())
         self.assertFalse(self.runtime.capabilities.has("llm.local"))
         self.assertFalse(self.runtime.capabilities.has("telegram.connector"))
         self.assertFalse(self.runtime.capabilities.has("gateway"))
@@ -118,6 +122,7 @@ class TestRuntime(unittest.TestCase):
                 "context.manager",
                 "mcp.manager",
                 "skills.runtime",
+                "hooks.runtime",
             ],
         )
         self.assertEqual(status.active_by_kind["storage_provider"], ["state.file"])

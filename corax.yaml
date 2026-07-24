@@ -35,6 +35,7 @@ extensions:
       - context.manager
       - mcp.manager
       - skills.runtime
+      - hooks.runtime
     storage_provider:
       - state.file
   bindings:
@@ -47,6 +48,7 @@ extensions:
     context: context.manager
     mcp: mcp.manager
     skills: skills.runtime
+    hooks: hooks.runtime
   available:
     stub:
       kind: model_provider
@@ -86,6 +88,11 @@ extensions:
       enabled: true
       description: "Portable progressive Agent Skills loader"
       path: ../corax-skills-runtime
+    hooks.runtime:
+      kind: runtime_service
+      enabled: true
+      description: "Consent-gated subprocess lifecycle hooks"
+      path: ../corax-hooks-runtime
     state.file:
       kind: storage_provider
       enabled: true

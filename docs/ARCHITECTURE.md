@@ -134,6 +134,10 @@ cannot bypass schema validation or the active policy.
 It reads metadata from bounded, trusted roots and injects only selected
 instructions before the shared context-compaction boundary.
 
+`hooks.runtime` dispatches model/tool lifecycle events to explicitly approved
+subprocess commands. Hook wrappers preserve each tool's original schema, scopes,
+risk and side effects; the Agent Core policy boundary remains unchanged.
+
 `RuntimeStatus` is a serialisable snapshot (`to_dict()` / `render()`), exposed
 both via `await runtime.status()` and the synchronous `runtime.snapshot()`
 (used by the blocking menu).

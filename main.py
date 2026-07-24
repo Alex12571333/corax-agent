@@ -56,6 +56,7 @@ def build_parser() -> argparse.ArgumentParser:
             "security",
             "mcp",
             "skills",
+            "hooks",
             "init",
             "menu",
         ),
@@ -142,6 +143,20 @@ async def _run(args: argparse.Namespace) -> int:
                 service_id,
                 {"operation": operation},
                 session_id="skills-control",
+            )
+            print(result)
+            return 0
+        elif command == "hooks":
+            service_id = app.config.extensions.bindings.get("hooks", "hooks.runtime")
+            if not app.runtime.services.has(service_id):
+                print("hooks.runtime is not loaded.")
+                return 1
+            requested = args.command_args[0] if args.command_args else "status"
+            operation = "reload" if requested == "reload" else "status"
+            result = await app.runtime.invoke_extension(
+                service_id,
+                {"operation": operation},
+                session_id="hooks-control",
             )
             print(result)
             return 0
