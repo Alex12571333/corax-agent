@@ -23,7 +23,12 @@ from typing import Any
 from . import yaml_lite
 
 VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
-VALID_SECURITY_MODES = {"normal", "strict", "paranoid"}
+VALID_SECURITY_MODES = {"ask", "auto", "full"}
+LEGACY_SECURITY_MODES = {
+    "normal": "ask",
+    "strict": "ask",
+    "paranoid": "ask",
+}
 VALID_EXTENSION_KINDS = {
     "tool",
     "channel_connector",
@@ -171,7 +176,7 @@ class CapabilitiesConfig:
 
 @dataclass
 class SecurityConfig:
-    mode: str = "normal"
+    mode: str = "ask"
     core_readonly: bool = True
     allow_shell: bool = False
     allow_file_write: bool = False
@@ -416,12 +421,14 @@ def default_config() -> AgentConfig:
                 ],
                 "model_provider": ["stub", "llm.local"],
                 "memory_provider": ["memory.none"],
+                "policy_provider": ["security.policy"],
                 "runtime_service": ["gateway"],
             },
             bindings={
                 "planner": "stub",
                 "primary_model": "llm.local",
                 "memory": "memory.none",
+                "policy": "security.policy",
             },
             available={
                 "stub": ExtensionSpec(
@@ -487,10 +494,15 @@ def default_config() -> AgentConfig:
                     description="Telegram channel connector",
                     path="../corax-telegram-connector",
                 ),
+                "security.policy": ExtensionSpec(
+                    kind="policy_provider",
+                    description="Three-mode authorization policy",
+                    path="../corax-security-policy",
+                ),
             },
         ),
         security=SecurityConfig(
-            mode="normal",
+            mode="ask",
             core_readonly=True,
             allow_shell=False,
             allow_file_write=False,
@@ -729,7 +741,10 @@ def config_from_dict(data: dict[str, Any]) -> AgentConfig:
         ),
         extensions=extensions,
         security=SecurityConfig(
-            mode=str(security.get("mode", defaults.security.mode)),
+            mode=LEGACY_SECURITY_MODES.get(
+                str(security.get("mode", defaults.security.mode)),
+                str(security.get("mode", defaults.security.mode)),
+            ),
             core_readonly=bool(security.get("core_readonly", defaults.security.core_readonly)),
             allow_shell=bool(security.get("allow_shell", defaults.security.allow_shell)),
             allow_file_write=bool(security.get("allow_file_write", defaults.security.allow_file_write)),
@@ -872,6 +887,7 @@ def validate_config(config: AgentConfig) -> list[str]:
         "planner": "model_provider",
         "primary_model": "model_provider",
         "memory": "memory_provider",
+        "policy": "policy_provider",
     }
     for role, extension_id in config.extensions.bindings.items():
         spec = config.extensions.available.get(extension_id)

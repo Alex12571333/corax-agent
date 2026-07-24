@@ -22,6 +22,7 @@ dependencies = [
     "corax-telegram-connector @ git+https://github.com/Alex12571333/corax-telegram-connector.git",
     "corax-web-search-capability @ git+https://github.com/Alex12571333/corax-web-search-capability.git",
     "corax-runtime-gateway @ git+https://github.com/Alex12571333/corax-gateway-capability.git",
+    "corax-security-policy @ git+https://github.com/Alex12571333/corax-security-policy.git",
 ]
 
 [project.optional-dependencies]

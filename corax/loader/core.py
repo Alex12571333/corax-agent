@@ -34,6 +34,18 @@ class KernelInvocationError(RuntimeError):
     """A capability invoked through the kernel did not complete successfully."""
 
 
+class ConfirmationRequired(KernelInvocationError):
+    """A kernel task is parked until an operator approves or denies it."""
+
+    def __init__(self, task_id: str, capability_id: str) -> None:
+        self.task_id = task_id
+        self.capability_id = capability_id
+        super().__init__(
+            f"confirmation required for {capability_id!r}; "
+            f"use /security approve {task_id} or /security deny {task_id}"
+        )
+
+
 _DECLARATION_ATTRS = (
     "id", "name", "description", "version", "kind", "interfaces", "tags",
     "permission_level", "required_scopes", "risk_level", "side_effects",
@@ -157,9 +169,14 @@ class RunningCore:
         return task.task_id
 
     async def wait(self, task_id: str, *, timeout: float = 5.0, poll: float = 0.02) -> Any:
-        """Block until ``task_id`` reaches a terminal status; return the Task."""
+        """Wait until a task settles or parks for operator confirmation."""
         TaskStatus = self._ac.TaskStatus
-        terminal = {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
+        terminal = {
+            TaskStatus.COMPLETED,
+            TaskStatus.FAILED,
+            TaskStatus.CANCELLED,
+            TaskStatus.WAITING_CONFIRMATION,
+        }
         loop = asyncio.get_event_loop()
         deadline = loop.time() + timeout
         while loop.time() < deadline:
@@ -168,6 +185,44 @@ class RunningCore:
                 return task
             await asyncio.sleep(poll)
         raise TimeoutError(f"task {task_id} did not settle within {timeout}s")
+
+    async def resolve_confirmation(
+        self,
+        task_id: str,
+        *,
+        approved: bool,
+        actor: str = "operator",
+        reason: str = "",
+        wait_timeout: float = 60.0,
+    ) -> dict[str, Any]:
+        """Resolve a parked task and, when approved, return its final payload."""
+
+        task = await self.executor.resolve_confirmation(
+            task_id,
+            approved=approved,
+            actor=actor,
+            reason=reason,
+        )
+        if not approved:
+            return {
+                "ok": True,
+                "task_id": task_id,
+                "status": task.status.value,
+                "message": f"task {task_id} denied",
+            }
+        task = await self.wait(task_id, timeout=wait_timeout)
+        state_key = task.input.get("state_key")
+        payload: Any = None
+        if isinstance(state_key, str) and state_key and self.state_manager is not None:
+            state = await self.state_manager.get_state(task.session_id)
+            payload = state.temporary_context.get(state_key)
+        return {
+            "ok": task.status is self._ac.TaskStatus.COMPLETED,
+            "task_id": task_id,
+            "status": task.status.value,
+            "result": payload,
+            "message": f"task {task_id} ended {task.status.value}",
+        }
 
     async def run_task(self, *, wait_timeout: float = 5.0, **submit_kwargs: Any) -> Any:
         """``submit_task`` + ``wait`` in one call; returns the final Task."""
@@ -211,6 +266,8 @@ class RunningCore:
             state = await self.state_manager.get_state(sid)
             echoed = state.temporary_context.get(state_key)
 
+        if task.status is self._ac.TaskStatus.WAITING_CONFIRMATION:
+            raise ConfirmationRequired(task.task_id, capability_id)
         if task.status is not self._ac.TaskStatus.COMPLETED:
             detail = ""
             if isinstance(echoed, dict) and echoed.get("_error"):

@@ -24,6 +24,7 @@ CoraxApp (corax/app.py)        boot / run_menu / shutdown
                   ├── ChannelRegistry
                   ├── ModelRegistry
                   ├── MemoryRegistry
+                  ├── PolicyRegistry
                   └── ServiceRegistry
                   ▲
                   ├── built-ins: planner/ · connectors/ · memory/ · capabilities/
@@ -71,6 +72,7 @@ it changed and stops the runtime.
 | `channel_connector` | `ChannelRegistry` | `TerminalConnector` |
 | `model_provider` | `ModelRegistry` | `StubPlanner` |
 | `memory_provider` | `MemoryRegistry` | `NullMemory` |
+| `policy_provider` | `PolicyRegistry` | external `security.policy` |
 | `runtime_service` | `ServiceRegistry` | external gateway |
 
 Mapping from a config id to a concrete class lives in the small factory
@@ -88,9 +90,10 @@ imported lazily.
 `CoreEngine` (`corax/loader/core.py`) is the second lazy seam — the mirror of
 the capability loader, but for the **execution kernel** rather than for tools.
 It imports `agent-core` lazily and, on demand, assembles a fully-wired kernel:
-`CapabilityRegistry`, `Router`, `DefaultPolicyEngine`, session/state/task stores,
-an `EventBus`, a `TraceManager` and the async `Executor` — with limits taken
-from the config's `limits` section.
+`CapabilityRegistry`, `Router`, the bound `policy_provider` (or conservative
+`DefaultPolicyEngine` fallback), session/state/task stores, an `EventBus`, a
+`TraceManager` and the async `Executor` — with limits taken from the config's
+`limits` section.
 
 The runtime owns one `CoreEngine` (`runtime.core`). It does not run a perpetual
 worker loop (the CLI has no persistent event loop); instead the kernel is built,
@@ -100,7 +103,7 @@ used and torn down inside the caller's loop:
 task = await runtime.execute("filesystem", input={"operation": "read", "path": "x"})
 ```
 
-`runtime.execute()` opens `core.session(self.tools)`, registers only
+`runtime.execute()` opens `core.session(self.tools, policy=self.active_policy())`, registers only
 `agent_core.ToolCapability` instances, starts the executor worker, runs one task
 through the full route → policy → execute → settle pipeline, and shuts down. When
 `agent-core` is absent, `runtime.core.available` is `False`, `RuntimeStatus`
@@ -122,8 +125,10 @@ Each role ships one concrete, well-formed member so the runtime, menu and
 Replacing a built-in means registering a different class under the same role —
 call sites are unaffected.
 
-## Security guard
+## Security control plane
 
-`paths.is_blocked_path()` enforces `security.blocked_paths` (notably
-`../corax-core` and `../corax-sdk`). No code in this stage writes files or runs
-shells directly; the guard is the seam future file/shell capabilities call.
+`security.policy` owns ask/auto/full authorization decisions and operator
+commands. Agent Core owns the generic policy checkpoint and one-time
+confirmation protocol. Concrete filesystem, shell, network, and connector
+packages still enforce their own technical boundaries. `BLOCKED` and
+administrator deny rules are not bypassed by full mode.

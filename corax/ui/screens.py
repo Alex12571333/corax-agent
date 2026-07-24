@@ -85,6 +85,7 @@ def security_screen(config: AgentConfig) -> list[str]:
         f"  2. core_readonly    : {sec.core_readonly}",
         f"  3. allow_shell      : {sec.allow_shell}",
         f"  4. allow_file_write : {sec.allow_file_write}",
+        "     modes: ask | auto | full (full needs command confirmation)",
         "",
         "  blocked_paths:",
     ]

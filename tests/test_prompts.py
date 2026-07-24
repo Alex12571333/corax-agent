@@ -38,6 +38,11 @@ class CliCommandTests(unittest.TestCase):
         args = build_parser().parse_args(["gateway"])
         self.assertEqual(_resolve_command(args), "gateway")
 
+    def test_security_subcommand_keeps_control_arguments(self) -> None:
+        args = build_parser().parse_args(["security", "mode", "auto"])
+        self.assertEqual(_resolve_command(args), "security")
+        self.assertEqual(args.command_args, ["mode", "auto"])
+
     def test_legacy_chat_flag_is_gateway(self) -> None:
         args = build_parser().parse_args(["--chat"])
         self.assertEqual(_resolve_command(args), "gateway")

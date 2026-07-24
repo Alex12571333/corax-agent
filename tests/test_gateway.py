@@ -68,12 +68,17 @@ class FakeBackend:
         self.gateway_calls: list[dict] = []
         self.fail_capability: str | None = None
         self.fail_operation: str | None = None
+        self.confirm_capability: str | None = None
 
     async def run_capability(self, cap_id, payload, *, session_id=None):
         op = payload.get("operation")
         self.calls.append((cap_id, op, payload))
         if cap_id == self.fail_capability or (self.fail_operation is not None and op == self.fail_operation):
             raise GatewayError("boom")
+        if cap_id == self.confirm_capability:
+            error = GatewayError("confirmation required")
+            error.task_id = "task-confirm-1"
+            raise error
         if cap_id == "gateway":
             self.gateway_calls.append(payload)
             if op == "prepare_turn":
@@ -321,6 +326,35 @@ class ToolSpecTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ChatToolLoopTests(unittest.IsolatedAsyncioTestCase):
+    async def test_confirmation_is_not_treated_as_recoverable_tool_failure(self) -> None:
+        backend = FakeBackend(
+            poll_batches=[[_text_update(5, "delete file")]],
+            llm_responses=[
+                {
+                    "tool_calls": [
+                        _tool_call(
+                            "filesystem",
+                            '{"operation": "delete", "path": "notes.txt"}',
+                        )
+                    ]
+                },
+                {"text": "Please approve the pending action."},
+            ],
+        )
+        backend.confirm_capability = "filesystem"
+        await _gateway(backend).run(max_iterations=1)
+        generate_calls = [
+            payload
+            for cap_id, operation, payload in backend.calls
+            if cap_id == "llm.local" and operation == "generate"
+        ]
+        self.assertEqual(len(generate_calls), 2)
+        tool_message = _last_tool_message(generate_calls[1]["messages"])
+        self.assertIn("/security approve task-confirm-1", tool_message["content"])
+        self.assertTrue(
+            any("Please approve" in message for message in backend.sends)
+        )
+
     async def test_plain_answer_no_tools(self) -> None:
         backend = FakeBackend(poll_batches=[[_text_update(5, "hi")]],
                               llm_responses=[{"text": "hello there"}])
@@ -971,6 +1005,29 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         backend = FakeBackend(poll_batches=[[_cmd_update(5, "status")]])
         await _gateway(backend, model="gemma-4").run(max_iterations=1)
         self.assertTrue(any("Corax status" in s and "gemma-4" in s for s in backend.sends))
+
+    async def test_security_command_uses_chat_as_actor(self) -> None:
+        backend = FakeBackend(
+            poll_batches=[[_cmd_update(5, "security", args="mode auto")]]
+        )
+        calls: list[tuple[str, str, str]] = []
+
+        async def security(command, *, actor, transport):
+            calls.append((command, actor, transport))
+            return {"ok": True, "mode": "auto", "message": "security mode: auto"}
+
+        await _gateway(backend, security_command=security).run(max_iterations=1)
+        self.assertEqual(calls, [("mode auto", "5", "telegram")])
+        self.assertIn("security mode: auto", backend.sends)
+
+    async def test_security_command_is_explicitly_unavailable_without_provider(self) -> None:
+        backend = FakeBackend(
+            poll_batches=[[_cmd_update(5, "security", args="status")]]
+        )
+        await _gateway(backend).run(max_iterations=1)
+        self.assertTrue(
+            any("unavailable" in message.lower() for message in backend.sends)
+        )
 
     async def test_bot_menu_is_synced_on_start(self) -> None:
         backend = FakeBackend(poll_batches=[[]])

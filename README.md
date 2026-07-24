@@ -11,7 +11,7 @@ one execution contract.
 2. Reads / writes config (`corax.yaml`, JSON fallback).
 3. Shows a terminal settings menu and persists settings.
 4. Discovers and validates standalone `extension.json` packages.
-5. Registers each package by kind: tools, channels, models, memory or services.
+5. Registers each package by kind: tools, channels, models, memory, policy or services.
 6. Exposes only tools to the planner and Agent Core execution kernel.
 7. Invokes infrastructure through its typed runtime contract.
 8. Supports the local model, Telegram channel, gateway and memory adapters
@@ -37,6 +37,8 @@ pip install -e ".[yaml,dev]"
 corax setup                 # first-run/settings menu
 corax gateway               # run the Telegram chat gateway
 corax status                # print runtime status and exit
+corax security status       # show ask / auto / full
+corax security mode auto    # switch permission mode
 corax init                  # create config + workspace/data/logs and exit
 corax --config ./corax.yaml setup
 ```
@@ -84,12 +86,29 @@ The default `corax.yaml` groups packages under `extensions.active`:
 - channels: `terminal`, `telegram.connector`;
 - models: `stub`, `llm.local`;
 - memory: `memory.none`;
+- policy: `security.policy`;
 - services: `gateway`.
 
 Each external package is loaded from its root `extension.json`. The runtime
 validates that the entrypoint implements the declared kind before adding it to
-the corresponding registry. Only tools pass through `runtime.execute(...)`;
-channels, models, memory and services use `runtime.invoke_extension(...)`.
+the corresponding registry. Only tools pass through `runtime.execute(...)`.
+The selected policy is injected into every Agent Core session and is never
+model-callable.
+
+Security mode can also be controlled by an authorised Telegram operator:
+
+```text
+/security status
+/security mode ask
+/security mode auto
+/security mode full
+/security approve <task-id>
+/security deny <task-id>
+```
+
+Entering `full` requires repeating the command with the returned short
+challenge. Configure remote administrators with
+`CORAX_SECURITY_ADMIN_IDS=12345,67890`.
 
 ## Tests
 

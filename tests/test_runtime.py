@@ -34,6 +34,7 @@ CAPABILITY_ROOTS = {
     "editor": REPO_ROOT.parent / "corax-editor-capability",
     "shell": REPO_ROOT.parent / "corax-shell-capability",
     "gateway": REPO_ROOT.parent / "corax-gateway-capability",
+    "security.policy": REPO_ROOT.parent / "corax-security-policy",
 }
 
 
@@ -60,6 +61,8 @@ class TestRuntime(unittest.TestCase):
                     self.assertTrue(self.runtime.capabilities.has(cap_id))
             if CAPABILITY_ROOTS["gateway"].is_dir():
                 self.assertTrue(self.runtime.services.has("gateway"))
+            if CAPABILITY_ROOTS["security.policy"].is_dir():
+                self.assertTrue(self.runtime.policies.has("security.policy"))
         self.assertFalse(self.runtime.capabilities.has("llm.local"))
         self.assertFalse(self.runtime.capabilities.has("telegram.connector"))
         self.assertFalse(self.runtime.capabilities.has("gateway"))

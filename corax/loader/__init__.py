@@ -13,6 +13,12 @@ owner.
 from __future__ import annotations
 
 from .capabilities import CapabilityLoader, ExtensionLoader
-from .core import CoreEngine, RunningCore
+from .core import ConfirmationRequired, CoreEngine, RunningCore
 
-__all__ = ["CapabilityLoader", "ExtensionLoader", "CoreEngine", "RunningCore"]
+__all__ = [
+    "CapabilityLoader",
+    "ConfirmationRequired",
+    "ExtensionLoader",
+    "CoreEngine",
+    "RunningCore",
+]

@@ -54,6 +54,7 @@ class RuntimeStatus:
     registry_counts: dict[str, int] = field(default_factory=dict)
     core_available: bool = False
     core_tools: list[str] = field(default_factory=list)
+    security_mode: str = ""
 
     # Deprecated 0.1 status views.
     planner_active: str = ""
@@ -77,6 +78,7 @@ class RuntimeStatus:
             "registry_counts": self.registry_counts,
             "core_available": self.core_available,
             "core_tools": self.core_tools,
+            "security_mode": self.security_mode,
             "planner_active": self.planner_active,
             "memory_active": self.memory_active,
             "connectors_active": self.connectors_active,
@@ -102,6 +104,7 @@ class RuntimeStatus:
                     if self.core_available
                     else "unavailable (agent-core not installed)"
                 ),
+                f"  security       : {self.security_mode or 'default core policy'}",
             ]
         )
         return "\n".join(rows)
@@ -133,6 +136,7 @@ class CoraxRuntime:
         self.channels = self.extensions.registry(ExtensionKind.CHANNEL_CONNECTOR)
         self.models = self.extensions.registry(ExtensionKind.MODEL_PROVIDER)
         self.memories = self.extensions.registry(ExtensionKind.MEMORY_PROVIDER)
+        self.policies = self.extensions.registry(ExtensionKind.POLICY_PROVIDER)
         self.services = self.extensions.registry(ExtensionKind.RUNTIME_SERVICE)
 
         # 0.1 aliases. Crucially, ``capabilities`` aliases tools only.
@@ -209,6 +213,7 @@ class CoraxRuntime:
             },
             core_available=self.core.available,
             core_tools=self.core.executable_ids(self.tools),
+            security_mode=self.security_mode(),
             planner_active=bindings.get("planner", ""),
             memory_active=bindings.get("memory", ""),
             connectors_active=active.get("channel_connector", []),
@@ -228,13 +233,47 @@ class CoraxRuntime:
         timeout: float = 5.0,
     ) -> Any:
         """Compatibility name for executing one LLM-callable tool."""
-        async with self.core.session(self.tools) as kernel:
+        async with self.core.session(self.tools, policy=self.active_policy()) as kernel:
             return await kernel.run_task(
                 required_capability=required_capability,
                 input=input,
                 task_type=task_type,
                 wait_timeout=timeout,
             )
+
+    def active_policy(self) -> Any | None:
+        """Return the host-selected policy provider, if it loaded."""
+
+        policy_id = self.config.extensions.bindings.get("policy", "")
+        if policy_id and self.policies.has(policy_id):
+            return self.policies.get(policy_id)
+        return None
+
+    def security_mode(self) -> str:
+        policy = self.active_policy()
+        mode = getattr(policy, "mode", None)
+        return getattr(mode, "value", str(mode or ""))
+
+    async def security_control(
+        self,
+        command: str | list[str],
+        *,
+        actor: str = "local",
+        transport: str = "local",
+    ) -> dict[str, Any]:
+        """Dispatch a host-only security command to the selected provider."""
+
+        policy = self.active_policy()
+        if policy is None or not hasattr(policy, "control"):
+            return {
+                "ok": False,
+                "message": "no active security policy provider",
+                "mode": "",
+            }
+        result = await policy.control(command, actor=actor, transport=transport)
+        if not isinstance(result, dict):
+            raise TypeError("security policy control must return a dict")
+        return result
 
     async def invoke_extension(
         self,
@@ -398,6 +437,7 @@ class CoraxRuntime:
         self._apply_telegram_environment()
         self._apply_websearch_environment()
         self._apply_gateway_environment()
+        self._apply_security_environment()
 
     def _apply_llm_environment(self) -> None:
         llm = self.config.llm
@@ -428,4 +468,15 @@ class CoraxRuntime:
         os.environ.setdefault(
             "CORAX_GATEWAY_STATE_PATH",
             str(self.data_path / "gateway-state.json"),
+        )
+
+    def _apply_security_environment(self) -> None:
+        os.environ.setdefault("CORAX_SECURITY_MODE", self.config.security.mode)
+        os.environ.setdefault(
+            "CORAX_SECURITY_STATE_PATH",
+            str(self.data_path / "security-policy.json"),
+        )
+        os.environ.setdefault(
+            "CORAX_SECURITY_AUDIT_PATH",
+            str(self.data_path / "security-policy.audit.jsonl"),
         )

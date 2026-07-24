@@ -43,6 +43,7 @@ RunCapability = Callable[..., Awaitable[dict]]
 StreamCapability = Callable[..., AsyncIterator[dict]]
 ToolSelector = Callable[[str, list[dict]], Iterable[str]]
 ToolRouter = Callable[[str, list[dict]], Awaitable[Iterable[str]]]
+SecurityCommand = Callable[..., Awaitable[dict]]
 
 _SAFE_TOOL_NAME = re.compile(r"[^a-zA-Z0-9_-]")
 _MEDIA_LINE = re.compile(r"^\s*MEDIA:\s*(?P<path>\S.*?)\s*$")
@@ -161,6 +162,7 @@ class CoraxTelegramGateway:
         max_recent_files: int = 10,
         tool_selector: ToolSelector | None = None,
         tool_router: "ToolRouter | None" = None,
+        security_command: SecurityCommand | None = None,
         max_active_tools: int = 8,
         log: logging.Logger | None = None,
         new_session: Callable[[], str] | None = None,
@@ -190,6 +192,7 @@ class CoraxTelegramGateway:
         self.max_recent_files = max(0, max_recent_files)
         self.tool_selector = tool_selector
         self.tool_router = tool_router
+        self._security_command = security_command
         self.max_active_tools = max(1, max_active_tools)
         self.log = log or logging.getLogger("corax.gateway")
         self._new_session = new_session or (lambda: f"chat-{uuid.uuid4().hex[:8]}")
@@ -354,6 +357,28 @@ class CoraxTelegramGateway:
                 await self._send(chat_id, f"Current model: {self.model or 'default'}")
         elif name == "status":
             await self._send(chat_id, self._status_text(chat_id))
+        elif name == "security":
+            if self._security_command is None:
+                await self._send(chat_id, "Security policy control is unavailable.")
+            else:
+                try:
+                    result = await self._security_command(
+                        command.get("args") or "status",
+                        actor=str(chat_id),
+                        transport="telegram",
+                    )
+                except Exception as exc:  # noqa: BLE001 - command loop must survive
+                    await self._send(chat_id, f"Security command failed: {exc}")
+                else:
+                    message = str(result.get("message") or result)
+                    if result.get("result") is not None:
+                        rendered = json.dumps(
+                            result["result"],
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        )
+                        message = f"{message}\nresult: {rendered}"
+                    await self._send(chat_id, message)
         elif name == "help":
             await self._send(chat_id, command.get("reply") or "Send a message to chat.")
         elif name == "cancel":
@@ -713,12 +738,37 @@ class CoraxTelegramGateway:
                 result = await self._run(cap_id, args)
             except Exception as exc:  # noqa: BLE001 - a failed tool feeds the error back
                 result = {"error": str(exc)}
+                task_id = getattr(exc, "task_id", None)
+                if isinstance(task_id, str) and task_id:
+                    result.update(
+                        {
+                            "confirmation_required": True,
+                            "task_id": task_id,
+                            "approve_command": f"/security approve {task_id}",
+                            "deny_command": f"/security deny {task_id}",
+                        }
+                    )
                 artifact_path = None
             else:
                 await self._record_artifact(session_id, cap_id, args, result)
                 artifact_path = self._artifact_path_from_tool(cap_id, args, result)
             document_sent = False
-            recovery_plan = await self._plan_tool_recovery(session_id, cap_id, args, result)
+            if result.get("confirmation_required") is True:
+                # A parked action is not a failed tool and must not trigger the
+                # automatic "try another tool" recovery path, which could
+                # encourage bypassing an explicit operator checkpoint.
+                recovery_plan = {
+                    "tool_failed": False,
+                    "tool_result": result,
+                    "recovery_prompt": "",
+                }
+            else:
+                recovery_plan = await self._plan_tool_recovery(
+                    session_id,
+                    cap_id,
+                    args,
+                    result,
+                )
             tool_failed = bool(recovery_plan.get("tool_failed"))
             if tool_failed:
                 self.log.warning(

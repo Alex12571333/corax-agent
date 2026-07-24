@@ -5,6 +5,8 @@ Usage:
     corax setup                    # open the first-run/settings menu
     corax gateway                  # run the Telegram gateway
     corax status                   # print runtime status and exit
+    corax security status          # show the active permission mode
+    corax security mode auto       # switch ask / auto / full
     corax init                     # create config + workspace/data/logs and exit
     corax --config PATH setup      # use an explicit config file
 """
@@ -42,8 +44,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=("setup", "gateway", "status", "init", "menu"),
+        choices=("setup", "gateway", "status", "security", "init", "menu"),
         help="command to run (default: setup)",
+    )
+    parser.add_argument(
+        "command_args",
+        nargs="*",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument("--menu", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--status", action="store_true", help=argparse.SUPPRESS)
@@ -73,6 +80,11 @@ async def _run(args: argparse.Namespace) -> int:
             print("\nCorax runtime status\n")
             print(status.render())
             print()
+        elif command == "security":
+            security_command = " ".join(args.command_args) or "status"
+            result = await app.runtime.security_control(security_command)
+            print(result.get("message") or result)
+            return 0 if result.get("ok") or result.get("challenge") else 2
         elif command == "gateway":
             return await _run_chat(app, config_path)
         else:
@@ -189,7 +201,6 @@ async def _run_chat(app: "CoraxApp", config_path: Path) -> int:
         return 1
 
     from corax.gateway import CoraxTelegramGateway
-    from corax.gateway.policy import GatewayPolicyEngine
     from corax.tool_discovery import RuntimeToolSelector
 
     specs = _tool_capability_specs(runtime)
@@ -216,7 +227,10 @@ async def _run_chat(app: "CoraxApp", config_path: Path) -> int:
     )
 
     while True:
-        async with runtime.core.session(runtime.tools, policy=GatewayPolicyEngine()) as kernel:
+        async with runtime.core.session(
+            runtime.tools,
+            policy=runtime.active_policy(),
+        ) as kernel:
             async def invoke_component(
                 extension_id: str,
                 payload: dict | None = None,
@@ -235,6 +249,41 @@ async def _run_chat(app: "CoraxApp", config_path: Path) -> int:
                     session_id=session_id,
                 )
 
+            async def control_security(
+                command: str,
+                *,
+                actor: str,
+                transport: str,
+            ) -> dict:
+                parts = command.split()
+                action = parts[0].lower() if parts else "status"
+                if action in {"approve", "deny"}:
+                    authorization = await runtime.security_control(
+                        "status",
+                        actor=actor,
+                        transport=transport,
+                    )
+                    if not authorization.get("ok"):
+                        return authorization
+                    if len(parts) != 2:
+                        return {
+                            "ok": False,
+                            "message": (
+                                f"usage: /security {action} <task-id>"
+                            ),
+                            "mode": runtime.security_mode(),
+                        }
+                    return await kernel.resolve_confirmation(
+                        parts[1],
+                        approved=action == "approve",
+                        actor=actor,
+                    )
+                return await runtime.security_control(
+                    command,
+                    actor=actor,
+                    transport=transport,
+                )
+
             gateway_kwargs = {
                 "run_capability": invoke_component,
                 "stream_capability": runtime.stream_extension,
@@ -246,6 +295,7 @@ async def _run_chat(app: "CoraxApp", config_path: Path) -> int:
                 "state_path": runtime.data_path / "telegram-gateway-fallback-state.json",
                 "profile_path": runtime.data_path / "profile.md",
                 "stream_transport": stream_transport,
+                "security_command": control_security,
             }
             gateway_kwargs.update(
                 _build_tool_routing(

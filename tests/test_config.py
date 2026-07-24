@@ -34,6 +34,22 @@ class TestDefaultConfig(unittest.TestCase):
                     kind,
                 )
 
+    def test_default_security_policy_is_bound_and_runtime_only(self) -> None:
+        config = cfg.default_config()
+        self.assertEqual(config.security.mode, "ask")
+        self.assertEqual(
+            config.extensions.bindings["policy"],
+            "security.policy",
+        )
+        self.assertIn(
+            "security.policy",
+            config.extensions.active["policy_provider"],
+        )
+        self.assertEqual(
+            config.extensions.available["security.policy"].kind,
+            "policy_provider",
+        )
+
 
 class TestValidation(unittest.TestCase):
     def test_default_config_is_valid(self) -> None:
@@ -85,6 +101,11 @@ class TestRoundTrip(unittest.TestCase):
             loaded = cfg.load_config(path)
             self.assertIn("../corax-core", loaded.security.blocked_paths)
             self.assertIn("../corax-sdk", loaded.security.blocked_paths)
+
+    def test_legacy_security_modes_migrate_to_ask(self) -> None:
+        data = cfg.default_config().to_dict()
+        data["security"]["mode"] = "normal"
+        self.assertEqual(cfg.config_from_dict(data).security.mode, "ask")
 
 
 class TestLLMConfig(unittest.TestCase):

@@ -33,7 +33,8 @@ my-extension/
 ```
 
 Use the matching SDK decorator (`@tool`, `@channel_connector`,
-`@model_provider`, `@memory_provider`, `@runtime_service` or `@adapter`) and
+`@model_provider`, `@memory_provider`, `@policy_provider`, `@runtime_service`
+or `@adapter`) and
 the matching Agent Core base class. The manifest and class must agree on:
 
 - stable `id`, `kind`, `interfaces` and entrypoint;
@@ -54,11 +55,13 @@ extensions:
     channel_connector: [terminal, telegram.connector]
     model_provider: [stub, llm.local]
     memory_provider: [memory.none]
+    policy_provider: [security.policy]
     runtime_service: [gateway]
   bindings:
     primary_model: llm.local
     planner: stub
     memory: memory.none
+    policy: security.policy
   available:
     web.search:
       kind: tool

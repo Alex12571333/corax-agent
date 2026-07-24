@@ -27,12 +27,15 @@ extensions:
       - llm.local
     memory_provider:
       - memory.none
+    policy_provider:
+      - security.policy
     runtime_service:
       - gateway
   bindings:
     planner: stub
     primary_model: llm.local
     memory: memory.none
+    policy: security.policy
   available:
     stub:
       kind: model_provider
@@ -95,9 +98,16 @@ extensions:
       enabled: true
       description: "Telegram chat connector (streaming, commands, HTML formatting)"
       path: ../corax-telegram-connector
+    security.policy:
+      kind: policy_provider
+      enabled: true
+      description: "Three-mode authorization policy"
+      path: ../corax-security-policy
 
 security:
-  mode: normal
+  # ask = prompt for guarded work; auto = risk reviewer; full = policy-layer
+  # full access (hard denials and tool/OS boundaries remain).
+  mode: ask
   core_readonly: true
   allow_shell: false
   allow_file_write: false
