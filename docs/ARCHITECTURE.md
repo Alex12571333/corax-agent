@@ -126,6 +126,10 @@ for bounded restart-safe checkpoints; it is runtime-only and never model-callabl
 Telegram, streaming and non-streaming requests share one deterministic context
 budget without adding another model call.
 
+`mcp.manager` uses the official MCP client SDK and registers discovered remote
+tools only after connection. Those proxies still execute through Agent Core and
+cannot bypass schema validation or the active policy.
+
 `RuntimeStatus` is a serialisable snapshot (`to_dict()` / `render()`), exposed
 both via `await runtime.status()` and the synchronous `runtime.snapshot()`
 (used by the blocking menu).

@@ -285,6 +285,14 @@ class CoraxRuntime:
             return self.services.get(service_id)
         return None
 
+    def active_mcp_manager(self) -> Any | None:
+        """Return the configured MCP connection manager."""
+
+        service_id = self.config.extensions.bindings.get("mcp", "")
+        if service_id and self.services.has(service_id):
+            return self.services.get(service_id)
+        return None
+
     async def compact_messages(
         self,
         messages: tuple | list,
@@ -371,6 +379,13 @@ class CoraxRuntime:
         loop = self.active_memory_loop()
         if loop is not None and hasattr(loop, "bind"):
             loop.bind(self.active_memory())
+        manager = self.active_mcp_manager()
+        if manager is not None and hasattr(manager, "tool_proxies"):
+            for proxy in manager.tool_proxies():
+                if self.extensions.has(proxy.id):
+                    self.log.warning("MCP tool id collision: %s", proxy.id)
+                    continue
+                self.tools.register(proxy.id, proxy)
 
     async def security_control(
         self,

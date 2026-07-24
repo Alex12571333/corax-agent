@@ -39,6 +39,7 @@ CAPABILITY_ROOTS = {
     "console.connector": REPO_ROOT.parent / "corax-console",
     "state.file": REPO_ROOT.parent / "corax-state-store",
     "context.manager": REPO_ROOT.parent / "corax-context-manager",
+    "mcp.manager": REPO_ROOT.parent / "corax-mcp-manager",
 }
 
 
@@ -77,6 +78,9 @@ class TestRuntime(unittest.TestCase):
             if CAPABILITY_ROOTS["context.manager"].is_dir():
                 self.assertTrue(self.runtime.services.has("context.manager"))
                 self.assertIsNotNone(self.runtime.active_context_manager())
+            if CAPABILITY_ROOTS["mcp.manager"].is_dir():
+                self.assertTrue(self.runtime.services.has("mcp.manager"))
+                self.assertIsNotNone(self.runtime.active_mcp_manager())
         self.assertFalse(self.runtime.capabilities.has("llm.local"))
         self.assertFalse(self.runtime.capabilities.has("telegram.connector"))
         self.assertFalse(self.runtime.capabilities.has("gateway"))
@@ -104,7 +108,7 @@ class TestRuntime(unittest.TestCase):
         self.assertEqual(status.registry_counts["model_provider"], 2)
         self.assertEqual(
             status.active_by_kind["runtime_service"],
-            ["gateway", "memory.loop", "context.manager"],
+            ["gateway", "memory.loop", "context.manager", "mcp.manager"],
         )
         self.assertEqual(status.active_by_kind["storage_provider"], ["state.file"])
         self.assertIn("RUNNING", status.render())

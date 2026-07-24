@@ -422,7 +422,12 @@ def default_config() -> AgentConfig:
                 "model_provider": ["stub", "llm.local"],
                 "memory_provider": ["memory.none"],
                 "policy_provider": ["security.policy"],
-                "runtime_service": ["gateway", "memory.loop", "context.manager"],
+                "runtime_service": [
+                    "gateway",
+                    "memory.loop",
+                    "context.manager",
+                    "mcp.manager",
+                ],
                 "storage_provider": ["state.file"],
             },
             bindings={
@@ -433,6 +438,7 @@ def default_config() -> AgentConfig:
                 "policy": "security.policy",
                 "state": "state.file",
                 "context": "context.manager",
+                "mcp": "mcp.manager",
             },
             available={
                 "stub": ExtensionSpec(
@@ -464,6 +470,11 @@ def default_config() -> AgentConfig:
                     kind="runtime_service",
                     description="Deterministic bounded context compaction",
                     path="../corax-context-manager",
+                ),
+                "mcp.manager": ExtensionSpec(
+                    kind="runtime_service",
+                    description="Official-SDK MCP client and tool bridge",
+                    path="../corax-mcp-manager",
                 ),
                 "terminal": ExtensionSpec(
                     kind="channel_connector",
@@ -915,6 +926,7 @@ def validate_config(config: AgentConfig) -> list[str]:
         "policy": "policy_provider",
         "state": "storage_provider",
         "context": "runtime_service",
+        "mcp": "runtime_service",
     }
     for role, extension_id in config.extensions.bindings.items():
         spec = config.extensions.available.get(extension_id)

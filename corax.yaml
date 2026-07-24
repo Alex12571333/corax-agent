@@ -33,6 +33,7 @@ extensions:
       - gateway
       - memory.loop
       - context.manager
+      - mcp.manager
     storage_provider:
       - state.file
   bindings:
@@ -43,6 +44,7 @@ extensions:
     policy: security.policy
     state: state.file
     context: context.manager
+    mcp: mcp.manager
   available:
     stub:
       kind: model_provider
@@ -72,6 +74,11 @@ extensions:
       enabled: true
       description: "Deterministic bounded context compaction"
       path: ../corax-context-manager
+    mcp.manager:
+      kind: runtime_service
+      enabled: true
+      description: "Official-SDK MCP client and tool bridge"
+      path: ../corax-mcp-manager
     state.file:
       kind: storage_provider
       enabled: true

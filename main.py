@@ -54,6 +54,7 @@ def build_parser() -> argparse.ArgumentParser:
             "gateway",
             "status",
             "security",
+            "mcp",
             "init",
             "menu",
         ),
@@ -110,6 +111,23 @@ async def _run(args: argparse.Namespace) -> int:
             result = await app.runtime.security_control(security_command)
             print(result.get("message") or result)
             return 0 if result.get("ok") or result.get("challenge") else 2
+        elif command == "mcp":
+            manager_id = app.config.extensions.bindings.get("mcp", "mcp.manager")
+            if not app.runtime.services.has(manager_id):
+                print("mcp.manager is not loaded.")
+                return 1
+            operation = (
+                "list_tools"
+                if args.command_args and args.command_args[0] == "tools"
+                else "status"
+            )
+            result = await app.runtime.invoke_extension(
+                manager_id,
+                {"operation": operation},
+                session_id="mcp-control",
+            )
+            print(result)
+            return 0
         elif command == "gateway":
             return await _run_chat(app, config_path)
         elif command == "chat":

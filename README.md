@@ -44,6 +44,8 @@ corax gateway               # run the Telegram chat gateway
 corax status                # print runtime status and exit
 corax security status       # show ask / auto / full
 corax security mode auto    # switch permission mode
+corax mcp status            # connected MCP servers and errors
+corax mcp tools             # discovered policy-gated MCP tools
 corax init                  # create config + workspace/data/logs and exit
 corax --config ./corax.yaml setup
 ```
@@ -98,7 +100,7 @@ The default `corax.yaml` groups packages under `extensions.active`:
 - models: `stub`, `llm.local`;
 - memory: `memory.none`;
 - policy: `security.policy`;
-- services: `gateway`, `memory.loop`, `context.manager`.
+- services: `gateway`, `memory.loop`, `context.manager`, `mcp.manager`.
 - storage: `state.file`.
 
 Each external package is loaded from its root `extension.json`. The runtime
@@ -115,6 +117,9 @@ The console stores its bounded session history through the host-only
 `state.file` provider and resumes it after a restart.
 Every model request also crosses `context.manager`, which preserves system
 instructions and the active turn while compacting stale history to a fixed budget.
+Configured stdio or Streamable HTTP MCP servers are connected by `mcp.manager`.
+Their tools become high-risk Corax tools and cross the normal Agent Core policy
+checkpoint.
 
 Security mode can also be controlled by an authorised Telegram operator:
 
