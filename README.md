@@ -33,6 +33,20 @@ one execution contract.
 pip install -e ".[yaml,dev]"
 ```
 
+## Reproducible installation
+
+[`corax-distribution`](https://github.com/Alex12571333/corax-distribution)
+installs the complete private composition into an isolated virtual
+environment. Its release-candidate lock uses immutable commit SHAs:
+
+```bash
+git clone https://github.com/Alex12571333/corax-distribution.git
+cd corax-distribution
+python3 -m corax_distribution --dry-run
+python3 -m corax_distribution --prefix ~/.corax
+~/.corax/bin/corax setup
+```
+
 ## Usage
 
 ```bash
@@ -53,6 +67,9 @@ corax hooks reload          # reload hook config and allowlist
 corax subagents             # delegation limits and counters
 corax sandbox               # active isolation backend and limits
 corax models                # model routes, providers and fallbacks
+corax observability         # privacy-first trace sink status
+corax eval                  # deterministic ecosystem contract checks
+corax doctor                # local composition readiness
 corax init                  # create config + workspace/data/logs and exit
 corax --config ./corax.yaml setup
 ```
