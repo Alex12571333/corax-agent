@@ -44,6 +44,8 @@ StreamCapability = Callable[..., AsyncIterator[dict]]
 ToolSelector = Callable[[str, list[dict]], Iterable[str]]
 ToolRouter = Callable[[str, list[dict]], Awaitable[Iterable[str]]]
 SecurityCommand = Callable[..., Awaitable[dict]]
+MemoryBeforeTurn = Callable[..., Awaitable[dict]]
+MemoryAfterTurn = Callable[..., Awaitable[dict]]
 
 _SAFE_TOOL_NAME = re.compile(r"[^a-zA-Z0-9_-]")
 _MEDIA_LINE = re.compile(r"^\s*MEDIA:\s*(?P<path>\S.*?)\s*$")
@@ -163,6 +165,8 @@ class CoraxTelegramGateway:
         tool_selector: ToolSelector | None = None,
         tool_router: "ToolRouter | None" = None,
         security_command: SecurityCommand | None = None,
+        memory_before_turn: MemoryBeforeTurn | None = None,
+        memory_after_turn: MemoryAfterTurn | None = None,
         max_active_tools: int = 8,
         log: logging.Logger | None = None,
         new_session: Callable[[], str] | None = None,
@@ -193,6 +197,8 @@ class CoraxTelegramGateway:
         self.tool_selector = tool_selector
         self.tool_router = tool_router
         self._security_command = security_command
+        self._memory_before_turn = memory_before_turn
+        self._memory_after_turn = memory_after_turn
         self.max_active_tools = max(1, max_active_tools)
         self.log = log or logging.getLogger("corax.gateway")
         self._new_session = new_session or (lambda: f"chat-{uuid.uuid4().hex[:8]}")
@@ -945,9 +951,10 @@ class CoraxTelegramGateway:
 
     async def _prepare_turn(self, chat_id: Any, text: str) -> dict[str, Any]:
         system_prompt = self._system_prompt_with_profile()
+        prepared: dict[str, Any] | None = None
         if self._has_gateway_capability:
             try:
-                prepared = await self._run(
+                candidate = await self._run(
                     self.gateway_id,
                     {
                         "operation": "prepare_turn",
@@ -957,24 +964,35 @@ class CoraxTelegramGateway:
                         "system_prompt": system_prompt,
                     },
                 )
-                if isinstance(prepared, dict) and prepared.get("messages"):
-                    return prepared
+                if isinstance(candidate, dict) and candidate.get("messages"):
+                    prepared = candidate
             except Exception as exc:  # noqa: BLE001 - fallback keeps chat alive
                 self.log.debug("gateway prepare_turn failed: %s", exc)
 
-        session_id = self._session_for(chat_id)
-        user_message = {"role": "user", "content": self._timestamped_user_message(text)}
-        return {
-            "session_id": session_id,
-            "allow_outbound_file": self._user_requested_media(text),
-            "user_message": user_message,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                *self._recent_files_context(session_id),
-                *self._history_for(session_id),
-                user_message,
-            ],
-        }
+        if prepared is None:
+            session_id = self._session_for(chat_id)
+            user_message = {
+                "role": "user",
+                "content": self._timestamped_user_message(text),
+            }
+            prepared = {
+                "session_id": session_id,
+                "allow_outbound_file": self._user_requested_media(text),
+                "user_message": user_message,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    *self._recent_files_context(session_id),
+                    *self._history_for(session_id),
+                    user_message,
+                ],
+            }
+        await self._inject_memory_context(
+            prepared,
+            text,
+            channel="telegram",
+            conversation_id=str(chat_id),
+        )
+        return prepared
 
     async def _record_turn(
         self,
@@ -983,8 +1001,10 @@ class CoraxTelegramGateway:
         user_message: dict[str, Any],
         assistant_text: str,
     ) -> None:
-        self._remember_profile_note(session_id, text)
+        if self._memory_after_turn is None:
+            self._remember_profile_note(session_id, text)
         self._last_assistant_by_session[session_id] = assistant_text
+        recorded_by_gateway = False
         if self._has_gateway_capability:
             try:
                 await self._run(
@@ -997,10 +1017,55 @@ class CoraxTelegramGateway:
                         "max_history_messages": self.max_history_messages,
                     },
                 )
-                return
+                recorded_by_gateway = True
             except Exception as exc:  # noqa: BLE001
                 self.log.debug("gateway record_turn failed: %s", exc)
-        self._remember_turn(session_id, user_message, assistant_text)
+        if not recorded_by_gateway:
+            self._remember_turn(session_id, user_message, assistant_text)
+        if self._memory_after_turn is not None:
+            try:
+                await self._memory_after_turn(
+                    text,
+                    assistant_text,
+                    session_id=session_id,
+                    scope={"channel": "telegram"},
+                )
+            except Exception as exc:  # noqa: BLE001 - memory is fail-soft
+                self.log.debug("memory retention failed: %s", exc)
+
+    async def _inject_memory_context(
+        self,
+        prepared: dict[str, Any],
+        text: str,
+        *,
+        channel: str,
+        conversation_id: str,
+    ) -> None:
+        if self._memory_before_turn is None:
+            return
+        session_id = str(prepared.get("session_id", ""))
+        try:
+            recalled = await self._memory_before_turn(
+                text,
+                session_id=session_id,
+                scope={
+                    "channel": channel,
+                    "conversation_id": conversation_id,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 - memory is fail-soft
+            self.log.debug("memory recall failed: %s", exc)
+            return
+        context = str((recalled or {}).get("context", "")).strip()
+        messages = prepared.get("messages")
+        if not context or not isinstance(messages, list):
+            return
+        user_index = len(messages)
+        for index in range(len(messages) - 1, -1, -1):
+            if isinstance(messages[index], dict) and messages[index].get("role") == "user":
+                user_index = index
+                break
+        messages.insert(user_index, {"role": "system", "content": context})
 
     async def _record_artifact(
         self, session_id: str, cap_id: str, args: dict[str, Any], result: dict[str, Any]

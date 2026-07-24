@@ -114,6 +114,11 @@ called by `runtime.invoke_extension()` (or model streaming) through their own
 contracts and are selected through config bindings such as `primary_model` and
 `memory`.
 
+`memory.loop` is a runtime service bound to the selected `memory_provider`.
+Conversation channels call it before and after each turn. Recall is bounded and
+injected as untrusted context; retention is conservative and excludes secrets
+and assistant-authored claims.
+
 `RuntimeStatus` is a serialisable snapshot (`to_dict()` / `render()`), exposed
 both via `await runtime.status()` and the synchronous `runtime.snapshot()`
 (used by the blocking menu).

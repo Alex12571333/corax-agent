@@ -20,7 +20,7 @@ extensions:
       - shell
       - web.search
     channel_connector:
-      - terminal
+      - console.connector
       - telegram.connector
     model_provider:
       - stub
@@ -31,10 +31,12 @@ extensions:
       - security.policy
     runtime_service:
       - gateway
+      - memory.loop
   bindings:
     planner: stub
     primary_model: llm.local
     memory: memory.none
+    memory_loop: memory.loop
     policy: security.policy
   available:
     stub:
@@ -55,10 +57,20 @@ extensions:
       enabled: false
       description: "Mnemonic Vault file-first memory provider"
       path: ../mnemonic-vault/integrations/corax
+    memory.loop:
+      kind: runtime_service
+      enabled: true
+      description: "Bounded recall and privacy-aware retention loop"
+      path: ../corax-memory-loop
     terminal:
       kind: channel_connector
       enabled: true
       description: "Built-in terminal connector"
+    console.connector:
+      kind: channel_connector
+      enabled: true
+      description: "Interactive local console channel"
+      path: ../corax-console
     echo:
       kind: tool
       enabled: true

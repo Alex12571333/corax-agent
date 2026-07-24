@@ -163,6 +163,7 @@ class CoraxRuntime:
         self._populate_extensions()
         for entry in self.extensions:
             await entry.item.start()
+        self._wire_runtime_services()
         self._running = True
         self._started_at = datetime.now(timezone.utc)
         self.log.info("runtime started: %s", self.extensions.active_by_kind())
@@ -249,10 +250,84 @@ class CoraxRuntime:
             return self.policies.get(policy_id)
         return None
 
+    def active_memory(self) -> Any | None:
+        """Return the host-selected memory provider, if it loaded."""
+
+        memory_id = self.config.extensions.bindings.get("memory", "")
+        if memory_id and self.memories.has(memory_id):
+            return self.memories.get(memory_id)
+        return None
+
+    def active_memory_loop(self) -> Any | None:
+        """Return the selected host-only memory orchestration service."""
+
+        service_id = self.config.extensions.bindings.get(
+            "memory_loop", "memory.loop"
+        )
+        if service_id and self.services.has(service_id):
+            return self.services.get(service_id)
+        return None
+
+    async def memory_before_turn(
+        self,
+        text: str,
+        *,
+        session_id: str,
+        scope: dict | None = None,
+    ) -> dict[str, Any]:
+        loop = self.active_memory_loop()
+        if loop is None:
+            return {"context": "", "records": [], "provider": ""}
+        result = await loop.handle(
+            ExtensionRequest(
+                operation="before_turn",
+                payload={"text": text, "scope": dict(scope or {})},
+                session_id=session_id,
+            )
+        )
+        if getattr(result, "is_success", False):
+            return dict(result.payload or {})
+        return {"context": "", "records": [], "provider": "", "degraded": True}
+
+    async def memory_after_turn(
+        self,
+        user_text: str,
+        assistant_text: str,
+        *,
+        session_id: str,
+        scope: dict | None = None,
+        explicit: bool | None = None,
+    ) -> dict[str, Any]:
+        loop = self.active_memory_loop()
+        if loop is None:
+            return {"stored": False, "reason": "memory loop unavailable"}
+        result = await loop.handle(
+            ExtensionRequest(
+                operation="after_turn",
+                payload={
+                    "user_text": user_text,
+                    "assistant_text": assistant_text,
+                    "scope": dict(scope or {}),
+                    "explicit": explicit,
+                },
+                session_id=session_id,
+            )
+        )
+        if getattr(result, "is_success", False):
+            return dict(result.payload or {})
+        return {"stored": False, "reason": "memory provider rejected write"}
+
     def security_mode(self) -> str:
         policy = self.active_policy()
         mode = getattr(policy, "mode", None)
         return getattr(mode, "value", str(mode or ""))
+
+    def _wire_runtime_services(self) -> None:
+        """Bind cross-role services after every extension has started."""
+
+        loop = self.active_memory_loop()
+        if loop is not None and hasattr(loop, "bind"):
+            loop.bind(self.active_memory())
 
     async def security_control(
         self,

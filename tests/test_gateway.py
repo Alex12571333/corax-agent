@@ -798,6 +798,60 @@ class ChatToolLoopTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("Алекс, русский, проект Corax", profile_text)
 
+    async def test_memory_loop_context_is_injected_before_user_message(self) -> None:
+        backend = FakeBackend(
+            poll_batches=[[_text_update(5, "как меня зовут?")]],
+            llm_responses=[{"text": "Алекс."}],
+        )
+        recalls = []
+
+        async def before(text, *, session_id, scope):
+            recalls.append((text, session_id, scope))
+            return {
+                "context": (
+                    '<memory_context trust="untrusted-data">\n'
+                    "- Меня зовут Алекс\n"
+                    "</memory_context>"
+                )
+            }
+
+        gateway = _gateway(backend, memory_before_turn=before)
+        await gateway.run(max_iterations=1)
+
+        messages = [
+            payload
+            for _cap, operation, payload in backend.calls
+            if operation == "generate"
+        ][0]["messages"]
+        memory_index = next(
+            index
+            for index, message in enumerate(messages)
+            if "memory_context" in str(message.get("content"))
+        )
+        user_index = next(
+            index
+            for index, message in enumerate(messages)
+            if message.get("role") == "user"
+        )
+        self.assertLess(memory_index, user_index)
+        self.assertEqual(recalls[0][2]["channel"], "telegram")
+
+    async def test_memory_loop_retains_after_completed_turn(self) -> None:
+        backend = FakeBackend(
+            poll_batches=[[_text_update(5, "Запомни, меня зовут Алекс")]],
+            llm_responses=[{"text": "Запомнил."}],
+        )
+        writes = []
+
+        async def after(user_text, assistant_text, *, session_id, scope):
+            writes.append((user_text, assistant_text, session_id, scope))
+            return {"stored": True}
+
+        await _gateway(backend, memory_after_turn=after).run(max_iterations=1)
+        self.assertEqual(writes[0][0], "Запомни, меня зовут Алекс")
+        self.assertEqual(writes[0][1], "Запомнил.")
+        self.assertEqual(writes[0][3]["channel"], "telegram")
+
     async def test_new_session_starts_empty_history(self) -> None:
         backend = FakeBackend(
             poll_batches=[

@@ -2,7 +2,10 @@
 """Corax Agent — CLI entrypoint.
 
 Usage:
-    corax setup                    # open the first-run/settings menu
+    corax                          # first-run setup, then console chat
+    corax chat                     # interactive console chat
+    corax setup                    # guided setup wizard
+    corax settings                 # advanced settings menu
     corax gateway                  # run the Telegram gateway
     corax status                   # print runtime status and exit
     corax security status          # show the active permission mode
@@ -44,8 +47,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=("setup", "gateway", "status", "security", "init", "menu"),
-        help="command to run (default: setup)",
+        choices=(
+            "chat",
+            "setup",
+            "settings",
+            "gateway",
+            "status",
+            "security",
+            "init",
+            "menu",
+        ),
+        help="command to run (default: interactive console chat)",
     )
     parser.add_argument(
         "command_args",
@@ -72,6 +84,19 @@ async def _run(args: argparse.Namespace) -> int:
     if command == "init":
         return _do_init(config_path)
 
+    first_run = not config_path.exists()
+    if not first_run:
+        first_run = config_mod.load_config(config_path).agent.first_run
+    if first_run or command == "setup":
+        setup_result = await _run_setup_wizard(
+            config_path,
+            first_run=first_run,
+        )
+        if setup_result != 0:
+            return setup_result
+        if command == "setup":
+            return 0
+
     app = CoraxApp(config_path)
     await app.boot()
     try:
@@ -87,6 +112,8 @@ async def _run(args: argparse.Namespace) -> int:
             return 0 if result.get("ok") or result.get("challenge") else 2
         elif command == "gateway":
             return await _run_chat(app, config_path)
+        elif command == "chat":
+            return await _run_console_chat(app)
         else:
             _print_setup_overview(app)
             await app.run_menu()
@@ -104,10 +131,108 @@ def _resolve_command(args: argparse.Namespace) -> str:
     if args.status:
         return "status"
     if args.menu:
-        return "setup"
+        return "settings"
     if args.command == "menu":
-        return "setup"
-    return args.command or "setup"
+        return "settings"
+    return args.command or "chat"
+
+
+async def _run_setup_wizard(config_path: Path, *, first_run: bool) -> int:
+    """Run the reusable guided setup before the runtime starts."""
+
+    try:
+        from corax_console import SetupWizard, probe_openai_compatible
+    except ImportError:
+        print("corax-console is not installed; cannot run guided setup.")
+        return 1
+
+    config = (
+        config_mod.load_config(config_path)
+        if config_path.exists()
+        else config_mod.default_config()
+    )
+    current = {
+        "agent_name": config.agent.name,
+        "workspace_path": config.runtime.workspace_path,
+        "llm_base_url": config.llm.base_url,
+        "llm_model": config.llm.model,
+        "memory": config.extensions.bindings.get("memory", "memory.none"),
+        "security_mode": config.security.mode,
+        "telegram_enabled": (
+            "telegram.connector"
+            in config.extensions.active.get("channel_connector", [])
+        ),
+    }
+    try:
+        result = await SetupWizard().run(
+            current,
+            first_run=first_run,
+            probe=probe_openai_compatible,
+        )
+    except EOFError:
+        print("Setup needs an interactive terminal. Run `corax setup` in a TTY.")
+        return 2
+    if not result.completed:
+        print("Setup cancelled; configuration was not changed.")
+        return 2
+
+    values = result.values
+    config.agent.name = str(values["agent_name"])
+    config.agent.first_run = False
+    config.runtime.workspace_path = str(values["workspace_path"])
+    config.llm.base_url = str(values["llm_base_url"])
+    config.llm.model = str(values["llm_model"])
+    config.security.mode = str(values["security_mode"])
+    _select_memory(config, str(values["memory"]))
+    _set_active_extension(
+        config,
+        "channel_connector",
+        "console.connector",
+        True,
+    )
+    _set_active_extension(
+        config,
+        "channel_connector",
+        "telegram.connector",
+        bool(values["telegram_enabled"]),
+    )
+    config.refresh_legacy_views()
+    errors = config_mod.validate_config(config)
+    if errors:
+        print("Configuration is invalid:")
+        for error in errors:
+            print(f"  - {error}")
+        return 1
+    config_mod.save_config(config, config_path)
+    ensure_paths(config, config_path)
+    print(f"Saved Corax configuration: {config_path}")
+    return 0
+
+
+def _select_memory(config, extension_id: str) -> None:
+    spec = config.extensions.available.get(extension_id)
+    if spec is None or spec.kind != "memory_provider":
+        raise ValueError(f"unknown memory provider: {extension_id}")
+    spec.enabled = True
+    config.extensions.active["memory_provider"] = [extension_id]
+    config.extensions.bindings["memory"] = extension_id
+
+
+def _set_active_extension(
+    config,
+    kind: str,
+    extension_id: str,
+    enabled: bool,
+) -> None:
+    spec = config.extensions.available.get(extension_id)
+    if spec is None or spec.kind != kind:
+        raise ValueError(f"unknown {kind}: {extension_id}")
+    active = config.extensions.active.setdefault(kind, [])
+    spec.enabled = enabled
+    if enabled and extension_id not in active:
+        active.append(extension_id)
+    if not enabled:
+        active[:] = [item for item in active if item != extension_id]
 
 
 def _tool_capability_specs(runtime) -> list[dict]:
@@ -126,6 +251,150 @@ def _tool_capability_specs(runtime) -> list[dict]:
             }
         )
     return specs
+
+
+async def _run_console_chat(app: "CoraxApp") -> int:
+    """Run the local interactive console over the same kernel as Telegram."""
+
+    runtime = app.runtime
+    if not runtime.core.available:
+        print("agent-core is not installed; console chat needs the execution kernel.")
+        return 1
+    if not runtime.channels.has("console.connector"):
+        print("console.connector is not loaded; run `corax setup`.")
+        return 1
+    model_id = app.config.extensions.bindings.get("primary_model", "llm.local")
+    if not runtime.models.has(model_id):
+        print(f"{model_id} model provider is not loaded; run `corax setup`.")
+        return 1
+    try:
+        from corax_console import ConsoleChat
+    except ImportError:
+        print("corax-console is not installed.")
+        return 1
+
+    connector = runtime.channels.get("console.connector")
+    specs = _tool_capability_specs(runtime)
+    system_prompt = _chat_system_prompt(runtime.root_path) or (
+        "You are Corax, a helpful local agent. Use tools when action or "
+        "verification is required. Reply in the user's language."
+    )
+
+    async with runtime.core.session(
+        runtime.tools,
+        policy=runtime.active_policy(),
+    ) as kernel:
+        async def run_model(payload, *, session_id):
+            return await runtime.invoke_extension(
+                model_id,
+                payload,
+                session_id=session_id,
+            )
+
+        async def run_tool(extension_id, payload, *, session_id):
+            return await kernel.invoke(
+                extension_id,
+                payload,
+                session_id=session_id,
+            )
+
+        async def status_control(_command: str) -> dict:
+            status = await runtime.status()
+            return {"ok": True, "message": status.render(), **status.to_dict()}
+
+        async def security_control(command: str) -> dict:
+            parts = command.split()
+            action = parts[0].lower() if parts else "status"
+            if action in {"approve", "deny"}:
+                if len(parts) != 2:
+                    return {
+                        "ok": False,
+                        "message": f"usage: /security {action} <task-id>",
+                    }
+                return await kernel.resolve_confirmation(
+                    parts[1],
+                    approved=action == "approve",
+                    actor="local-console",
+                )
+            return await runtime.security_control(
+                command,
+                actor="local-console",
+                transport="local",
+            )
+
+        async def memory_control(command: str) -> dict:
+            action, _, argument = command.partition(" ")
+            action = action.strip().lower() or "status"
+            argument = argument.strip()
+            if action == "status":
+                loop = runtime.active_memory_loop()
+                if loop is None:
+                    return {"ok": False, "message": "memory loop is unavailable"}
+                result = await runtime.invoke_extension(
+                    app.config.extensions.bindings.get(
+                        "memory_loop", "memory.loop"
+                    ),
+                    {"operation": "status"},
+                    session_id="console-control",
+                )
+                return {
+                    "ok": True,
+                    "message": (
+                        f"memory provider: {result.get('provider') or 'none'}; "
+                        f"write mode: {result.get('write_mode', 'off')}"
+                    ),
+                    **result,
+                }
+            if action == "search" and argument:
+                result = await runtime.memory_before_turn(
+                    argument,
+                    session_id="console-control",
+                    scope={"channel": "console"},
+                )
+                return {
+                    "ok": True,
+                    "message": result.get("context") or "No matching memories.",
+                    **result,
+                }
+            if action == "remember" and argument:
+                result = await runtime.memory_after_turn(
+                    argument,
+                    "",
+                    session_id="console-control",
+                    scope={"channel": "console"},
+                    explicit=True,
+                )
+                return {
+                    "ok": bool(result.get("stored", False)),
+                    "message": (
+                        "Memory stored."
+                        if result.get("stored")
+                        else str(result.get("reason", "Memory was not stored."))
+                    ),
+                    **result,
+                }
+            return {
+                "ok": False,
+                "message": (
+                    "usage: /memory status | /memory search <query> | "
+                    "/memory remember <text>"
+                ),
+            }
+
+        chat = ConsoleChat(
+            connector=connector,
+            run_model=run_model,
+            run_tool=run_tool,
+            tools=specs,
+            system_prompt=system_prompt,
+            model=app.config.llm.model,
+            status_command=status_control,
+            security_command=security_control,
+            memory_command=memory_control,
+            memory_before_turn=runtime.memory_before_turn,
+            memory_after_turn=runtime.memory_after_turn,
+        )
+        return await chat.run()
 
 
 def _resolve_tool_routing(app: "CoraxApp", selector_available: bool) -> tuple[str, str]:
@@ -296,6 +565,8 @@ async def _run_chat(app: "CoraxApp", config_path: Path) -> int:
                 "profile_path": runtime.data_path / "profile.md",
                 "stream_transport": stream_transport,
                 "security_command": control_security,
+                "memory_before_turn": runtime.memory_before_turn,
+                "memory_after_turn": runtime.memory_after_turn,
             }
             gateway_kwargs.update(
                 _build_tool_routing(
@@ -428,7 +699,7 @@ def _print_setup_overview(app: "CoraxApp") -> None:
         ("telegram", "configured" if os.getenv("CORAX_TELEGRAM_BOT_TOKEN") else "token missing"),
         ("web search", app.config.websearch.base_url),
         ("workspace", str(runtime.workspace_path)),
-        ("next", "corax gateway"),
+        ("next", "corax"),
     ]
     for label, value in rows:
         color = _YELLOW if value == "token missing" else ""

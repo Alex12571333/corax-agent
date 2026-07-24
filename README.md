@@ -14,8 +14,10 @@ one execution contract.
 5. Registers each package by kind: tools, channels, models, memory, policy or services.
 6. Exposes only tools to the planner and Agent Core execution kernel.
 7. Invokes infrastructure through its typed runtime contract.
-8. Supports the local model, Telegram channel, gateway and memory adapters
-   without placing them in the tool list.
+8. Runs bounded recall before each conversation turn and privacy-aware
+   retention after it through the selected memory provider.
+9. Supports the local model, Telegram channel, gateway and memory adapters
+   without placing infrastructure in the tool list.
 
 ## Requirements
 
@@ -34,7 +36,10 @@ pip install -e ".[yaml,dev]"
 ## Usage
 
 ```bash
-corax setup                 # first-run/settings menu
+corax                       # first-run wizard, then interactive console chat
+corax chat                  # interactive console chat
+corax setup                 # guided setup wizard
+corax settings              # advanced settings menu
 corax gateway               # run the Telegram chat gateway
 corax status                # print runtime status and exit
 corax security status       # show ask / auto / full
@@ -46,6 +51,12 @@ corax --config ./corax.yaml setup
 Legacy development aliases still work (`python main.py --chat`,
 `python main.py --status`, `python main.py --init`), but the public CLI shape is
 `corax <command>`.
+
+On a fresh installation, `corax` automatically runs the same guided flow as
+`corax setup`. The wizard acknowledges execution risk, configures workspace,
+verifies the selected local model with a real completion, selects memory and
+security modes, and optionally enables Telegram. Re-running it preserves
+current values as defaults and never writes credentials to the config.
 
 ## Project layout
 
@@ -83,17 +94,22 @@ next to `StubPlanner`, a `TelegramConnector` in `corax/connectors/`, and so on.
 The default `corax.yaml` groups packages under `extensions.active`:
 
 - tools: `echo`, `filesystem`, `editor`, `shell`, `web.search`;
-- channels: `terminal`, `telegram.connector`;
+- channels: `console.connector`, `telegram.connector`;
 - models: `stub`, `llm.local`;
 - memory: `memory.none`;
 - policy: `security.policy`;
-- services: `gateway`.
+- services: `gateway`, `memory.loop`.
 
 Each external package is loaded from its root `extension.json`. The runtime
 validates that the entrypoint implements the declared kind before adding it to
 the corresponding registry. Only tools pass through `runtime.execute(...)`.
 The selected policy is injected into every Agent Core session and is never
 model-callable.
+
+The selected memory provider is bound to the host-only `memory.loop` service.
+Every conversation turn recalls bounded context before model generation and
+retains only explicit or stable, non-secret user facts after the response.
+Recalled memory is inserted as untrusted data, never as executable instructions.
 
 Security mode can also be controlled by an authorised Telegram operator:
 

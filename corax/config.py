@@ -416,18 +416,19 @@ def default_config() -> AgentConfig:
                     "web.search",
                 ],
                 "channel_connector": [
-                    "terminal",
+                    "console.connector",
                     "telegram.connector",
                 ],
                 "model_provider": ["stub", "llm.local"],
                 "memory_provider": ["memory.none"],
                 "policy_provider": ["security.policy"],
-                "runtime_service": ["gateway"],
+                "runtime_service": ["gateway", "memory.loop"],
             },
             bindings={
                 "planner": "stub",
                 "primary_model": "llm.local",
                 "memory": "memory.none",
+                "memory_loop": "memory.loop",
                 "policy": "security.policy",
             },
             available={
@@ -451,9 +452,19 @@ def default_config() -> AgentConfig:
                     description="Mnemonic Vault file-first memory provider",
                     path="../mnemonic-vault/integrations/corax",
                 ),
+                "memory.loop": ExtensionSpec(
+                    kind="runtime_service",
+                    description="Bounded recall and privacy-aware retention loop",
+                    path="../corax-memory-loop",
+                ),
                 "terminal": ExtensionSpec(
                     kind="channel_connector",
                     description="Built-in terminal connector",
+                ),
+                "console.connector": ExtensionSpec(
+                    kind="channel_connector",
+                    description="Interactive local console channel",
+                    path="../corax-console",
                 ),
                 "echo": ExtensionSpec(
                     kind="tool",
@@ -887,6 +898,7 @@ def validate_config(config: AgentConfig) -> list[str]:
         "planner": "model_provider",
         "primary_model": "model_provider",
         "memory": "memory_provider",
+        "memory_loop": "runtime_service",
         "policy": "policy_provider",
     }
     for role, extension_id in config.extensions.bindings.items():

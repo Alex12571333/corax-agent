@@ -23,6 +23,8 @@ dependencies = [
     "corax-web-search-capability @ git+https://github.com/Alex12571333/corax-web-search-capability.git",
     "corax-runtime-gateway @ git+https://github.com/Alex12571333/corax-gateway-capability.git",
     "corax-security-policy @ git+https://github.com/Alex12571333/corax-security-policy.git",
+    "corax-memory-loop @ git+https://github.com/Alex12571333/corax-memory-loop.git",
+    "corax-console @ git+https://github.com/Alex12571333/corax-console.git",
 ]
 
 [project.optional-dependencies]

@@ -35,6 +35,8 @@ CAPABILITY_ROOTS = {
     "shell": REPO_ROOT.parent / "corax-shell-capability",
     "gateway": REPO_ROOT.parent / "corax-gateway-capability",
     "security.policy": REPO_ROOT.parent / "corax-security-policy",
+    "memory.loop": REPO_ROOT.parent / "corax-memory-loop",
+    "console.connector": REPO_ROOT.parent / "corax-console",
 }
 
 
@@ -51,7 +53,8 @@ class TestRuntime(unittest.TestCase):
         self.assertTrue(self.runtime.running)
         self.assertIsInstance(self.runtime.providers.get("stub"), StubPlanner)
         self.assertIsInstance(self.runtime.memory.get("memory.none"), NullMemory)
-        self.assertIsInstance(self.runtime.connectors.get("terminal"), TerminalConnector)
+        if HAS_AGENT_SDK and CAPABILITY_ROOTS["console.connector"].is_dir():
+            self.assertTrue(self.runtime.connectors.has("console.connector"))
         self.assertIsInstance(self.runtime.capabilities.get("echo"), EchoCapability)
         # The package capabilities load only when agent-sdk is installed AND the
         # sibling repos are present on disk.
@@ -63,6 +66,9 @@ class TestRuntime(unittest.TestCase):
                 self.assertTrue(self.runtime.services.has("gateway"))
             if CAPABILITY_ROOTS["security.policy"].is_dir():
                 self.assertTrue(self.runtime.policies.has("security.policy"))
+            if CAPABILITY_ROOTS["memory.loop"].is_dir():
+                self.assertTrue(self.runtime.services.has("memory.loop"))
+                self.assertIsNotNone(self.runtime.active_memory_loop())
         self.assertFalse(self.runtime.capabilities.has("llm.local"))
         self.assertFalse(self.runtime.capabilities.has("telegram.connector"))
         self.assertFalse(self.runtime.capabilities.has("gateway"))
@@ -75,7 +81,7 @@ class TestRuntime(unittest.TestCase):
         self.assertEqual(status.memory_active, "memory.none")
         self.assertEqual(
             status.connectors_active,
-            ["terminal", "telegram.connector"],
+            ["console.connector", "telegram.connector"],
         )
         self.assertEqual(
             status.capabilities_enabled,
@@ -88,7 +94,9 @@ class TestRuntime(unittest.TestCase):
             ],
         )
         self.assertEqual(status.registry_counts["model_provider"], 2)
-        self.assertEqual(status.active_by_kind["runtime_service"], ["gateway"])
+        self.assertEqual(
+            status.active_by_kind["runtime_service"], ["gateway", "memory.loop"]
+        )
         self.assertIn("RUNNING", status.render())
         self.assertIn("running", status.to_dict())
 
@@ -193,6 +201,17 @@ class TestRuntime(unittest.TestCase):
                     os.environ.pop("CORAX_GATEWAY_STATE_PATH", None)
                 else:
                     os.environ["CORAX_GATEWAY_STATE_PATH"] = old_value
+
+    def test_memory_loop_is_wired_to_selected_provider(self) -> None:
+        asyncio.run(self.runtime.start())
+        result = asyncio.run(
+            self.runtime.memory_before_turn(
+                "what do you remember?",
+                session_id="memory-session",
+            )
+        )
+        self.assertEqual(result["context"], "")
+        self.assertEqual(result["provider"], "memory.none")
 
     def test_start_keeps_custom_gateway_state_path(self) -> None:
         import os

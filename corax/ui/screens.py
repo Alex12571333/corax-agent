@@ -14,7 +14,7 @@ from ..runtime import RuntimeStatus
 MAIN_MENU = [
     "",
     "Corax Setup",
-    "  Configure the local runtime once, then run: corax gateway",
+    "  Advanced settings. Guided onboarding: corax setup",
     "",
     "  1. Runtime Status",
     "  2. Runtime Paths & Logs",
@@ -31,7 +31,7 @@ MAIN_MENU = [
     " 10. Save and Exit",
     "  0. Exit without saving",
     "",
-    "Commands: corax setup | corax gateway | corax status | corax init",
+    "Commands: corax | corax setup | corax settings | corax gateway | corax status",
     "",
 ]
 
