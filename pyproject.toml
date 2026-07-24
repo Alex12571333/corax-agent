@@ -21,7 +21,7 @@ dependencies = [
     "corax-llm-local-connector @ git+https://github.com/Alex12571333/corax-llm-local-connector.git@d0757c37f1bd386d60fdbbfb5aeec48a26a495b9",
     "corax-telegram-connector @ git+https://github.com/Alex12571333/corax-telegram-connector.git@da4c08ed871c3bc0461118aa3945e2ad3990fa98",
     "corax-web-search-capability @ git+https://github.com/Alex12571333/corax-web-search-capability.git@51d6aa46755ad98f4e7636c587490e70ba7d641d",
-    "corax-runtime-gateway @ git+https://github.com/Alex12571333/corax-gateway-capability.git",
+    "corax-runtime-gateway @ git+https://github.com/Alex12571333/corax-gateway-capability.git@838c83e3cf1f86cb2376ada63a1b3c76f5ca6129",
     "corax-security-policy @ git+https://github.com/Alex12571333/corax-security-policy.git",
     "corax-memory-loop @ git+https://github.com/Alex12571333/corax-memory-loop.git",
     "corax-console @ git+https://github.com/Alex12571333/corax-console.git",
