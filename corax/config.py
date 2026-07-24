@@ -423,6 +423,7 @@ def default_config() -> AgentConfig:
                 "memory_provider": ["memory.none"],
                 "policy_provider": ["security.policy"],
                 "runtime_service": ["gateway", "memory.loop"],
+                "storage_provider": ["state.file"],
             },
             bindings={
                 "planner": "stub",
@@ -430,6 +431,7 @@ def default_config() -> AgentConfig:
                 "memory": "memory.none",
                 "memory_loop": "memory.loop",
                 "policy": "security.policy",
+                "state": "state.file",
             },
             available={
                 "stub": ExtensionSpec(
@@ -509,6 +511,11 @@ def default_config() -> AgentConfig:
                     kind="policy_provider",
                     description="Three-mode authorization policy",
                     path="../corax-security-policy",
+                ),
+                "state.file": ExtensionSpec(
+                    kind="storage_provider",
+                    description="Atomic local JSON checkpoint storage",
+                    path="../corax-state-store",
                 ),
             },
         ),
@@ -900,6 +907,7 @@ def validate_config(config: AgentConfig) -> list[str]:
         "memory": "memory_provider",
         "memory_loop": "runtime_service",
         "policy": "policy_provider",
+        "state": "storage_provider",
     }
     for role, extension_id in config.extensions.bindings.items():
         spec = config.extensions.available.get(extension_id)

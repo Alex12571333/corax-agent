@@ -138,6 +138,7 @@ class CoraxRuntime:
         self.memories = self.extensions.registry(ExtensionKind.MEMORY_PROVIDER)
         self.policies = self.extensions.registry(ExtensionKind.POLICY_PROVIDER)
         self.services = self.extensions.registry(ExtensionKind.RUNTIME_SERVICE)
+        self.storage = self.extensions.registry(ExtensionKind.STORAGE_PROVIDER)
 
         # 0.1 aliases. Crucially, ``capabilities`` aliases tools only.
         self.capabilities = self.tools
@@ -266,6 +267,14 @@ class CoraxRuntime:
         )
         if service_id and self.services.has(service_id):
             return self.services.get(service_id)
+        return None
+
+    def active_state_store(self) -> Any | None:
+        """Return the selected host-only checkpoint provider."""
+
+        storage_id = self.config.extensions.bindings.get("state", "")
+        if storage_id and self.storage.has(storage_id):
+            return self.storage.get(storage_id)
         return None
 
     async def memory_before_turn(
@@ -438,6 +447,22 @@ class CoraxRuntime:
             result = await item.handle(
                 ExtensionRequest(operation=operation, payload=data, session_id=session_id)
             )
+        elif kind is ExtensionKind.STORAGE_PROVIDER:
+            key = str(data.pop("key", ""))
+            namespace = str(data.pop("namespace", ""))
+            if operation == "read":
+                return await item.read(key, namespace=namespace)
+            if operation == "write":
+                await item.write(
+                    key,
+                    data.pop("value", None),
+                    namespace=namespace,
+                )
+                return None
+            if operation == "delete":
+                await item.delete(key, namespace=namespace)
+                return None
+            raise ValueError("storage operation must be read, write or delete")
         elif hasattr(item, "invoke"):
             result = await item.invoke(
                 ExtensionRequest(operation=operation, payload=data, session_id=session_id)
@@ -512,6 +537,7 @@ class CoraxRuntime:
         self._apply_telegram_environment()
         self._apply_websearch_environment()
         self._apply_gateway_environment()
+        self._apply_state_environment()
         self._apply_security_environment()
 
     def _apply_llm_environment(self) -> None:
@@ -543,6 +569,12 @@ class CoraxRuntime:
         os.environ.setdefault(
             "CORAX_GATEWAY_STATE_PATH",
             str(self.data_path / "gateway-state.json"),
+        )
+
+    def _apply_state_environment(self) -> None:
+        os.environ.setdefault(
+            "CORAX_STATE_PATH",
+            str(self.data_path / "state"),
         )
 
     def _apply_security_environment(self) -> None:

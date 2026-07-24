@@ -37,6 +37,7 @@ CAPABILITY_ROOTS = {
     "security.policy": REPO_ROOT.parent / "corax-security-policy",
     "memory.loop": REPO_ROOT.parent / "corax-memory-loop",
     "console.connector": REPO_ROOT.parent / "corax-console",
+    "state.file": REPO_ROOT.parent / "corax-state-store",
 }
 
 
@@ -69,6 +70,9 @@ class TestRuntime(unittest.TestCase):
             if CAPABILITY_ROOTS["memory.loop"].is_dir():
                 self.assertTrue(self.runtime.services.has("memory.loop"))
                 self.assertIsNotNone(self.runtime.active_memory_loop())
+            if CAPABILITY_ROOTS["state.file"].is_dir():
+                self.assertTrue(self.runtime.storage.has("state.file"))
+                self.assertIsNotNone(self.runtime.active_state_store())
         self.assertFalse(self.runtime.capabilities.has("llm.local"))
         self.assertFalse(self.runtime.capabilities.has("telegram.connector"))
         self.assertFalse(self.runtime.capabilities.has("gateway"))
@@ -97,6 +101,7 @@ class TestRuntime(unittest.TestCase):
         self.assertEqual(
             status.active_by_kind["runtime_service"], ["gateway", "memory.loop"]
         )
+        self.assertEqual(status.active_by_kind["storage_provider"], ["state.file"])
         self.assertIn("RUNNING", status.render())
         self.assertIn("running", status.to_dict())
 

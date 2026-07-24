@@ -381,6 +381,28 @@ async def _run_console_chat(app: "CoraxApp") -> int:
                 ),
             }
 
+        state_id = app.config.extensions.bindings.get("state", "")
+
+        async def load_state():
+            if not state_id or not runtime.storage.has(state_id):
+                return None
+            return await runtime.invoke_extension(
+                state_id,
+                {"operation": "read", "namespace": "console", "key": "local"},
+            )
+
+        async def save_state(state):
+            if state_id and runtime.storage.has(state_id):
+                await runtime.invoke_extension(
+                    state_id,
+                    {
+                        "operation": "write",
+                        "namespace": "console",
+                        "key": "local",
+                        "value": state,
+                    },
+                )
+
         chat = ConsoleChat(
             connector=connector,
             run_model=run_model,
@@ -393,6 +415,8 @@ async def _run_console_chat(app: "CoraxApp") -> int:
             memory_command=memory_control,
             memory_before_turn=runtime.memory_before_turn,
             memory_after_turn=runtime.memory_after_turn,
+            load_state=load_state,
+            save_state=save_state,
         )
         return await chat.run()
 

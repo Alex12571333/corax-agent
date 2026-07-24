@@ -99,6 +99,7 @@ The default `corax.yaml` groups packages under `extensions.active`:
 - memory: `memory.none`;
 - policy: `security.policy`;
 - services: `gateway`, `memory.loop`.
+- storage: `state.file`.
 
 Each external package is loaded from its root `extension.json`. The runtime
 validates that the entrypoint implements the declared kind before adding it to
@@ -110,6 +111,8 @@ The selected memory provider is bound to the host-only `memory.loop` service.
 Every conversation turn recalls bounded context before model generation and
 retains only explicit or stable, non-secret user facts after the response.
 Recalled memory is inserted as untrusted data, never as executable instructions.
+The console stores its bounded session history through the host-only
+`state.file` provider and resumes it after a restart.
 
 Security mode can also be controlled by an authorised Telegram operator:
 

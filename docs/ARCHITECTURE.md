@@ -119,6 +119,9 @@ Conversation channels call it before and after each turn. Recall is bounded and
 injected as untrusted context; retention is conservative and excludes secrets
 and assistant-authored claims.
 
+`state.file` implements the core `StorageProvider` port. The console uses it
+for bounded restart-safe checkpoints; it is runtime-only and never model-callable.
+
 `RuntimeStatus` is a serialisable snapshot (`to_dict()` / `render()`), exposed
 both via `await runtime.status()` and the synchronous `runtime.snapshot()`
 (used by the blocking menu).
