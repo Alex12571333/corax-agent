@@ -429,6 +429,7 @@ def default_config() -> AgentConfig:
                     "mcp.manager",
                     "skills.runtime",
                     "hooks.runtime",
+                    "subagents.orchestrator",
                 ],
                 "storage_provider": ["state.file"],
             },
@@ -443,6 +444,7 @@ def default_config() -> AgentConfig:
                 "mcp": "mcp.manager",
                 "skills": "skills.runtime",
                 "hooks": "hooks.runtime",
+                "subagents": "subagents.orchestrator",
             },
             available={
                 "stub": ExtensionSpec(
@@ -489,6 +491,11 @@ def default_config() -> AgentConfig:
                     kind="runtime_service",
                     description="Consent-gated subprocess lifecycle hooks",
                     path="../corax-hooks-runtime",
+                ),
+                "subagents.orchestrator": ExtensionSpec(
+                    kind="runtime_service",
+                    description="Bounded parallel leaf-subagent delegation",
+                    path="../corax-subagents",
                 ),
                 "terminal": ExtensionSpec(
                     kind="channel_connector",
@@ -943,6 +950,7 @@ def validate_config(config: AgentConfig) -> list[str]:
         "mcp": "runtime_service",
         "skills": "runtime_service",
         "hooks": "runtime_service",
+        "subagents": "runtime_service",
     }
     for role, extension_id in config.extensions.bindings.items():
         spec = config.extensions.available.get(extension_id)

@@ -314,6 +314,14 @@ class CoraxRuntime:
             return self.services.get(service_id)
         return None
 
+    def active_subagent_orchestrator(self) -> Any | None:
+        """Return the configured bounded subagent delegation service."""
+
+        service_id = self.config.extensions.bindings.get("subagents", "")
+        if service_id and self.services.has(service_id):
+            return self.services.get(service_id)
+        return None
+
     async def _dispatch_hooks(
         self,
         event: str,
@@ -491,6 +499,16 @@ class CoraxRuntime:
                     self.log.warning("MCP tool id collision: %s", proxy.id)
                     continue
                 self.tools.register(proxy.id, proxy)
+        orchestrator = self.active_subagent_orchestrator()
+        if orchestrator is not None:
+            if hasattr(orchestrator, "bind"):
+                orchestrator.bind(self._run_subagent_model)
+            if hasattr(orchestrator, "tool_proxy"):
+                proxy = orchestrator.tool_proxy()
+                if self.extensions.has(proxy.id):
+                    self.log.warning("subagent tool id collision: %s", proxy.id)
+                else:
+                    self.tools.register(proxy.id, proxy)
         hooks = self.active_hooks_runtime()
         if (
             hooks is not None
@@ -503,6 +521,21 @@ class CoraxRuntime:
         ):
             for entry in self.tools.list_all():
                 entry.item = hooks.wrap_tool(entry.item)
+
+    async def _run_subagent_model(
+        self,
+        payload: dict[str, Any],
+        *,
+        session_id: str,
+    ) -> Any:
+        model_id = self.config.extensions.bindings.get("primary_model", "")
+        if not model_id or not self.models.has(model_id):
+            raise RuntimeError("primary model provider is unavailable")
+        return await self.invoke_extension(
+            model_id,
+            payload,
+            session_id=session_id,
+        )
 
     async def security_control(
         self,

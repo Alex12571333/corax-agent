@@ -57,6 +57,7 @@ def build_parser() -> argparse.ArgumentParser:
             "mcp",
             "skills",
             "hooks",
+            "subagents",
             "init",
             "menu",
         ),
@@ -157,6 +158,20 @@ async def _run(args: argparse.Namespace) -> int:
                 service_id,
                 {"operation": operation},
                 session_id="hooks-control",
+            )
+            print(result)
+            return 0
+        elif command == "subagents":
+            service_id = app.config.extensions.bindings.get(
+                "subagents", "subagents.orchestrator"
+            )
+            if not app.runtime.services.has(service_id):
+                print("subagents.orchestrator is not loaded.")
+                return 1
+            result = await app.runtime.invoke_extension(
+                service_id,
+                {"operation": "status"},
+                session_id="subagents-control",
             )
             print(result)
             return 0

@@ -42,6 +42,7 @@ CAPABILITY_ROOTS = {
     "mcp.manager": REPO_ROOT.parent / "corax-mcp-manager",
     "skills.runtime": REPO_ROOT.parent / "corax-skills-runtime",
     "hooks.runtime": REPO_ROOT.parent / "corax-hooks-runtime",
+    "subagents.orchestrator": REPO_ROOT.parent / "corax-subagents",
 }
 
 
@@ -89,6 +90,10 @@ class TestRuntime(unittest.TestCase):
             if CAPABILITY_ROOTS["hooks.runtime"].is_dir():
                 self.assertTrue(self.runtime.services.has("hooks.runtime"))
                 self.assertIsNotNone(self.runtime.active_hooks_runtime())
+            if CAPABILITY_ROOTS["subagents.orchestrator"].is_dir():
+                self.assertTrue(self.runtime.services.has("subagents.orchestrator"))
+                self.assertIsNotNone(self.runtime.active_subagent_orchestrator())
+                self.assertTrue(self.runtime.tools.has("subagents.delegate"))
         self.assertFalse(self.runtime.capabilities.has("llm.local"))
         self.assertFalse(self.runtime.capabilities.has("telegram.connector"))
         self.assertFalse(self.runtime.capabilities.has("gateway"))
@@ -111,6 +116,7 @@ class TestRuntime(unittest.TestCase):
                 "editor",
                 "shell",
                 "web.search",
+                "subagents.delegate",
             ],
         )
         self.assertEqual(status.registry_counts["model_provider"], 2)
@@ -123,6 +129,7 @@ class TestRuntime(unittest.TestCase):
                 "mcp.manager",
                 "skills.runtime",
                 "hooks.runtime",
+                "subagents.orchestrator",
             ],
         )
         self.assertEqual(status.active_by_kind["storage_provider"], ["state.file"])

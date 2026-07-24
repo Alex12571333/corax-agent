@@ -30,6 +30,7 @@ dependencies = [
     "corax-mcp-manager @ git+https://github.com/Alex12571333/corax-mcp-manager.git",
     "corax-skills-runtime @ git+https://github.com/Alex12571333/corax-skills-runtime.git",
     "corax-hooks-runtime @ git+https://github.com/Alex12571333/corax-hooks-runtime.git",
+    "corax-subagents @ git+https://github.com/Alex12571333/corax-subagents.git",
 ]
 
 [project.optional-dependencies]

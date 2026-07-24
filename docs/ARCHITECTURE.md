@@ -138,6 +138,10 @@ instructions before the shared context-compaction boundary.
 subprocess commands. Hook wrappers preserve each tool's original schema, scopes,
 risk and side effects; the Agent Core policy boundary remains unchanged.
 
+`subagents.orchestrator` owns bounded parallel leaf delegation and registers
+`subagents.delegate` as a confirm-gated core tool. Child calls use the selected
+model provider in isolated sessions and receive no tool registry.
+
 `RuntimeStatus` is a serialisable snapshot (`to_dict()` / `render()`), exposed
 both via `await runtime.status()` and the synchronous `runtime.snapshot()`
 (used by the blocking menu).

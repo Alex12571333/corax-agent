@@ -50,6 +50,7 @@ corax skills list           # installed portable Agent Skills
 corax skills reload         # rescan trusted skill roots
 corax hooks status          # fingerprints and approval state
 corax hooks reload          # reload hook config and allowlist
+corax subagents             # delegation limits and counters
 corax init                  # create config + workspace/data/logs and exit
 corax --config ./corax.yaml setup
 ```
@@ -105,7 +106,7 @@ The default `corax.yaml` groups packages under `extensions.active`:
 - memory: `memory.none`;
 - policy: `security.policy`;
 - services: `gateway`, `memory.loop`, `context.manager`, `mcp.manager`,
-  `skills.runtime`, `hooks.runtime`.
+  `skills.runtime`, `hooks.runtime`, `subagents.orchestrator`.
 - storage: `state.file`.
 
 Each external package is loaded from its root `extension.json`. The runtime
@@ -130,6 +131,9 @@ directories, then loads only the instructions relevant to the current turn.
 `hooks.runtime` runs approved lifecycle hooks out of process with `shell=False`,
 bounded I/O, timeouts, and content fingerprints. Tool hooks wrap the original
 tool metadata, so Agent Core authorization remains authoritative.
+`subagents.orchestrator` adds the confirm-gated `subagents.delegate` tool.
+Children run in parallel fresh contexts, receive no tools, and return only
+bounded summaries to the parent.
 
 Security mode can also be controlled by an authorised Telegram operator:
 
