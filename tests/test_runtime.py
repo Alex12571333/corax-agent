@@ -38,6 +38,7 @@ CAPABILITY_ROOTS = {
     "memory.loop": REPO_ROOT.parent / "corax-memory-loop",
     "console.connector": REPO_ROOT.parent / "corax-console",
     "state.file": REPO_ROOT.parent / "corax-state-store",
+    "context.manager": REPO_ROOT.parent / "corax-context-manager",
 }
 
 
@@ -73,6 +74,9 @@ class TestRuntime(unittest.TestCase):
             if CAPABILITY_ROOTS["state.file"].is_dir():
                 self.assertTrue(self.runtime.storage.has("state.file"))
                 self.assertIsNotNone(self.runtime.active_state_store())
+            if CAPABILITY_ROOTS["context.manager"].is_dir():
+                self.assertTrue(self.runtime.services.has("context.manager"))
+                self.assertIsNotNone(self.runtime.active_context_manager())
         self.assertFalse(self.runtime.capabilities.has("llm.local"))
         self.assertFalse(self.runtime.capabilities.has("telegram.connector"))
         self.assertFalse(self.runtime.capabilities.has("gateway"))
@@ -99,7 +103,8 @@ class TestRuntime(unittest.TestCase):
         )
         self.assertEqual(status.registry_counts["model_provider"], 2)
         self.assertEqual(
-            status.active_by_kind["runtime_service"], ["gateway", "memory.loop"]
+            status.active_by_kind["runtime_service"],
+            ["gateway", "memory.loop", "context.manager"],
         )
         self.assertEqual(status.active_by_kind["storage_provider"], ["state.file"])
         self.assertIn("RUNNING", status.render())
@@ -217,6 +222,21 @@ class TestRuntime(unittest.TestCase):
         )
         self.assertEqual(result["context"], "")
         self.assertEqual(result["provider"], "memory.none")
+
+    def test_context_manager_compacts_old_history(self) -> None:
+        asyncio.run(self.runtime.start())
+        messages = [{"role": "system", "content": "safety"}]
+        for index in range(20):
+            messages.append(
+                {"role": "assistant", "content": f"old-{index}-" * 1_000}
+            )
+        messages.append({"role": "user", "content": "current"})
+        compacted = asyncio.run(
+            self.runtime.compact_messages(messages, session_id="context-test")
+        )
+        self.assertLess(len(compacted), len(messages))
+        self.assertEqual(compacted[0]["content"], "safety")
+        self.assertEqual(compacted[-1]["content"], "current")
 
     def test_start_keeps_custom_gateway_state_path(self) -> None:
         import os

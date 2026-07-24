@@ -32,6 +32,7 @@ extensions:
     runtime_service:
       - gateway
       - memory.loop
+      - context.manager
     storage_provider:
       - state.file
   bindings:
@@ -41,6 +42,7 @@ extensions:
     memory_loop: memory.loop
     policy: security.policy
     state: state.file
+    context: context.manager
   available:
     stub:
       kind: model_provider
@@ -65,6 +67,11 @@ extensions:
       enabled: true
       description: "Bounded recall and privacy-aware retention loop"
       path: ../corax-memory-loop
+    context.manager:
+      kind: runtime_service
+      enabled: true
+      description: "Deterministic bounded context compaction"
+      path: ../corax-context-manager
     state.file:
       kind: storage_provider
       enabled: true

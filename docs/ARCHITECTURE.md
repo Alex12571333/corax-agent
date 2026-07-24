@@ -122,6 +122,10 @@ and assistant-authored claims.
 `state.file` implements the core `StorageProvider` port. The console uses it
 for bounded restart-safe checkpoints; it is runtime-only and never model-callable.
 
+`context.manager` runs inside the model-provider host path, so console,
+Telegram, streaming and non-streaming requests share one deterministic context
+budget without adding another model call.
+
 `RuntimeStatus` is a serialisable snapshot (`to_dict()` / `render()`), exposed
 both via `await runtime.status()` and the synchronous `runtime.snapshot()`
 (used by the blocking menu).

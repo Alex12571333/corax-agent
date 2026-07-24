@@ -98,7 +98,7 @@ The default `corax.yaml` groups packages under `extensions.active`:
 - models: `stub`, `llm.local`;
 - memory: `memory.none`;
 - policy: `security.policy`;
-- services: `gateway`, `memory.loop`.
+- services: `gateway`, `memory.loop`, `context.manager`.
 - storage: `state.file`.
 
 Each external package is loaded from its root `extension.json`. The runtime
@@ -113,6 +113,8 @@ retains only explicit or stable, non-secret user facts after the response.
 Recalled memory is inserted as untrusted data, never as executable instructions.
 The console stores its bounded session history through the host-only
 `state.file` provider and resumes it after a restart.
+Every model request also crosses `context.manager`, which preserves system
+instructions and the active turn while compacting stale history to a fixed budget.
 
 Security mode can also be controlled by an authorised Telegram operator:
 

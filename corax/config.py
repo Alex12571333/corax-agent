@@ -422,7 +422,7 @@ def default_config() -> AgentConfig:
                 "model_provider": ["stub", "llm.local"],
                 "memory_provider": ["memory.none"],
                 "policy_provider": ["security.policy"],
-                "runtime_service": ["gateway", "memory.loop"],
+                "runtime_service": ["gateway", "memory.loop", "context.manager"],
                 "storage_provider": ["state.file"],
             },
             bindings={
@@ -432,6 +432,7 @@ def default_config() -> AgentConfig:
                 "memory_loop": "memory.loop",
                 "policy": "security.policy",
                 "state": "state.file",
+                "context": "context.manager",
             },
             available={
                 "stub": ExtensionSpec(
@@ -458,6 +459,11 @@ def default_config() -> AgentConfig:
                     kind="runtime_service",
                     description="Bounded recall and privacy-aware retention loop",
                     path="../corax-memory-loop",
+                ),
+                "context.manager": ExtensionSpec(
+                    kind="runtime_service",
+                    description="Deterministic bounded context compaction",
+                    path="../corax-context-manager",
                 ),
                 "terminal": ExtensionSpec(
                     kind="channel_connector",
@@ -908,6 +914,7 @@ def validate_config(config: AgentConfig) -> list[str]:
         "memory_loop": "runtime_service",
         "policy": "policy_provider",
         "state": "storage_provider",
+        "context": "runtime_service",
     }
     for role, extension_id in config.extensions.bindings.items():
         spec = config.extensions.available.get(extension_id)

@@ -277,6 +277,40 @@ class CoraxRuntime:
             return self.storage.get(storage_id)
         return None
 
+    def active_context_manager(self) -> Any | None:
+        """Return the selected host-only context compaction service."""
+
+        service_id = self.config.extensions.bindings.get("context", "")
+        if service_id and self.services.has(service_id):
+            return self.services.get(service_id)
+        return None
+
+    async def compact_messages(
+        self,
+        messages: tuple | list,
+        *,
+        session_id: str = "",
+    ) -> list:
+        manager = self.active_context_manager()
+        original = list(messages)
+        if manager is None:
+            return original
+        try:
+            result = await manager.handle(
+                ExtensionRequest(
+                    operation="compact",
+                    payload={"messages": original},
+                    session_id=session_id,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - compaction is fail-soft
+            self.log.debug("context compaction failed: %s", exc)
+            return original
+        compacted = (result.payload or {}).get("messages", [])
+        return compacted if getattr(result, "is_success", False) and isinstance(
+            compacted, list
+        ) else original
+
     async def memory_before_turn(
         self,
         text: str,
@@ -380,9 +414,13 @@ class CoraxRuntime:
                 f"{extension_id!r} is a tool; invoke it through agent-core"
             )
         if kind is ExtensionKind.MODEL_PROVIDER:
+            messages = await self.compact_messages(
+                tuple(data.pop("messages", ())),
+                session_id=session_id,
+            )
             request = ModelRequest(
                 prompt=str(data.pop("prompt", "")),
-                messages=tuple(data.pop("messages", ())),
+                messages=tuple(messages),
                 model=data.pop("model", None),
                 modalities=tuple(data.pop("modalities", ("text",))),
                 parameters=data,
@@ -490,9 +528,13 @@ class CoraxRuntime:
             raise TypeError(f"model provider {extension_id!r} does not support streaming")
         data = dict(payload or {})
         data.pop("operation", None)
+        messages = await self.compact_messages(
+            tuple(data.pop("messages", ())),
+            session_id=session_id,
+        )
         request = ModelRequest(
             prompt=str(data.pop("prompt", "")),
-            messages=tuple(data.pop("messages", ())),
+            messages=tuple(messages),
             model=data.pop("model", None),
             modalities=tuple(data.pop("modalities", ("text",))),
             parameters=data,

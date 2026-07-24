@@ -26,6 +26,7 @@ dependencies = [
     "corax-memory-loop @ git+https://github.com/Alex12571333/corax-memory-loop.git",
     "corax-console @ git+https://github.com/Alex12571333/corax-console.git",
     "corax-state-store @ git+https://github.com/Alex12571333/corax-state-store.git",
+    "corax-context-manager @ git+https://github.com/Alex12571333/corax-context-manager.git",
 ]
 
 [project.optional-dependencies]
