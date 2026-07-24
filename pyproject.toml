@@ -31,6 +31,8 @@ dependencies = [
     "corax-skills-runtime @ git+https://github.com/Alex12571333/corax-skills-runtime.git",
     "corax-hooks-runtime @ git+https://github.com/Alex12571333/corax-hooks-runtime.git",
     "corax-subagents @ git+https://github.com/Alex12571333/corax-subagents.git",
+    "corax-sandbox-executor @ git+https://github.com/Alex12571333/corax-sandbox-executor.git",
+    "corax-model-router @ git+https://github.com/Alex12571333/corax-model-router.git",
 ]
 
 [project.optional-dependencies]

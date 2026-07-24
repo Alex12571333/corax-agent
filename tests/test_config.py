@@ -116,6 +116,11 @@ class TestLLMConfig(unittest.TestCase):
         self.assertFalse(config.llm.enable_image)
         self.assertFalse(config.llm.enable_video)
         self.assertIn("llm.local", config.extensions.active["model_provider"])
+        self.assertIn("model.router", config.extensions.active["model_provider"])
+        self.assertEqual(
+            config.extensions.bindings["primary_model"],
+            "model.router",
+        )
         self.assertEqual(
             config.extensions.available["llm.local"].kind,
             "model_provider",

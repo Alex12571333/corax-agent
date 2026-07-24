@@ -322,6 +322,22 @@ class CoraxRuntime:
             return self.services.get(service_id)
         return None
 
+    def active_sandbox_executor(self) -> Any | None:
+        """Return the selected fail-closed process sandbox backend."""
+
+        service_id = self.config.extensions.bindings.get("sandbox", "")
+        if service_id and self.services.has(service_id):
+            return self.services.get(service_id)
+        return None
+
+    def active_model_router(self) -> Any | None:
+        """Return the provider-agnostic model router when loaded."""
+
+        router_id = self.config.extensions.bindings.get("model_router", "")
+        if router_id and self.models.has(router_id):
+            return self.models.get(router_id)
+        return None
+
     async def _dispatch_hooks(
         self,
         event: str,
@@ -492,6 +508,15 @@ class CoraxRuntime:
         loop = self.active_memory_loop()
         if loop is not None and hasattr(loop, "bind"):
             loop.bind(self.active_memory())
+        router = self.active_model_router()
+        if router is not None and hasattr(router, "bind"):
+            router.bind(
+                {
+                    entry.id: entry.item
+                    for entry in self.models.list_enabled()
+                    if entry.id != getattr(router, "id", "")
+                }
+            )
         manager = self.active_mcp_manager()
         if manager is not None and hasattr(manager, "tool_proxies"):
             for proxy in manager.tool_proxies():
@@ -509,6 +534,11 @@ class CoraxRuntime:
                     self.log.warning("subagent tool id collision: %s", proxy.id)
                 else:
                     self.tools.register(proxy.id, proxy)
+        sandbox = self.active_sandbox_executor()
+        if self.tools.has("shell") and hasattr(
+            self.tools.get("shell"), "bind_executor"
+        ):
+            self.tools.get("shell").bind_executor(sandbox)
         hooks = self.active_hooks_runtime()
         if (
             hooks is not None
@@ -788,6 +818,7 @@ class CoraxRuntime:
         self._apply_state_environment()
         self._apply_security_environment()
         self._apply_skills_environment()
+        self._apply_sandbox_environment()
 
     def _apply_llm_environment(self) -> None:
         llm = self.config.llm
@@ -847,3 +878,7 @@ class CoraxRuntime:
                 )
             ),
         )
+
+    def _apply_sandbox_environment(self) -> None:
+        os.environ["CORAX_SHELL_REQUIRE_SANDBOX"] = "true"
+        os.environ["CORAX_SANDBOX_WORKSPACE"] = str(self.workspace_path)

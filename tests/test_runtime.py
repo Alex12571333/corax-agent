@@ -43,6 +43,8 @@ CAPABILITY_ROOTS = {
     "skills.runtime": REPO_ROOT.parent / "corax-skills-runtime",
     "hooks.runtime": REPO_ROOT.parent / "corax-hooks-runtime",
     "subagents.orchestrator": REPO_ROOT.parent / "corax-subagents",
+    "sandbox.executor": REPO_ROOT.parent / "corax-sandbox-executor",
+    "model.router": REPO_ROOT.parent / "corax-model-router",
 }
 
 
@@ -94,6 +96,12 @@ class TestRuntime(unittest.TestCase):
                 self.assertTrue(self.runtime.services.has("subagents.orchestrator"))
                 self.assertIsNotNone(self.runtime.active_subagent_orchestrator())
                 self.assertTrue(self.runtime.tools.has("subagents.delegate"))
+            if CAPABILITY_ROOTS["sandbox.executor"].is_dir():
+                self.assertTrue(self.runtime.services.has("sandbox.executor"))
+                self.assertIsNotNone(self.runtime.active_sandbox_executor())
+            if CAPABILITY_ROOTS["model.router"].is_dir():
+                self.assertTrue(self.runtime.models.has("model.router"))
+                self.assertIsNotNone(self.runtime.active_model_router())
         self.assertFalse(self.runtime.capabilities.has("llm.local"))
         self.assertFalse(self.runtime.capabilities.has("telegram.connector"))
         self.assertFalse(self.runtime.capabilities.has("gateway"))
@@ -119,7 +127,7 @@ class TestRuntime(unittest.TestCase):
                 "subagents.delegate",
             ],
         )
-        self.assertEqual(status.registry_counts["model_provider"], 2)
+        self.assertEqual(status.registry_counts["model_provider"], 3)
         self.assertEqual(
             status.active_by_kind["runtime_service"],
             [
@@ -130,6 +138,7 @@ class TestRuntime(unittest.TestCase):
                 "skills.runtime",
                 "hooks.runtime",
                 "subagents.orchestrator",
+                "sandbox.executor",
             ],
         )
         self.assertEqual(status.active_by_kind["storage_provider"], ["state.file"])
@@ -378,6 +387,7 @@ class TestCapabilityIntegration(unittest.TestCase):
             shell.execute(
                 self._request(
                     {
+                        "operation": "validate",
                         "command": "printf 'shell-ok\\n'",
                         "timeout_seconds": 5,
                     }
@@ -390,7 +400,11 @@ class TestCapabilityIntegration(unittest.TestCase):
         self.assertEqual(read.status, ResultStatus.SUCCESS)
         self.assertEqual(read.payload["content"], "hello corax\n")
         self.assertEqual(shell_result.status, ResultStatus.SUCCESS)
-        self.assertEqual(shell_result.payload["stdout"], "shell-ok\n")
+        self.assertTrue(shell_result.payload["safe"])
+        self.assertIs(
+            getattr(shell, "_executor", None),
+            self.runtime.active_sandbox_executor(),
+        )
 
     def _request(self, payload: dict) -> "CapabilityRequest":
         return CapabilityRequest(

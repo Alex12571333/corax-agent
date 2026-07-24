@@ -58,6 +58,8 @@ def build_parser() -> argparse.ArgumentParser:
             "skills",
             "hooks",
             "subagents",
+            "sandbox",
+            "models",
             "init",
             "menu",
         ),
@@ -174,6 +176,27 @@ async def _run(args: argparse.Namespace) -> int:
                 session_id="subagents-control",
             )
             print(result)
+            return 0
+        elif command == "sandbox":
+            service_id = app.config.extensions.bindings.get(
+                "sandbox", "sandbox.executor"
+            )
+            if not app.runtime.services.has(service_id):
+                print("sandbox.executor is not loaded.")
+                return 1
+            result = await app.runtime.invoke_extension(
+                service_id,
+                {"operation": "status"},
+                session_id="sandbox-control",
+            )
+            print(result)
+            return 0
+        elif command == "models":
+            router = app.runtime.active_model_router()
+            if router is None or not hasattr(router, "status"):
+                print("model.router is not loaded.")
+                return 1
+            print(router.status())
             return 0
         elif command == "gateway":
             return await _run_chat(app, config_path)
@@ -515,6 +538,9 @@ def _build_tool_routing(
         router = LLMToolRouter(
             invoke_extension,
             catalog=specs,
+            llm_id=app.config.extensions.bindings.get(
+                "primary_model", "llm.local"
+            ),
             model=app.config.llm.model,
             fallback=selector.select if selector.available else None,
             log=logging.getLogger("corax.tool_router"),
@@ -551,8 +577,9 @@ async def _run_chat(app: "CoraxApp", config_path: Path) -> int:
     if not (os.getenv("CORAX_TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")):
         print("Set CORAX_TELEGRAM_BOT_TOKEN before running --chat.")
         return 1
-    if not runtime.models.has("llm.local"):
-        print("llm.local model provider is not loaded; cannot run the chat.")
+    model_id = app.config.extensions.bindings.get("primary_model", "llm.local")
+    if not runtime.models.has(model_id):
+        print(f"{model_id} model provider is not loaded; cannot run the chat.")
         return 1
     if not runtime.channels.has("telegram.connector"):
         print("telegram.connector channel is not loaded; cannot run the chat.")
@@ -649,6 +676,7 @@ async def _run_chat(app: "CoraxApp", config_path: Path) -> int:
                 "gateway_available": runtime.services.has("gateway"),
                 "telegram_available": runtime.channels.has("telegram.connector"),
                 "model": app.config.llm.model,
+                "llm_id": model_id,
                 "workspace_path": runtime.workspace_path,
                 "state_path": runtime.data_path / "telegram-gateway-fallback-state.json",
                 "profile_path": runtime.data_path / "profile.md",
@@ -675,6 +703,9 @@ async def _run_chat(app: "CoraxApp", config_path: Path) -> int:
         if outcome == "reload":
             print(_style("Reloading agent...", _YELLOW))
             await runtime.reload_config(config_mod.load_config(config_path))
+            model_id = runtime.config.extensions.bindings.get(
+                "primary_model", "llm.local"
+            )
             specs = _tool_capability_specs(runtime)
             selector = RuntimeToolSelector(app.config, root_path=runtime.root_path)
             routing_mode, tool_mode_label = _resolve_tool_routing(app, selector.available)

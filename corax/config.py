@@ -419,7 +419,7 @@ def default_config() -> AgentConfig:
                     "console.connector",
                     "telegram.connector",
                 ],
-                "model_provider": ["stub", "llm.local"],
+                "model_provider": ["stub", "llm.local", "model.router"],
                 "memory_provider": ["memory.none"],
                 "policy_provider": ["security.policy"],
                 "runtime_service": [
@@ -430,12 +430,14 @@ def default_config() -> AgentConfig:
                     "skills.runtime",
                     "hooks.runtime",
                     "subagents.orchestrator",
+                    "sandbox.executor",
                 ],
                 "storage_provider": ["state.file"],
             },
             bindings={
                 "planner": "stub",
-                "primary_model": "llm.local",
+                "primary_model": "model.router",
+                "model_router": "model.router",
                 "memory": "memory.none",
                 "memory_loop": "memory.loop",
                 "policy": "security.policy",
@@ -445,6 +447,7 @@ def default_config() -> AgentConfig:
                 "skills": "skills.runtime",
                 "hooks": "hooks.runtime",
                 "subagents": "subagents.orchestrator",
+                "sandbox": "sandbox.executor",
             },
             available={
                 "stub": ExtensionSpec(
@@ -497,6 +500,11 @@ def default_config() -> AgentConfig:
                     description="Bounded parallel leaf-subagent delegation",
                     path="../corax-subagents",
                 ),
+                "sandbox.executor": ExtensionSpec(
+                    kind="runtime_service",
+                    description="Fail-closed Seatbelt or Docker shell backend",
+                    path="../corax-sandbox-executor",
+                ),
                 "terminal": ExtensionSpec(
                     kind="channel_connector",
                     description="Built-in terminal connector",
@@ -539,6 +547,11 @@ def default_config() -> AgentConfig:
                     kind="model_provider",
                     description="Local OpenAI-compatible model provider",
                     path="../corax-llm-local-connector",
+                ),
+                "model.router": ExtensionSpec(
+                    kind="model_provider",
+                    description="Provider-agnostic model routing and fallback",
+                    path="../corax-model-router",
                 ),
                 "telegram.connector": ExtensionSpec(
                     kind="channel_connector",
@@ -942,6 +955,7 @@ def validate_config(config: AgentConfig) -> list[str]:
     binding_kinds = {
         "planner": "model_provider",
         "primary_model": "model_provider",
+        "model_router": "model_provider",
         "memory": "memory_provider",
         "memory_loop": "runtime_service",
         "policy": "policy_provider",
@@ -951,6 +965,7 @@ def validate_config(config: AgentConfig) -> list[str]:
         "skills": "runtime_service",
         "hooks": "runtime_service",
         "subagents": "runtime_service",
+        "sandbox": "runtime_service",
     }
     for role, extension_id in config.extensions.bindings.items():
         spec = config.extensions.available.get(extension_id)

@@ -51,6 +51,8 @@ corax skills reload         # rescan trusted skill roots
 corax hooks status          # fingerprints and approval state
 corax hooks reload          # reload hook config and allowlist
 corax subagents             # delegation limits and counters
+corax sandbox               # active isolation backend and limits
+corax models                # model routes, providers and fallbacks
 corax init                  # create config + workspace/data/logs and exit
 corax --config ./corax.yaml setup
 ```
@@ -102,11 +104,12 @@ The default `corax.yaml` groups packages under `extensions.active`:
 
 - tools: `echo`, `filesystem`, `editor`, `shell`, `web.search`;
 - channels: `console.connector`, `telegram.connector`;
-- models: `stub`, `llm.local`;
+- models: `stub`, `llm.local`, `model.router`;
 - memory: `memory.none`;
 - policy: `security.policy`;
 - services: `gateway`, `memory.loop`, `context.manager`, `mcp.manager`,
-  `skills.runtime`, `hooks.runtime`, `subagents.orchestrator`.
+  `skills.runtime`, `hooks.runtime`, `subagents.orchestrator`,
+  `sandbox.executor`.
 - storage: `state.file`.
 
 Each external package is loaded from its root `extension.json`. The runtime
@@ -134,6 +137,11 @@ tool metadata, so Agent Core authorization remains authoritative.
 `subagents.orchestrator` adds the confirm-gated `subagents.delegate` tool.
 Children run in parallel fresh contexts, receive no tools, and return only
 bounded summaries to the parent.
+`sandbox.executor` is injected into `shell`; it denies network, strips the
+child environment, limits resources and writes, and fails closed when no
+Seatbelt/Docker backend is available.
+`model.router` is the default primary model provider. It delegates to existing
+providers and falls back only after retryable failures.
 
 Security mode can also be controlled by an authorised Telegram operator:
 

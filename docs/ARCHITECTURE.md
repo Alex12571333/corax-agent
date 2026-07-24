@@ -142,6 +142,14 @@ risk and side effects; the Agent Core policy boundary remains unchanged.
 `subagents.delegate` as a confirm-gated core tool. Child calls use the selected
 model provider in isolated sessions and receive no tool registry.
 
+`sandbox.executor` is a host-only backend injected into the shell tool. The
+shell keeps validation/redaction and Agent Core policy; process execution is
+fail-closed inside Seatbelt or Docker.
+
+`model.router` is a `model_provider` composed over other loaded providers. It
+routes by modalities and context size, supports model overrides, and performs
+fallback only for retryable failures.
+
 `RuntimeStatus` is a serialisable snapshot (`to_dict()` / `render()`), exposed
 both via `await runtime.status()` and the synchronous `runtime.snapshot()`
 (used by the blocking menu).
