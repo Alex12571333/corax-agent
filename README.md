@@ -109,7 +109,8 @@ you to copy its task ID. The explicit `/security approve <task-id>` and
 `corax` opens the full-screen
 [`corax-tui`](https://github.com/Alex12571333/corax-tui) by default. It keeps
 the transcript scrollable while model output arrives, separates real-time
-thinking from the answer, and lets you collapse thinking with `Ctrl-T`.
+thinking from the answer, and keeps thinking collapsed to a one-line status by
+default. Use `Ctrl-T` or `/thinking` to expand and collapse it.
 Typing `/` opens command suggestions with descriptions. The fixed status bar
 shows the active model, context use, security mode, memory provider, and
 session. Corax discovers the selected model's real context window from its
@@ -120,8 +121,14 @@ as if it were the model's token limit.
 
 `Page Up`, `Page Down`, and the mouse wheel detach the transcript from live
 output without streaming deltas snapping it back to the bottom. `Ctrl-End`
-returns to live follow mode. The raven uses a continuously animated truecolor
-scan beam when the terminal supports 24-bit color.
+returns to live follow mode. Assistant Markdown is rendered as styled headings,
+lists, quotes, links, inline emphasis/code, and fenced code blocks while the
+answer is still streaming.
+
+The hunter raven is a packaged raster hologram rather than character art.
+iTerm2, Kitty, and WezTerm display the PNG through their native image protocol.
+Apple Terminal, unknown terminals, and tmux/screen use the same compact header
+without emitting unsupported image escapes or falling back to ASCII art.
 
 Every model-selected tool is visible. The TUI and classic console show the
 tool name, safe argument summary, approval state, and completion or failure;
@@ -329,7 +336,7 @@ Host and operator surfaces:
 | --- | --- |
 | [`corax-agent`](https://github.com/Alex12571333/corax-agent) | Composition host, lifecycle, configuration, CLI, and runtime bindings. |
 | [`corax-console`](https://github.com/Alex12571333/corax-console) | First-run wizard and interactive terminal chat. |
-| [`corax-tui`](https://github.com/Alex12571333/corax-tui) | Full-screen terminal host: streaming transcript, thinking, tool activity, approvals, context bar, and slash completion. |
+| [`corax-tui`](https://github.com/Alex12571333/corax-tui) | Full-screen terminal host: streaming transcript, collapsed thinking, formatted answers, native raster hologram, tool activity, approvals, context bar, and slash completion. |
 | [`corax-ui`](https://github.com/Alex12571333/corax-ui) | Shared design tokens and dependency-free terminal renderer; not a runtime extension. |
 | [`corax-gateway-capability`](https://github.com/Alex12571333/corax-gateway-capability) | Channel-neutral sessions and gateway policy. |
 | [`corax-distribution`](https://github.com/Alex12571333/corax-distribution) | Immutable release lock and isolated source-composition installer. |
