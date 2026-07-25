@@ -458,7 +458,7 @@ async def _run_console_chat(
         print(f"{model_id} model provider is not loaded; run `corax setup`.")
         return 1
     try:
-        from corax_console import ConsoleChat
+        from corax_console import ConsoleChat, discover_model_context_window
     except ImportError:
         print("corax-console is not installed.")
         return 1
@@ -631,7 +631,11 @@ async def _run_console_chat(
                     "corax-tui is not installed; falling back to simple chat."
                 )
             else:
-                return await run_tui(chat)
+                context_window = await discover_model_context_window(
+                    app.config.llm.base_url,
+                    app.config.llm.model,
+                )
+                return await run_tui(chat, context_window=context_window)
         return await chat.run()
 
 

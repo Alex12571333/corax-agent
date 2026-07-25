@@ -112,9 +112,16 @@ the transcript scrollable while model output arrives, separates real-time
 thinking from the answer, and lets you collapse thinking with `Ctrl-T`.
 Typing `/` opens command suggestions with descriptions. The fixed status bar
 shows the active model, context use, security mode, memory provider, and
-session. Before the first turn it shows an explicit token estimate; during
-generation it switches to the context manager's exact character budget rather
-than pretending that estimated characters are exact provider tokens.
+session. Corax discovers the selected model's real context window from its
+OpenAI-compatible `/models` metadata and updates current use from streaming
+`prompt_tokens`. Until exact usage arrives it shows a clearly marked estimate;
+the context manager's independent character compaction budget is never shown
+as if it were the model's token limit.
+
+`Page Up`, `Page Down`, and the mouse wheel detach the transcript from live
+output without streaming deltas snapping it back to the bottom. `Ctrl-End`
+returns to live follow mode. The raven uses a continuously animated truecolor
+scan beam when the terminal supports 24-bit color.
 
 Every model-selected tool is visible. The TUI and classic console show the
 tool name, safe argument summary, approval state, and completion or failure;

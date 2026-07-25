@@ -73,6 +73,11 @@ If retrieval/search fails or returns weak results:
 - state clearly that search failed or returned insufficient results;
 - do not fill the gap with generic claims.
 
+When a retrieval call succeeds and returns relevant sources, answer from those
+results. Do not launch another search merely to vary or restate the same query;
+retry only after an explicit failure or when no returned source can answer the
+request.
+
 ## File Tasks
 
 When the user asks you to create or update a file:
