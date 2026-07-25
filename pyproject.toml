@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "corax-agent"
-version = "0.2.1"
+version = "0.3.0"
 description = "Corax Agent — typed extension runtime with strict tool and infrastructure boundaries."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -26,6 +26,7 @@ dependencies = [
     "corax-security-policy @ git+https://github.com/Alex12571333/corax-security-policy.git",
     "corax-memory-loop @ git+https://github.com/Alex12571333/corax-memory-loop.git",
     "corax-console @ git+https://github.com/Alex12571333/corax-console.git",
+    "corax-tui @ git+https://github.com/Alex12571333/corax-tui.git",
     "corax-state-store @ git+https://github.com/Alex12571333/corax-state-store.git",
     "corax-context-manager @ git+https://github.com/Alex12571333/corax-context-manager.git",
     "corax-mcp-manager @ git+https://github.com/Alex12571333/corax-mcp-manager.git",

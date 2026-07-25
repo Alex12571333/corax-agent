@@ -307,6 +307,20 @@ class ToolSpecTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(rendered, 'operation=write path="notes.txt"')
 
+    def test_tool_activity_label_omits_secrets_and_raw_shell_command(self) -> None:
+        gw = _gateway(FakeBackend())
+        generic = gw._tool_activity_label(
+            "web.search",
+            {"query": "weather", "api_key": "top-secret"},
+        )
+        shell = gw._tool_activity_label(
+            "shell",
+            {"command": "API_KEY=top-secret curl https://example.com/private"},
+        )
+        self.assertIn('query="weather"', generic)
+        self.assertNotIn("top-secret", generic)
+        self.assertNotIn("example.com", shell)
+
     def test_failed_tool_result_includes_recovery_hint(self) -> None:
         gw = _gateway(FakeBackend())
         content = gw._format_tool_result_for_model({"error": "missing module"})
@@ -354,6 +368,10 @@ class ChatToolLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             any("Please approve" in message for message in backend.sends)
         )
+        self.assertTrue(any("🔧 TOOL · filesystem" in message for message in backend.sends))
+        approval = next(message for message in backend.sends if "⏸ APPROVAL" in message)
+        self.assertIn("/approve or /deny", approval)
+        self.assertIn("/security approve task-confirm-1", approval)
 
     async def test_plain_answer_no_tools(self) -> None:
         backend = FakeBackend(poll_batches=[[_text_update(5, "hi")]],
@@ -665,6 +683,47 @@ class ChatToolLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(backend.tools_run[0][0], "filesystem")
         self.assertEqual(backend.tools_run[0][1], {"path": "."})  # args parsed, op stripped
         self.assertIn("here are your files", backend.sends)
+        self.assertTrue(
+            any(
+                message == '🔧 TOOL · filesystem · path="."'
+                for message in backend.sends
+            )
+        )
+        self.assertTrue(
+            any(
+                message == '✅ TOOL · filesystem · path="." · completed'
+                for message in backend.sends
+            )
+        )
+
+    async def test_tool_activity_never_exposes_args_or_results(self) -> None:
+        backend = FakeBackend(
+            poll_batches=[[_text_update(5, "write notes")]],
+            llm_responses=[
+                {
+                    "tool_calls": [
+                        _tool_call(
+                            "filesystem",
+                            '{"operation": "write", "path": "notes.txt", '
+                            '"content": "argument-secret"}',
+                        )
+                    ]
+                },
+                {"text": "done"},
+            ],
+            tool_results={
+                "filesystem": {
+                    "path": "notes.txt",
+                    "written": True,
+                    "private": "result-secret",
+                }
+            },
+        )
+        await _gateway(backend).run(max_iterations=1)
+        visible = "\n".join(backend.sends)
+        self.assertIn('operation=write path="notes.txt"', visible)
+        self.assertNotIn("argument-secret", visible)
+        self.assertNotIn("result-secret", visible)
 
     async def test_gateway_capability_records_tool_artifact(self) -> None:
         backend = FakeBackend(
@@ -911,6 +970,9 @@ class ChatToolLoopTests(unittest.IsolatedAsyncioTestCase):
         tool_msg = _last_tool_message(gen_calls[1]["messages"])
         self.assertIn("error", tool_msg["content"])
         self.assertIn("recovery_hint", tool_msg["content"])
+        self.assertTrue(
+            any(message == "❌ TOOL · filesystem · failed" for message in backend.sends)
+        )
 
     async def test_tool_failure_can_be_retried_in_next_step(self) -> None:
         backend = FakeBackend(
@@ -1073,6 +1135,118 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         await _gateway(backend, security_command=security).run(max_iterations=1)
         self.assertEqual(calls, [("mode auto", "5", "telegram")])
         self.assertIn("security mode: auto", backend.sends)
+
+    async def test_approve_alias_resolves_single_pending_tool_without_exposing_result(self) -> None:
+        backend = FakeBackend(
+            poll_batches=[
+                [_text_update(5, "delete file")],
+                [{
+                    "chat_id": 5,
+                    "text": "/approve",
+                    "command": {"is_command": True, "command": "unknown", "args": ""},
+                }],
+            ],
+            llm_responses=[
+                {"tool_calls": [_tool_call("filesystem", '{"operation": "delete"}')]},
+                {"text": "Waiting for approval."},
+            ],
+        )
+        backend.confirm_capability = "filesystem"
+        calls: list[tuple[str, str, str]] = []
+
+        async def security(command, *, actor, transport):
+            calls.append((command, actor, transport))
+            return {
+                "ok": True,
+                "status": "completed",
+                "message": "task completed",
+                "result": {"secret": "result-secret"},
+            }
+
+        await _gateway(backend, security_command=security).run(max_iterations=2)
+        self.assertEqual(calls, [("approve task-confirm-1", "5", "telegram")])
+        self.assertIn("✅ TOOL · filesystem · operation=delete · completed", backend.sends)
+        self.assertNotIn("result-secret", "\n".join(backend.sends))
+
+    async def test_deny_alias_resolves_single_pending_tool(self) -> None:
+        backend = FakeBackend(
+            poll_batches=[
+                [_text_update(5, "delete file")],
+                [{
+                    "chat_id": 5,
+                    "text": "/deny",
+                    "command": {"is_command": True, "command": "unknown", "args": ""},
+                }],
+            ],
+            llm_responses=[
+                {"tool_calls": [_tool_call("filesystem", '{"operation": "delete"}')]},
+                {"text": "Waiting for approval."},
+            ],
+        )
+        backend.confirm_capability = "filesystem"
+        calls: list[str] = []
+
+        async def security(command, *, actor, transport):
+            calls.append(command)
+            return {"ok": True, "status": "cancelled", "message": "task denied"}
+
+        await _gateway(backend, security_command=security).run(max_iterations=2)
+        self.assertEqual(calls, ["deny task-confirm-1"])
+        self.assertIn("❌ TOOL · filesystem · operation=delete · denied", backend.sends)
+
+    async def test_full_security_approval_command_remains_compatible(self) -> None:
+        backend = FakeBackend()
+        calls: list[str] = []
+
+        async def security(command, *, actor, transport):
+            calls.append(command)
+            return {"ok": True, "message": "task completed", "result": {"private": True}}
+
+        gw = _gateway(backend, security_command=security)
+        gw._pending_approvals["5"] = {"task-1": "filesystem"}
+        await gw.handle_update(_cmd_update(5, "security", args="approve task-1"))
+        self.assertEqual(calls, ["approve task-1"])
+        self.assertIn("✅ TOOL · filesystem · completed", backend.sends)
+        self.assertNotIn("private", "\n".join(backend.sends))
+
+    async def test_approval_alias_requires_one_unambiguous_pending_task(self) -> None:
+        backend = FakeBackend()
+        calls: list[str] = []
+
+        async def security(command, *, actor, transport):
+            calls.append(command)
+            return {"ok": True, "message": "unexpected"}
+
+        gw = _gateway(backend, security_command=security)
+        update = {
+            "chat_id": 5,
+            "text": "/approve",
+            "command": {"is_command": True, "command": "unknown", "args": ""},
+        }
+        await gw.handle_update(update)
+        self.assertIn("No pending approval", backend.sends[-1])
+        gw._pending_approvals["5"] = {"task-1": "filesystem", "task-2": "shell"}
+        await gw.handle_update(update)
+        self.assertIn("More than one approval", backend.sends[-1])
+        self.assertEqual(calls, [])
+
+    async def test_failed_approval_keeps_pending_tool_and_shows_failure(self) -> None:
+        backend = FakeBackend()
+
+        async def security(command, *, actor, transport):
+            raise GatewayError("private backend detail")
+
+        gw = _gateway(backend, security_command=security)
+        gw._pending_approvals["5"] = {"task-1": "filesystem"}
+        await gw.handle_update({
+            "chat_id": 5,
+            "text": "/approve",
+            "command": {"is_command": True, "command": "unknown", "args": ""},
+        })
+        visible = "\n".join(backend.sends)
+        self.assertIn("❌ TOOL · filesystem · approval failed", visible)
+        self.assertNotIn("private backend detail", visible)
+        self.assertIn("task-1", gw._pending_approvals["5"])
 
     async def test_security_command_is_explicitly_unavailable_without_provider(self) -> None:
         backend = FakeBackend(

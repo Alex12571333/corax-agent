@@ -483,10 +483,22 @@ class CoraxRuntime:
         *,
         session_id: str = "",
     ) -> list:
+        compacted, _ = await self._compact_messages_with_context(
+            messages,
+            session_id=session_id,
+        )
+        return compacted
+
+    async def _compact_messages_with_context(
+        self,
+        messages: tuple | list,
+        *,
+        session_id: str = "",
+    ) -> tuple[list, dict[str, Any] | None]:
         manager = self.active_context_manager()
         original = list(messages)
         if manager is None:
-            return original
+            return original, None
         try:
             result = await manager.handle(
                 ExtensionRequest(
@@ -497,11 +509,27 @@ class CoraxRuntime:
             )
         except Exception as exc:  # noqa: BLE001 - compaction is fail-soft
             self.log.debug("context compaction failed: %s", exc)
-            return original
-        compacted = (result.payload or {}).get("messages", [])
-        return compacted if getattr(result, "is_success", False) and isinstance(
+            return original, None
+        payload = result.payload or {}
+        compacted = payload.get("messages", [])
+        if not getattr(result, "is_success", False) or not isinstance(
             compacted, list
-        ) else original
+        ):
+            return original, None
+        used = payload.get("chars_after")
+        try:
+            limit = getattr(manager, "max_chars", None)
+        except Exception:  # noqa: BLE001 - optional budget reporting is fail-soft
+            limit = None
+        context = (
+            {"type": "context", "used": used, "limit": limit, "unit": "chars"}
+            if type(used) is int
+            and used >= 0
+            and type(limit) is int
+            and limit > 0
+            else None
+        )
+        return compacted, context
 
     async def memory_before_turn(
         self,
@@ -853,7 +881,7 @@ class CoraxRuntime:
             prompt=prompt,
             session_id=session_id,
         )
-        messages = await self.compact_messages(
+        messages, context = await self._compact_messages_with_context(
             messages,
             session_id=session_id,
         )
@@ -878,6 +906,8 @@ class CoraxRuntime:
             },
         )
         try:
+            if context is not None and messages:
+                yield context
             async for event in item.stream_generate_events(request):
                 yield event
         except Exception as exc:

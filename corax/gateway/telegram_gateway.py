@@ -264,6 +264,7 @@ class CoraxTelegramGateway:
         self._history: dict[str, list[dict[str, Any]]] = {}
         self._recent_files: dict[str, list[str]] = {}
         self._last_assistant_by_session: dict[str, str] = {}
+        self._pending_approvals: dict[str, dict[str, str]] = {}
         self._offset: int | None = None
         self._bot_menu_synced = False
         self._load_fallback_state()
@@ -320,6 +321,16 @@ class CoraxTelegramGateway:
             return
         command = update.get("command") or {}
         if command.get("is_command"):
+            raw_text = update.get("text")
+            if command.get("command") == "unknown" and isinstance(raw_text, str):
+                parts = raw_text.strip().split(maxsplit=1)
+                alias = parts[0].split("@", 1)[0].lower() if parts else ""
+                if alias in {"/approve", "/deny"}:
+                    command = {
+                        **command,
+                        "command": alias[1:],
+                        "args": parts[1] if len(parts) > 1 else "",
+                    }
             await self._handle_command(chat_id, command)
             return
         text = update.get("text")
@@ -363,34 +374,92 @@ class CoraxTelegramGateway:
                 await self._send(chat_id, f"Current model: {self.model or 'default'}")
         elif name == "status":
             await self._send(chat_id, self._status_text(chat_id))
-        elif name == "security":
-            if self._security_command is None:
-                await self._send(chat_id, "Security policy control is unavailable.")
-            else:
-                try:
-                    result = await self._security_command(
-                        command.get("args") or "status",
-                        actor=str(chat_id),
-                        transport="telegram",
-                    )
-                except Exception as exc:  # noqa: BLE001 - command loop must survive
-                    await self._send(chat_id, f"Security command failed: {exc}")
-                else:
-                    message = str(result.get("message") or result)
-                    if result.get("result") is not None:
-                        rendered = json.dumps(
-                            result["result"],
-                            ensure_ascii=False,
-                            sort_keys=True,
-                        )
-                        message = f"{message}\nresult: {rendered}"
-                    await self._send(chat_id, message)
+        elif name in {"security", "approve", "deny"}:
+            await self._handle_security_command(chat_id, name, command.get("args") or "")
         elif name == "help":
             await self._send(chat_id, command.get("reply") or "Send a message to chat.")
         elif name == "cancel":
             await self._send(chat_id, command.get("reply") or "🛑 Cancelled.")
         else:  # unknown
             await self._send(chat_id, "Unknown command. Send /help.")
+
+    async def _handle_security_command(self, chat_id: Any, name: str, args: str) -> None:
+        if self._security_command is None:
+            await self._send(chat_id, "Security policy control is unavailable.")
+            return
+
+        command = args.strip() or "status"
+        action = command.split(maxsplit=1)[0].lower()
+        task_id = ""
+        if name in {"approve", "deny"}:
+            action = name
+            explicit_ids = args.split()
+            if len(explicit_ids) > 1:
+                await self._send(chat_id, f"Usage: /{name} [task-id]")
+                return
+            if explicit_ids:
+                task_id = explicit_ids[0]
+            else:
+                pending = self._pending_approvals.get(self._session_key(chat_id), {})
+                if not pending:
+                    await self._send(
+                        chat_id,
+                        "No pending approval for this chat. Use /security approve <task-id>.",
+                    )
+                    return
+                if len(pending) > 1:
+                    task_ids = ", ".join(sorted(pending))
+                    await self._send(
+                        chat_id,
+                        "More than one approval is pending. "
+                        f"Use /security {name} <task-id>: {task_ids}",
+                    )
+                    return
+                task_id = next(iter(pending))
+            command = f"{action} {task_id}"
+        elif action in {"approve", "deny"}:
+            parts = command.split()
+            if len(parts) == 2:
+                task_id = parts[1]
+
+        pending = self._pending_approvals.get(self._session_key(chat_id), {})
+        activity = pending.get(task_id)
+        try:
+            result = await self._security_command(
+                command,
+                actor=str(chat_id),
+                transport="telegram",
+            )
+        except Exception as exc:  # noqa: BLE001 - command loop must survive
+            self.log.debug("security command failed: %s", exc)
+            if activity:
+                await self._send_tool_activity(
+                    chat_id,
+                    f"❌ TOOL · {activity} · approval failed",
+                )
+            await self._send(chat_id, "Security command failed.")
+            return
+
+        if action in {"approve", "deny"} and activity:
+            if result.get("ok"):
+                pending.pop(task_id, None)
+                if not pending:
+                    self._pending_approvals.pop(self._session_key(chat_id), None)
+                outcome = "completed" if action == "approve" else "denied"
+                icon = "✅" if action == "approve" else "❌"
+                await self._send_tool_activity(chat_id, f"{icon} TOOL · {activity} · {outcome}")
+            else:
+                await self._send_tool_activity(
+                    chat_id,
+                    f"❌ TOOL · {activity} · approval failed",
+                )
+
+        message = result.get("message")
+        fallback = "Security command completed." if result.get("ok") else "Security command failed."
+        await self._send(
+            chat_id,
+            str(message) if isinstance(message, str) and message else fallback,
+        )
 
     async def _handle_chat(self, chat_id: Any, text: str, *, chat_type: Any = None) -> None:
         prepared = await self._prepare_turn(chat_id, text)
@@ -722,6 +791,8 @@ class CoraxTelegramGateway:
                 args = {}
         except (ValueError, TypeError):
             args = {}
+        activity = self._tool_activity_label(cap_id or name or "unknown", args)
+        await self._send_tool_activity(chat_id, f"🔧 TOOL · {activity}")
 
         if name == _SEND_DOCUMENT_TOOL:
             result = await self._run_send_document_tool(
@@ -803,6 +874,25 @@ class CoraxTelegramGateway:
             model_result = recovery_plan.get("tool_result")
             if not isinstance(model_result, dict):
                 model_result = result
+
+        if result.get("confirmation_required") is True:
+            task_id = result.get("task_id")
+            if isinstance(task_id, str) and task_id:
+                self._pending_approvals.setdefault(self._session_key(chat_id), {})[
+                    task_id
+                ] = activity
+                await self._send_tool_activity(
+                    chat_id,
+                    (
+                        f"⏸ APPROVAL · {activity}\n"
+                        f"/approve or /deny\n"
+                        f"/security approve {task_id} · /security deny {task_id}"
+                    ),
+                )
+        elif tool_failed:
+            await self._send_tool_activity(chat_id, f"❌ TOOL · {activity} · failed")
+        else:
+            await self._send_tool_activity(chat_id, f"✅ TOOL · {activity} · completed")
 
         messages.append(
             {
@@ -886,6 +976,12 @@ class CoraxTelegramGateway:
         await self._run(
             self.telegram_id, {"operation": "send", "chat_id": chat_id, "text": text}
         )
+
+    async def _send_tool_activity(self, chat_id: Any, text: str) -> None:
+        try:
+            await self._send(chat_id, text)
+        except Exception as exc:  # noqa: BLE001 - status must not block the tool itself
+            self.log.debug("tool activity delivery failed: %s", exc)
 
     async def _deliver_final(self, chat_id: Any, text: str, *, allow_media: bool = True) -> str:
         clean_text, media_paths = self._extract_media_paths(self._sanitize_model_text(text))
@@ -1235,6 +1331,23 @@ class CoraxTelegramGateway:
             if len(parts) >= 4:
                 break
         return " ".join(parts) if parts else f"{len(args)} arg(s)"
+
+    def _tool_activity_label(self, cap_id: str, args: dict[str, Any]) -> str:
+        name = _SAFE_TOOL_NAME.sub("_", str(cap_id)).strip("_") or "unknown"
+        public_args = {
+            key: value
+            for key, value in args.items()
+            if key not in {"caption", "content", "message", "prompt", "text"}
+            and not _SECRET_SIGNAL.search(str(key))
+        }
+        if cap_id == "shell" and isinstance(args.get("command"), str):
+            command = self._compact_log_value(args["command"]).split(maxsplit=1)
+            executable = command[0] if command and "=" not in command[0] else "command"
+            public_args = {"command": executable}
+        detail = self._format_tool_args_for_log(cap_id, public_args)
+        if detail and not _SECRET_SIGNAL.search(detail):
+            return f"{name} · {detail}"
+        return name
 
     def _format_tool_result_for_model(self, result: dict[str, Any]) -> str:
         if not self._tool_result_failed(result):

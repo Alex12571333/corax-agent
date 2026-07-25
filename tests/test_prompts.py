@@ -30,9 +30,13 @@ class ChatPromptTests(unittest.TestCase):
 
 
 class CliCommandTests(unittest.TestCase):
-    def test_default_command_is_console_chat(self) -> None:
+    def test_default_command_is_full_screen_tui(self) -> None:
         args = build_parser().parse_args([])
-        self.assertEqual(_resolve_command(args), "chat")
+        self.assertEqual(_resolve_command(args), "tui")
+
+    def test_explicit_tui_command(self) -> None:
+        args = build_parser().parse_args(["tui"])
+        self.assertEqual(_resolve_command(args), "tui")
 
     def test_explicit_setup_command(self) -> None:
         args = build_parser().parse_args(["setup"])
@@ -56,6 +60,7 @@ class CliCommandTests(unittest.TestCase):
         self.assertEqual(_resolve_command(args), "settings")
 
     def test_first_run_gates_interactive_entrypoints_only(self) -> None:
+        self.assertTrue(_needs_setup("tui", True))
         self.assertTrue(_needs_setup("chat", True))
         self.assertTrue(_needs_setup("gateway", True))
         self.assertTrue(_needs_setup("setup", False))

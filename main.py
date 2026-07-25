@@ -2,8 +2,9 @@
 """Corax Agent — CLI entrypoint.
 
 Usage:
-    corax                          # first-run setup, then console chat
-    corax chat                     # interactive console chat
+    corax                          # first-run setup, then full-screen TUI
+    corax tui                      # full-screen terminal chat
+    corax chat                     # simple line-oriented console fallback
     corax setup                    # guided setup wizard
     corax settings                 # advanced settings menu
     corax gateway                  # run the Telegram gateway
@@ -46,6 +47,7 @@ def build_parser() -> argparse.ArgumentParser:
         "command",
         nargs="?",
         choices=(
+            "tui",
             "chat",
             "setup",
             "settings",
@@ -64,7 +66,7 @@ def build_parser() -> argparse.ArgumentParser:
             "init",
             "menu",
         ),
-        help="command to run (default: interactive console chat)",
+        help="command to run (default: full-screen terminal chat)",
     )
     parser.add_argument(
         "command_args",
@@ -223,6 +225,8 @@ async def _run(args: argparse.Namespace) -> int:
             return await _run_doctor(app)
         elif command == "gateway":
             return await _run_chat(app, config_path)
+        elif command == "tui":
+            return await _run_console_chat(app, use_tui=True)
         elif command == "chat":
             return await _run_console_chat(app)
         else:
@@ -245,13 +249,15 @@ def _resolve_command(args: argparse.Namespace) -> str:
         return "settings"
     if args.command == "menu":
         return "settings"
-    return args.command or "chat"
+    return args.command or "tui"
 
 
 def _needs_setup(command: str, first_run: bool) -> bool:
     """Gate interactive entrypoints, while keeping diagnostics available."""
 
-    return command == "setup" or (first_run and command in {"chat", "gateway"})
+    return command == "setup" or (
+        first_run and command in {"tui", "chat", "gateway"}
+    )
 
 
 async def _run_doctor(app: "CoraxApp") -> int:
@@ -433,7 +439,11 @@ def _tool_capability_specs(runtime) -> list[dict]:
     return specs
 
 
-async def _run_console_chat(app: "CoraxApp") -> int:
+async def _run_console_chat(
+    app: "CoraxApp",
+    *,
+    use_tui: bool = False,
+) -> int:
     """Run the local interactive console over the same kernel as Telegram."""
 
     runtime = app.runtime
@@ -471,6 +481,14 @@ async def _run_console_chat(app: "CoraxApp") -> int:
                 payload,
                 session_id=session_id,
             )
+
+        async def run_model_stream(payload, *, session_id):
+            async for event in runtime.stream_extension(
+                model_id,
+                payload,
+                session_id=session_id,
+            ):
+                yield event
 
         async def run_tool(extension_id, payload, *, session_id):
             return await kernel.invoke(
@@ -587,6 +605,7 @@ async def _run_console_chat(app: "CoraxApp") -> int:
         chat = ConsoleChat(
             connector=connector,
             run_model=run_model,
+            run_model_stream=run_model_stream,
             run_tool=run_tool,
             tools=specs,
             system_prompt=system_prompt,
@@ -604,6 +623,15 @@ async def _run_console_chat(app: "CoraxApp") -> int:
             memory=app.config.extensions.bindings.get("memory", "memory.none"),
             show_banner=app.config.ui.show_banner,
         )
+        if use_tui:
+            try:
+                from corax_tui import run_tui
+            except ImportError:
+                print(
+                    "corax-tui is not installed; falling back to simple chat."
+                )
+            else:
+                return await run_tui(chat)
         return await chat.run()
 
 

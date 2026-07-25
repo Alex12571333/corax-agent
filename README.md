@@ -2,9 +2,9 @@
 
 ![Corax Agent — modular local-first agent runtime](docs/assets/corax-agent-hero.png)
 
-Corax is a local-first agent runtime with an interactive terminal, typed
-extensions, persistent sessions, optional long-term memory, Telegram access,
-and a policy-enforced execution kernel.
+Corax is a local-first agent runtime with a full-screen terminal interface,
+typed extensions, persistent sessions, optional long-term memory, Telegram
+access, and a policy-enforced execution kernel.
 
 The project is intentionally split across small repositories. `agent-core`
 remains the universal execution kernel; Corax composes it with tools, model and
@@ -54,10 +54,12 @@ runtime directory unless the paths are changed in the configuration.
 
 ## First run
 
-Start the local console:
+Start the full-screen terminal interface:
 
 ```bash
 ~/.corax/bin/corax
+# The explicit form is equivalent:
+~/.corax/bin/corax tui
 ```
 
 On a new installation Corax launches a guided terminal setup before opening
@@ -74,13 +76,22 @@ Run `corax setup` again at any time. Existing values are offered as defaults.
 Secrets are read from environment variables and are never written to
 `corax.yaml`.
 
-Inside console chat, use:
+Use `corax chat` when a simple line-oriented console is preferable, for
+example in a minimal terminal or while diagnosing display compatibility.
+
+Inside terminal chat, use:
 
 ```text
 /help
 /new
 /status
+/approve
+/deny
 /security status
+/security mode ask
+/security mode auto
+/security mode full
+/security mode full <challenge>
 /security approve <task-id>
 /security deny <task-id>
 /memory status
@@ -89,14 +100,36 @@ Inside console chat, use:
 /exit
 ```
 
+`/approve` and `/deny` resolve the current pending tool request without asking
+you to copy its task ID. The explicit `/security approve <task-id>` and
+`/security deny <task-id>` forms remain available.
+
 ## Interface
 
-The console uses the shared
+`corax` opens the full-screen
+[`corax-tui`](https://github.com/Alex12571333/corax-tui) by default. It keeps
+the transcript scrollable while model output arrives, separates real-time
+thinking from the answer, and lets you collapse thinking with `Ctrl-T`.
+Typing `/` opens command suggestions with descriptions. The fixed status bar
+shows the active model, context use, security mode, memory provider, and
+session. Before the first turn it shows an explicit token estimate; during
+generation it switches to the context manager's exact character budget rather
+than pretending that estimated characters are exact provider tokens.
+
+Every model-selected tool is visible. The TUI and classic console show the
+tool name, safe argument summary, approval state, and completion or failure;
+Telegram sends the same start, approval, and outcome activity as separate
+messages. Raw tool payloads and secret-like arguments are not rendered.
+
+`corax chat` uses the same streaming chat loop and event contract in a
+line-oriented renderer. It preserves real-time thinking, answers, approval
+resume, and tool visibility without taking over the terminal screen.
+
+Both terminal surfaces use the shared
 [`corax-ui`](https://github.com/Alex12571333/corax-ui) visual contract: a
-palette designed for near-black terminals, cyan and ultraviolet holographic
-light, thin technical borders, compact status labels, and the Corax raven. The
-terminal renderer is static and dependency-free, so startup remains fast and
-output remains useful in logs and pipes.
+palette designed for near-black terminals, cyan-to-white-to-ultraviolet
+holographic light, thin technical borders, compact status labels, and the
+Corax raven.
 
 `corax-ui` is a host library, not an Agent Core extension or a model-callable
 tool. Its platform-neutral `tokens.json` is the source of truth for color,
@@ -119,7 +152,8 @@ Meaning is always repeated in text or symbols; color is never the only signal.
 
 | Command | Purpose |
 | --- | --- |
-| `corax` or `corax chat` | Open the interactive local console. |
+| `corax` or `corax tui` | Open the full-screen terminal interface. |
+| `corax chat` | Open the line-oriented streaming console fallback. |
 | `corax setup` | Run the guided setup wizard. |
 | `corax settings` | Open the advanced terminal settings menu. |
 | `corax gateway` | Run the Telegram gateway. |
@@ -153,10 +187,18 @@ The default mode is `ask`.
 Entering `full` is deliberately a two-step operation:
 
 ```bash
+corax security mode ask
+corax security mode auto
+
+# Request full mode; Corax prints a short challenge.
 corax security mode full
-# Corax returns a short challenge.
+# Repeat the command with that exact challenge.
 corax security mode full <challenge>
 ```
+
+The same grammar is available inside terminal chat with a leading slash:
+`/security mode ask`, `/security mode auto`, and the two-step
+`/security mode full` sequence.
 
 `full` does not disable blocked capabilities, administrator deny lists,
 workspace confinement, shell validation, network restrictions, or the OS
@@ -276,6 +318,7 @@ Host and operator surfaces:
 | --- | --- |
 | [`corax-agent`](https://github.com/Alex12571333/corax-agent) | Composition host, lifecycle, configuration, CLI, and runtime bindings. |
 | [`corax-console`](https://github.com/Alex12571333/corax-console) | First-run wizard and interactive terminal chat. |
+| [`corax-tui`](https://github.com/Alex12571333/corax-tui) | Full-screen terminal host: streaming transcript, thinking, tool activity, approvals, context bar, and slash completion. |
 | [`corax-ui`](https://github.com/Alex12571333/corax-ui) | Shared design tokens and dependency-free terminal renderer; not a runtime extension. |
 | [`corax-gateway-capability`](https://github.com/Alex12571333/corax-gateway-capability) | Channel-neutral sessions and gateway policy. |
 | [`corax-distribution`](https://github.com/Alex12571333/corax-distribution) | Immutable release lock and isolated source-composition installer. |

@@ -283,6 +283,63 @@ class TestRuntime(unittest.TestCase):
         self.assertEqual(compacted[0]["content"], "safety")
         self.assertEqual(compacted[-1]["content"], "current")
 
+    def test_stream_reports_exact_host_context_budget(self) -> None:
+        from agent_core import ExtensionKind
+
+        class ContextManager:
+            id = "context.manager"
+            kind = ExtensionKind.RUNTIME_SERVICE
+            max_chars = 48_000
+
+            async def handle(self, request):
+                return type(
+                    "Result",
+                    (),
+                    {
+                        "is_success": True,
+                        "payload": {
+                            "messages": list(request.payload["messages"]),
+                            "chars_after": 137,
+                        },
+                    },
+                )()
+
+        class StreamingModel:
+            id = "stream.test"
+            kind = ExtensionKind.MODEL_PROVIDER
+
+            async def stream_generate_events(self, request):
+                yield {"type": "delta", "content": "ok"}
+                yield {"type": "done"}
+
+        self.runtime.services.register("context.manager", ContextManager())
+        self.runtime.models.register("stream.test", StreamingModel())
+
+        async def collect() -> list[dict]:
+            return [
+                event
+                async for event in self.runtime.stream_extension(
+                    "stream.test",
+                    {"messages": [{"role": "user", "content": "hello"}]},
+                    session_id="context-stream",
+                )
+            ]
+
+        events = asyncio.run(collect())
+        self.assertEqual(
+            events,
+            [
+                {
+                    "type": "context",
+                    "used": 137,
+                    "limit": 48_000,
+                    "unit": "chars",
+                },
+                {"type": "delta", "content": "ok"},
+                {"type": "done"},
+            ],
+        )
+
     def test_skills_runtime_augments_only_matching_turn(self) -> None:
         import os
         import tempfile
