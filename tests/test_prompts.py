@@ -6,7 +6,7 @@ import tempfile
 from pathlib import Path
 import unittest
 
-from main import _chat_system_prompt, _resolve_command, build_parser
+from main import _chat_system_prompt, _needs_setup, _resolve_command, build_parser
 
 
 class ChatPromptTests(unittest.TestCase):
@@ -54,6 +54,13 @@ class CliCommandTests(unittest.TestCase):
     def test_menu_alias_is_advanced_settings(self) -> None:
         args = build_parser().parse_args(["menu"])
         self.assertEqual(_resolve_command(args), "settings")
+
+    def test_first_run_gates_interactive_entrypoints_only(self) -> None:
+        self.assertTrue(_needs_setup("chat", True))
+        self.assertTrue(_needs_setup("gateway", True))
+        self.assertTrue(_needs_setup("setup", False))
+        self.assertFalse(_needs_setup("doctor", True))
+        self.assertFalse(_needs_setup("status", True))
 
 
 if __name__ == "__main__":

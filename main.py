@@ -94,7 +94,7 @@ async def _run(args: argparse.Namespace) -> int:
     first_run = not config_path.exists()
     if not first_run:
         first_run = config_mod.load_config(config_path).agent.first_run
-    if first_run or command == "setup":
+    if _needs_setup(command, first_run):
         setup_result = await _run_setup_wizard(
             config_path,
             first_run=first_run,
@@ -246,6 +246,12 @@ def _resolve_command(args: argparse.Namespace) -> str:
     if args.command == "menu":
         return "settings"
     return args.command or "chat"
+
+
+def _needs_setup(command: str, first_run: bool) -> bool:
+    """Gate interactive entrypoints, while keeping diagnostics available."""
+
+    return command == "setup" or (first_run and command in {"chat", "gateway"})
 
 
 async def _run_doctor(app: "CoraxApp") -> int:
