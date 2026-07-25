@@ -1,7 +1,7 @@
 """agent-core execution-kernel seam.
 
 The mirror image of :mod:`corax.loader.capabilities`: where that loader pulls
-**capabilities** from standalone SDK packages, this one wires the **execution
+typed extensions from standalone SDK packages, this one wires the **execution
 kernel** from ``agent-core``. ``agent-core`` is imported **lazily**, so the
 scaffold (menu, config, built-ins) runs on a pure-stdlib install — the kernel
 is simply unavailable, and the runtime degrades gracefully.
@@ -9,7 +9,7 @@ is simply unavailable, and the runtime degrades gracefully.
 `CoreEngine` is the seam the runtime owns. It does two things:
 
 * *introspect* — report whether ``agent-core`` is installed and which of the
-  runtime's loaded capabilities are real ``agent_core.Capability`` instances
+  runtime's loaded tools are real ``agent_core.ToolCapability`` instances
   (the only ones the kernel can execute);
 * *run* — assemble a fresh, fully-wired kernel (registry, router, policy,
   session/state/task stores, event bus, tracer and the async ``Executor``),
@@ -34,11 +34,34 @@ class KernelInvocationError(RuntimeError):
     """A capability invoked through the kernel did not complete successfully."""
 
 
+class ConfirmationRequired(KernelInvocationError):
+    """A kernel task is parked until an operator approves or denies it."""
+
+    def __init__(self, task_id: str, capability_id: str) -> None:
+        self.task_id = task_id
+        self.capability_id = capability_id
+        super().__init__(
+            f"confirmation required for {capability_id!r}; "
+            f"use /security approve {task_id} or /security deny {task_id}"
+        )
+
+
 _DECLARATION_ATTRS = (
-    "id", "name", "description", "version", "tags", "permission_level",
-    "required_scopes", "risk_level", "side_effects", "input_schema", "output_schema",
+    "id", "name", "description", "version", "kind", "interfaces", "tags",
+    "permission_level", "required_scopes", "risk_level", "side_effects",
+    "config_schema", "secrets", "input_schema", "output_schema",
 )
 _echo_wrapper_cache: dict[int, type] = {}
+
+
+class _ExtensionTraceWriter:
+    """Adapt a typed observability provider to agent-core's trace writer port."""
+
+    def __init__(self, provider: Any) -> None:
+        self._provider = provider
+
+    async def write(self, record: Any) -> None:
+        await self._provider.record(record)
 
 
 def _echo_wrapper_class(ac: Any) -> type:
@@ -156,9 +179,14 @@ class RunningCore:
         return task.task_id
 
     async def wait(self, task_id: str, *, timeout: float = 5.0, poll: float = 0.02) -> Any:
-        """Block until ``task_id`` reaches a terminal status; return the Task."""
+        """Wait until a task settles or parks for operator confirmation."""
         TaskStatus = self._ac.TaskStatus
-        terminal = {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
+        terminal = {
+            TaskStatus.COMPLETED,
+            TaskStatus.FAILED,
+            TaskStatus.CANCELLED,
+            TaskStatus.WAITING_CONFIRMATION,
+        }
         loop = asyncio.get_event_loop()
         deadline = loop.time() + timeout
         while loop.time() < deadline:
@@ -167,6 +195,44 @@ class RunningCore:
                 return task
             await asyncio.sleep(poll)
         raise TimeoutError(f"task {task_id} did not settle within {timeout}s")
+
+    async def resolve_confirmation(
+        self,
+        task_id: str,
+        *,
+        approved: bool,
+        actor: str = "operator",
+        reason: str = "",
+        wait_timeout: float = 60.0,
+    ) -> dict[str, Any]:
+        """Resolve a parked task and, when approved, return its final payload."""
+
+        task = await self.executor.resolve_confirmation(
+            task_id,
+            approved=approved,
+            actor=actor,
+            reason=reason,
+        )
+        if not approved:
+            return {
+                "ok": True,
+                "task_id": task_id,
+                "status": task.status.value,
+                "message": f"task {task_id} denied",
+            }
+        task = await self.wait(task_id, timeout=wait_timeout)
+        state_key = task.input.get("state_key")
+        payload: Any = None
+        if isinstance(state_key, str) and state_key and self.state_manager is not None:
+            state = await self.state_manager.get_state(task.session_id)
+            payload = state.temporary_context.get(state_key)
+        return {
+            "ok": task.status is self._ac.TaskStatus.COMPLETED,
+            "task_id": task_id,
+            "status": task.status.value,
+            "result": payload,
+            "message": f"task {task_id} ended {task.status.value}",
+        }
 
     async def run_task(self, *, wait_timeout: float = 5.0, **submit_kwargs: Any) -> Any:
         """``submit_task`` + ``wait`` in one call; returns the final Task."""
@@ -210,6 +276,8 @@ class RunningCore:
             state = await self.state_manager.get_state(sid)
             echoed = state.temporary_context.get(state_key)
 
+        if task.status is self._ac.TaskStatus.WAITING_CONFIRMATION:
+            raise ConfirmationRequired(task.task_id, capability_id)
         if task.status is not self._ac.TaskStatus.COMPLETED:
             detail = ""
             if isinstance(echoed, dict) and echoed.get("_error"):
@@ -270,8 +338,8 @@ class CoreEngine:
         return self.probe()
 
     def is_executable(self, item: Any) -> bool:
-        """True if ``item`` is a real ``agent_core.Capability`` the kernel can run."""
-        return self.probe() and isinstance(item, self._ac.Capability)
+        """True only for an LLM-callable ``agent_core.ToolCapability``."""
+        return self.probe() and isinstance(item, self._ac.ToolCapability)
 
     def executable_ids(self, capabilities: Any) -> list[str]:
         """Ids in ``capabilities`` that the kernel can actually execute."""
@@ -286,12 +354,13 @@ class CoreEngine:
         capabilities: Iterable[Any] = (),
         *,
         policy: Any | None = None,
+        observability: Any | None = None,
     ) -> AsyncIterator[RunningCore]:
         """Build, start, yield and tear down a fresh kernel in the current loop.
 
-        Only the real ``agent_core.Capability`` instances among ``capabilities``
-        are registered; everything else (e.g. the built-in echo placeholder) is
-        skipped. A custom ``policy`` (any ``agent_core.PolicyEngine``) may be
+        Only real ``agent_core.ToolCapability`` instances among ``capabilities``
+        are registered; every runtime-only extension is skipped. A custom
+        ``policy`` (any ``agent_core.PolicyEngine``) may be
         injected; otherwise the conservative ``DefaultPolicyEngine`` is used.
         """
         if not self.probe():
@@ -304,6 +373,8 @@ class CoreEngine:
         task_store = ac.InMemoryTaskStore()
         bus = ac.InMemoryEventBus()
         trace = ac.TraceManager()
+        if observability is not None and hasattr(observability, "record"):
+            await trace.add_writer(_ExtensionTraceWriter(observability))
         policy = policy if policy is not None else ac.DefaultPolicyEngine()
         router = ac.Router(registry)
         executor = ac.Executor(
@@ -322,7 +393,7 @@ class CoreEngine:
         streamers: dict[str, Any] = {}
         echo_cls = _echo_wrapper_class(ac)
         for cap_id, item in _as_pairs(capabilities):
-            if not isinstance(item, ac.Capability):
+            if not isinstance(item, ac.ToolCapability):
                 continue
             try:
                 # Register a wrapper that auto-echoes the result to session state,

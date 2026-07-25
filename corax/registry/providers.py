@@ -8,11 +8,11 @@ later without touching the runtime.
 
 from __future__ import annotations
 
-from . import Registry
+from agent_core import ExtensionKind
+
+from .extensions import TypedExtensionRegistry
 
 
-class ProviderRegistry(Registry):
-    kind = "provider"
-
+class ProviderRegistry(TypedExtensionRegistry):
     def __init__(self) -> None:
-        super().__init__("ProviderRegistry")
+        super().__init__(ExtensionKind.MODEL_PROVIDER)

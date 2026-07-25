@@ -1,100 +1,110 @@
 # Extending Corax
 
-Every future module plugs into an existing seam. You should never need to
-restructure the package to add one.
+Corax uses typed extension packages. Choose the runtime role first; do not put
+every callable component into the tool registry.
 
-## The extension points
+## Choose the kind
 
-1. **config** — declare the provider/capability in `corax.yaml`.
-2. **role folder** — drop your class next to the built-in (`corax/planner/`,
-   `corax/connectors/`, `corax/memory/`, `corax/capabilities/`).
-3. **factory table** — map the config id to your class in `corax/runtime.py`.
-4. **(optionally) settings** — extra fields are read via `get_setting`.
+| What the package does | `kind` | Core contract |
+| --- | --- | --- |
+| The LLM may directly choose it | `tool` | `ToolCapability.execute` |
+| Receives or sends channel messages | `channel_connector` | `ChannelConnector.receive/send` |
+| Calls or hosts a model | `model_provider` | `ModelProvider.generate` |
+| Stores or recalls long-lived memory | `memory_provider` | `MemoryProvider.remember/recall/forget` |
+| Makes authorization decisions | `policy_provider` | `PolicyProvider.evaluate` |
+| Runs internal orchestration | `runtime_service` | `RuntimeService.handle` |
+| Implements persistence, telemetry or translation | `storage_provider`, `observability`, `adapter` | the matching typed contract |
 
-## Recipe: add a real planner
+Only `tool` packages use `exposure: agent` and appear in the LLM tool list.
+Every other kind uses `exposure: runtime` and is resolved by its role or a
+named binding. Security is a cross-cutting policy checkpoint, not a connector.
 
-Say you want an `OpenAIPlanner`.
+## Package contract
 
-### 1. Implement it
+Every external package contains:
 
-Create `corax/planner/openai.py` next to `stub.py`, with the same shape the
-runtime expects of a planner (an `async plan(...)`, `async health()`, an `id`):
-
-```python
-from ..health import Health
-
-
-class OpenAIPlanner:
-    id = "planner.openai"
-    kind = "planner"
-
-    def __init__(self, **opts): ...
-    async def plan(self, goal, *, correlation_id=None): ...
-    async def health(self) -> Health: ...
+```text
+my-extension/
+  extension.json
+  main.py
+  README.md
+  pyproject.toml
+  tests/
 ```
 
-> Keep secrets out of the repo — read them from env at construction.
+Use the matching SDK decorator (`@tool`, `@channel_connector`,
+`@model_provider`, `@memory_provider`, `@policy_provider`, `@runtime_service`
+or `@adapter`) and
+the matching Agent Core base class. The manifest and class must agree on:
 
-### 2. Register it in the factory table
+- stable `id`, `kind`, `interfaces` and entrypoint;
+- permissions, scopes, risk, side effects and secret names;
+- config, request and response schemas;
+- Core/SDK compatibility.
 
-In `corax/runtime.py`:
+`capability.json`, `@capability` and `Capability` are migration-only APIs.
 
-```python
-from .planner.openai import OpenAIPlanner
+## Add a package to Corax
 
-_PLANNER_FACTORIES = {
-    "stub": StubPlanner,
-    "openai": OpenAIPlanner,   # <-- new id
-}
-```
-
-### 3. Declare it in config
+Declare it in `extensions.available` and activate it under the matching kind:
 
 ```yaml
-planner:
-  active: openai
-  providers:
-    stub:   { enabled: true,  type: planner, description: "..." }
-    openai: { enabled: true,  type: planner, description: "OpenAI planner" }
+extensions:
+  active:
+    tool: [echo, filesystem, editor, shell, web.search]
+    channel_connector: [terminal, telegram.connector]
+    model_provider: [stub, llm.local]
+    memory_provider: [memory.none]
+    policy_provider: [security.policy]
+    runtime_service: [gateway]
+  bindings:
+    primary_model: llm.local
+    planner: stub
+    memory: memory.none
+    policy: security.policy
+  available:
+    web.search:
+      kind: tool
+      path: ../corax-web-search-capability
+      enabled: true
 ```
 
-That's it. `runtime.start()` will build and register it; the menu will list
-and toggle it.
+`ExtensionLoader` reads `extension.json`, validates compatibility, loads the
+entrypoint, and verifies that the instance implements the declared role.
+`ExtensionCatalog` then registers it in the corresponding role registry.
 
-## Where each future module lands
+## Runtime use
 
-| Module                | Role folder           | Config section | Registry                    |
-|-----------------------|-----------------------|----------------|-----------------------------|
-| `OpenAIPlanner`       | `corax/planner/`      | `planner`      | `ProviderRegistry`          |
-| `TelegramConnector`   | `corax/connectors/`   | `connectors`   | `ConnectorRegistry`         |
-| `SQLiteMemory`        | `corax/memory/`       | `memory`       | `MemoryRegistry`            |
-| `FilesystemCapability`| SDK package + `loader`| `capabilities` | `CapabilityRegistryAdapter` |
-| `MCPAdapter`          | SDK package + `loader`| `capabilities` | `CapabilityRegistryAdapter` |
+Tools run through the Agent Core policy/execution kernel:
 
-## Capabilities: in-tree vs. packages
+```python
+task = await runtime.execute(
+    "filesystem",
+    input={"operation": "read", "path": "notes.txt"},
+)
+```
 
-- Small, dependency-free tools (like `echo`) live in `corax/capabilities/` and
-  go in the `_CAPABILITY_FACTORIES` table.
-- Richer tools ship as standalone **SDK packages** with a root
-  `capability.json`. Add the path to `capabilities.available.<id>.path` in
-  config; `corax/loader/capabilities.py` loads and validates them. No factory
-  entry needed.
+Infrastructure is invoked directly through its typed runtime contract:
 
-Because SDK packages are real `agent_core.Capability` instances, they can be
-executed through the **agent-core kernel**: `corax/loader/core.py` (`CoreEngine`)
-assembles the executor on demand and `runtime.execute("<capability id>",
-input={...})` routes one task through route → policy → execute. The built-in
-`echo` placeholder is *not* an `agent_core.Capability`, so the kernel skips it.
+```python
+reply = await runtime.invoke_extension(
+    "llm.local",
+    {"prompt": "Summarize the result."},
+)
+```
 
-## Guardrails for file / shell capabilities
+The gateway uses the same dispatcher, but only the tool registry is converted
+to model-facing tool specifications.
 
-Before touching the filesystem, call `paths.is_blocked_path(config, target,
-base)` and honour `security.allow_file_write` / `security.allow_shell`. Never
-write under `security.blocked_paths` — that list includes `corax-core` and
-`corax-sdk`, which must stay untouched.
+## Definition of done
 
-## Do **not** in this stage
+- The kind describes the actual role, not merely “has callable methods”.
+- The manifest passes `agent-sdk extension validate .`.
+- Discovery works without importing package code.
+- Loader tests prove the class/manifest role match.
+- Lifecycle and health checks are covered.
+- Local resource validation and structured error handling are covered.
+- Secrets are injected by name and never stored in manifests or results.
+- The README documents configuration, security, operations and non-goals.
 
-Implement Telegram, OpenAI, MCP or persistent memory; or modify `corax-core` /
-`corax-sdk`. This stage is the scaffold plus the workspace-confined filesystem,
-editor and shell capability packages.
+See the Agent SDK extension specification for the complete manifest format.

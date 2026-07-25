@@ -68,12 +68,17 @@ class FakeBackend:
         self.gateway_calls: list[dict] = []
         self.fail_capability: str | None = None
         self.fail_operation: str | None = None
+        self.confirm_capability: str | None = None
 
     async def run_capability(self, cap_id, payload, *, session_id=None):
         op = payload.get("operation")
         self.calls.append((cap_id, op, payload))
         if cap_id == self.fail_capability or (self.fail_operation is not None and op == self.fail_operation):
             raise GatewayError("boom")
+        if cap_id == self.confirm_capability:
+            error = GatewayError("confirmation required")
+            error.task_id = "task-confirm-1"
+            raise error
         if cap_id == "gateway":
             self.gateway_calls.append(payload)
             if op == "prepare_turn":
@@ -321,6 +326,35 @@ class ToolSpecTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ChatToolLoopTests(unittest.IsolatedAsyncioTestCase):
+    async def test_confirmation_is_not_treated_as_recoverable_tool_failure(self) -> None:
+        backend = FakeBackend(
+            poll_batches=[[_text_update(5, "delete file")]],
+            llm_responses=[
+                {
+                    "tool_calls": [
+                        _tool_call(
+                            "filesystem",
+                            '{"operation": "delete", "path": "notes.txt"}',
+                        )
+                    ]
+                },
+                {"text": "Please approve the pending action."},
+            ],
+        )
+        backend.confirm_capability = "filesystem"
+        await _gateway(backend).run(max_iterations=1)
+        generate_calls = [
+            payload
+            for cap_id, operation, payload in backend.calls
+            if cap_id == "llm.local" and operation == "generate"
+        ]
+        self.assertEqual(len(generate_calls), 2)
+        tool_message = _last_tool_message(generate_calls[1]["messages"])
+        self.assertIn("/security approve task-confirm-1", tool_message["content"])
+        self.assertTrue(
+            any("Please approve" in message for message in backend.sends)
+        )
+
     async def test_plain_answer_no_tools(self) -> None:
         backend = FakeBackend(poll_batches=[[_text_update(5, "hi")]],
                               llm_responses=[{"text": "hello there"}])
@@ -764,6 +798,60 @@ class ChatToolLoopTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("Алекс, русский, проект Corax", profile_text)
 
+    async def test_memory_loop_context_is_injected_before_user_message(self) -> None:
+        backend = FakeBackend(
+            poll_batches=[[_text_update(5, "как меня зовут?")]],
+            llm_responses=[{"text": "Алекс."}],
+        )
+        recalls = []
+
+        async def before(text, *, session_id, scope):
+            recalls.append((text, session_id, scope))
+            return {
+                "context": (
+                    '<memory_context trust="untrusted-data">\n'
+                    "- Меня зовут Алекс\n"
+                    "</memory_context>"
+                )
+            }
+
+        gateway = _gateway(backend, memory_before_turn=before)
+        await gateway.run(max_iterations=1)
+
+        messages = [
+            payload
+            for _cap, operation, payload in backend.calls
+            if operation == "generate"
+        ][0]["messages"]
+        memory_index = next(
+            index
+            for index, message in enumerate(messages)
+            if "memory_context" in str(message.get("content"))
+        )
+        user_index = next(
+            index
+            for index, message in enumerate(messages)
+            if message.get("role") == "user"
+        )
+        self.assertLess(memory_index, user_index)
+        self.assertEqual(recalls[0][2]["channel"], "telegram")
+
+    async def test_memory_loop_retains_after_completed_turn(self) -> None:
+        backend = FakeBackend(
+            poll_batches=[[_text_update(5, "Запомни, меня зовут Алекс")]],
+            llm_responses=[{"text": "Запомнил."}],
+        )
+        writes = []
+
+        async def after(user_text, assistant_text, *, session_id, scope):
+            writes.append((user_text, assistant_text, session_id, scope))
+            return {"stored": True}
+
+        await _gateway(backend, memory_after_turn=after).run(max_iterations=1)
+        self.assertEqual(writes[0][0], "Запомни, меня зовут Алекс")
+        self.assertEqual(writes[0][1], "Запомнил.")
+        self.assertEqual(writes[0][3]["channel"], "telegram")
+
     async def test_new_session_starts_empty_history(self) -> None:
         backend = FakeBackend(
             poll_batches=[
@@ -972,6 +1060,29 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         await _gateway(backend, model="gemma-4").run(max_iterations=1)
         self.assertTrue(any("Corax status" in s and "gemma-4" in s for s in backend.sends))
 
+    async def test_security_command_uses_chat_as_actor(self) -> None:
+        backend = FakeBackend(
+            poll_batches=[[_cmd_update(5, "security", args="mode auto")]]
+        )
+        calls: list[tuple[str, str, str]] = []
+
+        async def security(command, *, actor, transport):
+            calls.append((command, actor, transport))
+            return {"ok": True, "mode": "auto", "message": "security mode: auto"}
+
+        await _gateway(backend, security_command=security).run(max_iterations=1)
+        self.assertEqual(calls, [("mode auto", "5", "telegram")])
+        self.assertIn("security mode: auto", backend.sends)
+
+    async def test_security_command_is_explicitly_unavailable_without_provider(self) -> None:
+        backend = FakeBackend(
+            poll_batches=[[_cmd_update(5, "security", args="status")]]
+        )
+        await _gateway(backend).run(max_iterations=1)
+        self.assertTrue(
+            any("unavailable" in message.lower() for message in backend.sends)
+        )
+
     async def test_bot_menu_is_synced_on_start(self) -> None:
         backend = FakeBackend(poll_batches=[[]])
         await _gateway(backend).run(max_iterations=1)
@@ -1105,9 +1216,8 @@ class GatewayPolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse((await policy.evaluate(None, None, ctx(PermissionLevel.BLOCKED))).allowed)
 
 
-class CoreRoundTripTests(unittest.IsolatedAsyncioTestCase):
-    """Run a capability through the real kernel under the gateway policy and read
-    its output back from core session state."""
+class HostRoleRoundTripTests(unittest.IsolatedAsyncioTestCase):
+    """Infrastructure crosses host role ports and never enters the tool kernel."""
 
     async def asyncSetUp(self) -> None:
         if not HAS_CORE:
@@ -1120,51 +1230,52 @@ class CoreRoundTripTests(unittest.IsolatedAsyncioTestCase):
         from corax.runtime import CoraxRuntime
 
         config = cfg.default_config()
-        config.capabilities.available["telegram.connector"].path = str(TELEGRAM_REPO)
-        config.capabilities.available["llm.local"].path = str(LLM_REPO)
+        config.extensions.available["telegram.connector"].path = str(TELEGRAM_REPO)
+        config.extensions.available["llm.local"].path = str(LLM_REPO)
         self.runtime = CoraxRuntime(config, root_path=REPO_ROOT)
         await self.runtime.start()
 
     async def asyncTearDown(self) -> None:
         await self.runtime.stop()
 
-    async def test_invoke_routes_through_core_and_returns_payload(self) -> None:
-        async with self.runtime.core.session(
-            self.runtime.capabilities, policy=GatewayPolicyEngine()
-        ) as kernel:
-            output = await kernel.invoke(
-                "telegram.connector",
-                {"operation": "poll", "mock": True,
-                 "mock_updates": [{"update_id": 1, "message": {"text": "/new", "chat": {"id": 7}}}]},
-                wait_timeout=10,
-            )
+    async def test_channel_invokes_through_host_port(self) -> None:
+        output = await self.runtime.invoke_extension(
+            "telegram.connector",
+            {
+                "operation": "poll",
+                "mock": True,
+                "mock_updates": [
+                    {
+                        "update_id": 1,
+                        "message": {"text": "/new", "chat": {"id": 7}},
+                    }
+                ],
+            },
+        )
         self.assertEqual(output["count"], 1)
         self.assertEqual(output["updates"][0]["command"]["command"], "new_session")
+        self.assertFalse(self.runtime.tools.has("telegram.connector"))
 
-    async def test_invoke_raises_with_reason_on_failure(self) -> None:
-        from corax.loader.core import KernelInvocationError
-
-        async with self.runtime.core.session(
-            self.runtime.capabilities, policy=GatewayPolicyEngine()
-        ) as kernel:
-            with self.assertRaises(KernelInvocationError) as ctx:
-                await kernel.invoke("telegram.connector", {"operation": "nope"}, wait_timeout=10)
+    async def test_host_port_raises_with_reason_on_failure(self) -> None:
+        with self.assertRaises(RuntimeError) as ctx:
+            await self.runtime.invoke_extension(
+                "telegram.connector",
+                {"operation": "nope"},
+            )
         self.assertIn("unsupported operation", str(ctx.exception))
 
-    async def test_stream_generate_events_routes_from_kernel_session(self) -> None:
-        async with self.runtime.core.session(
-            self.runtime.capabilities, policy=GatewayPolicyEngine()
-        ) as kernel:
-            events = [
-                event
-                async for event in kernel.stream_generate_events(
-                    "llm.local",
-                    {"prompt": "hi", "mock_response": "hello"},
-                    session_id="stream-test",
-                )
-            ]
+    async def test_stream_generate_events_routes_from_model_provider(self) -> None:
+        events = [
+            event
+            async for event in self.runtime.stream_extension(
+                "llm.local",
+                {"prompt": "hi", "mock_response": "hello"},
+                session_id="stream-test",
+            )
+        ]
         self.assertEqual(events[0], {"type": "delta", "content": "hello"})
         self.assertEqual(events[-1]["type"], "done")
+        self.assertFalse(self.runtime.tools.has("llm.local"))
 
 
 class EchoWrapperTests(unittest.IsolatedAsyncioTestCase):

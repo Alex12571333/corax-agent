@@ -11,78 +11,180 @@ runtime:
   data_path: ./data
   logs_path: ./logs
 
-planner:
-  active: stub
-  providers:
-    stub:
-      enabled: true
-      type: planner
-      description: "Local stub planner for scaffold testing"
-
-memory:
-  active: none
-  providers:
-    none:
-      enabled: true
-      type: memory
-      description: "No persistent memory yet"
-
-connectors:
+extensions:
   active:
-    - terminal
-  providers:
-    terminal:
-      enabled: true
-      type: connector
-      description: "Terminal connector placeholder"
-
-capabilities:
-  enabled:
-    - echo
-    - filesystem
-    - editor
-    - shell
-    - llm.local
-    - telegram.connector
-    - web.search
+    tool:
+      - echo
+      - filesystem
+      - editor
+      - shell
+      - web.search
+    channel_connector:
+      - console.connector
+      - telegram.connector
+    model_provider:
+      - stub
+      - llm.local
+      - model.router
+    memory_provider:
+      - memory.none
+    policy_provider:
+      - security.policy
+    runtime_service:
+      - gateway
+      - memory.loop
+      - context.manager
+      - mcp.manager
+      - skills.runtime
+      - hooks.runtime
+      - subagents.orchestrator
+      - sandbox.executor
+    storage_provider:
+      - state.file
+    observability:
+      - observability.jsonl
+  bindings:
+    planner: stub
+    primary_model: model.router
+    model_router: model.router
+    memory: memory.none
+    memory_loop: memory.loop
+    policy: security.policy
+    state: state.file
+    context: context.manager
+    mcp: mcp.manager
+    skills: skills.runtime
+    hooks: hooks.runtime
+    subagents: subagents.orchestrator
+    sandbox: sandbox.executor
+    observability: observability.jsonl
   available:
+    stub:
+      kind: model_provider
+      enabled: true
+      description: "Built-in deterministic planner"
+    memory.none:
+      kind: memory_provider
+      enabled: true
+      description: "Built-in no-op memory provider"
+    memory.uam:
+      kind: memory_provider
+      enabled: false
+      description: "Universal Agent Memory provider"
+      path: ../universal-agent-memory/agent-integrations/corax
+    memory.mnemonic-vault:
+      kind: memory_provider
+      enabled: false
+      description: "Mnemonic Vault file-first memory provider"
+      path: ../mnemonic-vault/integrations/corax
+    memory.loop:
+      kind: runtime_service
+      enabled: true
+      description: "Bounded recall and privacy-aware retention loop"
+      path: ../corax-memory-loop
+    context.manager:
+      kind: runtime_service
+      enabled: true
+      description: "Deterministic bounded context compaction"
+      path: ../corax-context-manager
+    mcp.manager:
+      kind: runtime_service
+      enabled: true
+      description: "Official-SDK MCP client and tool bridge"
+      path: ../corax-mcp-manager
+    skills.runtime:
+      kind: runtime_service
+      enabled: true
+      description: "Portable progressive Agent Skills loader"
+      path: ../corax-skills-runtime
+    hooks.runtime:
+      kind: runtime_service
+      enabled: true
+      description: "Consent-gated subprocess lifecycle hooks"
+      path: ../corax-hooks-runtime
+    subagents.orchestrator:
+      kind: runtime_service
+      enabled: true
+      description: "Bounded parallel leaf-subagent delegation"
+      path: ../corax-subagents
+    sandbox.executor:
+      kind: runtime_service
+      enabled: true
+      description: "Fail-closed Seatbelt or Docker shell backend"
+      path: ../corax-sandbox-executor
+    observability.jsonl:
+      kind: observability
+      enabled: true
+      description: "Privacy-first bounded JSONL execution traces"
+      path: ../corax-observability
+    state.file:
+      kind: storage_provider
+      enabled: true
+      description: "Atomic local JSON checkpoint storage"
+      path: ../corax-state-store
+    terminal:
+      kind: channel_connector
+      enabled: true
+      description: "Built-in terminal connector"
+    model.router:
+      kind: model_provider
+      enabled: true
+      description: "Provider-agnostic model routing and fallback"
+      path: ../corax-model-router
+    console.connector:
+      kind: channel_connector
+      enabled: true
+      description: "Interactive local console channel"
+      path: ../corax-console
     echo:
+      kind: tool
       enabled: true
-      type: tool
-      description: "Built-in echo capability"
+      description: "Built-in echo tool"
     filesystem:
+      kind: tool
       enabled: true
-      type: tool
-      description: "Workspace-confined filesystem capability"
+      description: "Workspace-confined filesystem tool"
       path: ../corax-filesystem-capability
     editor:
+      kind: tool
       enabled: true
-      type: tool
-      description: "Workspace-confined text editor capability"
+      description: "Workspace-confined text editor tool"
       path: ../corax-editor-capability
     shell:
+      kind: tool
       enabled: true
-      type: tool
-      description: "Guarded local shell command capability"
+      description: "Guarded local shell command tool"
       path: ../corax-shell-capability
-    llm.local:
-      enabled: true
-      type: connector
-      description: "Local Spark LLM connector (text + optional image/video)"
-      path: ../corax-llm-local-connector
-    telegram.connector:
-      enabled: true
-      type: connector
-      description: "Telegram chat connector (streaming, commands, HTML formatting)"
-      path: ../corax-telegram-connector
     web.search:
+      kind: tool
       enabled: true
-      type: tool
       description: "Web search via a self-hosted SearXNG instance"
       path: ../corax-web-search-capability
+    gateway:
+      kind: runtime_service
+      enabled: true
+      description: "Channel-neutral gateway/session service"
+      path: ../corax-gateway-capability
+    llm.local:
+      kind: model_provider
+      enabled: true
+      description: "Local Spark model provider (text + optional image/video)"
+      path: ../corax-llm-local-connector
+    telegram.connector:
+      kind: channel_connector
+      enabled: true
+      description: "Telegram chat connector (streaming, commands, HTML formatting)"
+      path: ../corax-telegram-connector
+    security.policy:
+      kind: policy_provider
+      enabled: true
+      description: "Three-mode authorization policy"
+      path: ../corax-security-policy
 
 security:
-  mode: normal
+  # ask = prompt for guarded work; auto = risk reviewer; full = policy-layer
+  # full access (hard denials and tool/OS boundaries remain).
+  mode: ask
   core_readonly: true
   allow_shell: false
   allow_file_write: false

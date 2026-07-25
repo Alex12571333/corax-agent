@@ -52,7 +52,8 @@ class TestProviders(unittest.TestCase):
 
     def test_disable_scalar_active_clears_active(self) -> None:
         settings.toggle_provider(self.config, "memory", "none", False)
-        self.assertEqual(self.config.memory.active, "none")  # memory resets to 'none'
+        self.assertEqual(self.config.memory.active, "")
+        self.assertEqual(self.config.extensions.bindings["memory"], "")
 
     def test_disable_list_active_removes_from_list(self) -> None:
         settings.toggle_provider(self.config, "connectors", "terminal", False)

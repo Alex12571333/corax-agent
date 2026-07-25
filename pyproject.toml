@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "corax-agent"
-version = "0.1.0"
-description = "Corax Agent — minimal agent scaffold (runtime, config, settings menu, extension points)."
+version = "0.2.0"
+description = "Corax Agent — typed extension runtime with strict tool and infrastructure boundaries."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
@@ -16,11 +16,24 @@ dependencies = [
     "agent-sdk @ git+https://github.com/Alex12571333/agent-sdk.git",
     "corax-capability-filesystem @ git+https://github.com/Alex12571333/corax-filesystem-capability.git",
     "corax-capability-editor @ git+https://github.com/Alex12571333/corax-editor-capability.git",
-    "corax-shell-capability @ git+https://github.com/Alex12571333/corax-shell-capability.git",
+    "corax-shell-capability @ git+https://github.com/Alex12571333/corax-shell-capability.git@05524a4336e7ea337b7058cd14e58115598c99af",
     "corax-plugin-tool-discovery @ git+https://github.com/Alex12571333/corax-plugin-tool-discovery.git",
-    "corax-llm-local-connector @ git+https://github.com/Alex12571333/corax-llm-local-connector.git",
-    "corax-telegram-connector @ git+https://github.com/Alex12571333/corax-telegram-connector.git",
-    "corax-web-search-capability @ git+https://github.com/Alex12571333/corax-web-search-capability.git",
+    "corax-llm-local-connector @ git+https://github.com/Alex12571333/corax-llm-local-connector.git@d0757c37f1bd386d60fdbbfb5aeec48a26a495b9",
+    "corax-telegram-connector @ git+https://github.com/Alex12571333/corax-telegram-connector.git@da4c08ed871c3bc0461118aa3945e2ad3990fa98",
+    "corax-web-search-capability @ git+https://github.com/Alex12571333/corax-web-search-capability.git@51d6aa46755ad98f4e7636c587490e70ba7d641d",
+    "corax-runtime-gateway @ git+https://github.com/Alex12571333/corax-gateway-capability.git@838c83e3cf1f86cb2376ada63a1b3c76f5ca6129",
+    "corax-security-policy @ git+https://github.com/Alex12571333/corax-security-policy.git",
+    "corax-memory-loop @ git+https://github.com/Alex12571333/corax-memory-loop.git",
+    "corax-console @ git+https://github.com/Alex12571333/corax-console.git",
+    "corax-state-store @ git+https://github.com/Alex12571333/corax-state-store.git",
+    "corax-context-manager @ git+https://github.com/Alex12571333/corax-context-manager.git",
+    "corax-mcp-manager @ git+https://github.com/Alex12571333/corax-mcp-manager.git",
+    "corax-skills-runtime @ git+https://github.com/Alex12571333/corax-skills-runtime.git",
+    "corax-hooks-runtime @ git+https://github.com/Alex12571333/corax-hooks-runtime.git",
+    "corax-subagents @ git+https://github.com/Alex12571333/corax-subagents.git",
+    "corax-sandbox-executor @ git+https://github.com/Alex12571333/corax-sandbox-executor.git",
+    "corax-model-router @ git+https://github.com/Alex12571333/corax-model-router.git",
+    "corax-observability @ git+https://github.com/Alex12571333/corax-observability.git",
 ]
 
 [project.optional-dependencies]
@@ -29,7 +42,11 @@ dependencies = [
 # recommended for full YAML fidelity.
 yaml = ["pyyaml>=6.0"]
 # Tooling for the test/coverage workflow.
-dev = ["pytest>=7.0", "pytest-cov>=4.0"]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "corax-evals @ git+https://github.com/Alex12571333/corax-evals.git",
+]
 
 [project.scripts]
 corax = "main:main"

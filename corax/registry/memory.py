@@ -7,11 +7,11 @@ here later.
 
 from __future__ import annotations
 
-from . import Registry
+from agent_core import ExtensionKind
+
+from .extensions import TypedExtensionRegistry
 
 
-class MemoryRegistry(Registry):
-    kind = "memory"
-
+class MemoryRegistry(TypedExtensionRegistry):
     def __init__(self) -> None:
-        super().__init__("MemoryRegistry")
+        super().__init__(ExtensionKind.MEMORY_PROVIDER)

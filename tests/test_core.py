@@ -19,7 +19,7 @@ except ImportError:  # pragma: no cover - exercised on stdlib-only installs
 
 from corax import config as cfg
 from corax.capabilities import EchoCapability
-from corax.loader import CoreEngine
+from corax.loader import ConfirmationRequired, CoreEngine
 from corax.runtime import CoraxRuntime
 
 
@@ -65,6 +65,47 @@ def _make_adder():
     return _Adder()
 
 
+def _make_confirmed_writer():
+    from agent_core import (
+        Capability,
+        CapabilityRequest,
+        HealthStatus,
+        PermissionLevel,
+        Result,
+        RiskLevel,
+        SideEffect,
+    )
+
+    class _Writer(Capability):
+        id = "writer"
+        name = "Writer"
+        description = "A test action requiring confirmation."
+        version = "1.0.0"
+        tags = {"write"}
+        permission_level = PermissionLevel.CONFIRM
+        required_scopes = {"file.write"}
+        risk_level = RiskLevel.MEDIUM
+        side_effects = {SideEffect.WRITE_FILE}
+        input_schema: dict = {}
+        output_schema: dict = {}
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def execute(self, request: CapabilityRequest) -> Result:
+            self.calls += 1
+            return Result.ok(
+                {"written": True},
+                session_id=request.session_id,
+                task_id=request.task_id,
+            )
+
+        async def health_check(self) -> HealthStatus:
+            return HealthStatus.HEALTHY
+
+    return _Writer()
+
+
 @unittest.skipUnless(HAS_AGENT_CORE, "agent-core not installed")
 class TestCoreEngine(unittest.TestCase):
     def setUp(self) -> None:
@@ -75,9 +116,9 @@ class TestCoreEngine(unittest.TestCase):
 
     def test_executable_ids_filters_non_core(self) -> None:
         pairs = [("adder", _make_adder()), ("echo", EchoCapability())]
-        # Only the real agent_core.Capability is executable; the built-in
-        # echo placeholder is not.
-        self.assertEqual(self.engine.executable_ids(pairs), ["adder"])
+        # Both are real tool contracts; runtime infrastructure is kept in
+        # separate registries before this boundary.
+        self.assertEqual(self.engine.executable_ids(pairs), ["adder", "echo"])
 
     def test_executes_task_through_kernel(self) -> None:
         from agent_core import TaskStatus
@@ -94,6 +135,54 @@ class TestCoreEngine(unittest.TestCase):
         task = asyncio.run(go())
         self.assertEqual(task.status, TaskStatus.COMPLETED)
         self.assertEqual(adder.calls, [5])
+
+    def test_session_forwards_core_traces_to_observability_provider(self) -> None:
+        adder = _make_adder()
+
+        class _Sink:
+            def __init__(self) -> None:
+                self.records = []
+
+            async def record(self, record) -> None:
+                self.records.append(record)
+
+        sink = _Sink()
+
+        async def go() -> None:
+            async with self.engine.session(
+                [("adder", adder)],
+                observability=sink,
+            ) as kernel:
+                await kernel.run_task(
+                    required_capability="adder",
+                    input={"a": 1, "b": 1},
+                )
+
+        asyncio.run(go())
+        stages = {
+            getattr(record.stage, "value", str(record.stage))
+            for record in sink.records
+        }
+        self.assertIn("capability_called", stages)
+        self.assertIn("capability_completed", stages)
+
+    def test_invoke_parks_and_resumes_after_confirmation(self) -> None:
+        writer = _make_confirmed_writer()
+
+        async def go():
+            async with self.engine.session([("writer", writer)]) as kernel:
+                with self.assertRaises(ConfirmationRequired) as raised:
+                    await kernel.invoke("writer", {"path": "notes.txt"})
+                return await kernel.resolve_confirmation(
+                    raised.exception.task_id,
+                    approved=True,
+                    actor="test",
+                )
+
+        result = asyncio.run(go())
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["result"], {"written": True})
+        self.assertEqual(writer.calls, 1)
 
     def test_session_unavailable_raises_when_core_absent(self) -> None:
         engine = CoreEngine(cfg.default_config())
@@ -139,7 +228,7 @@ class TestRuntimeCore(unittest.TestCase):
         snap = asyncio.run(go())
         self.assertTrue(snap.core_available)
         self.assertIn("core_available", snap.to_dict())
-        self.assertIn("core (kernel)", snap.render())
+        self.assertIn("core (tools)", snap.render())
 
 
 if __name__ == "__main__":

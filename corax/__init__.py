@@ -9,7 +9,7 @@ Nothing here talks to an LLM, Telegram, MCP, a shell or a real memory
 store. Those arrive in later stages through the registries.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __agent_name__ = "corax"
 
 __all__ = ["__version__", "__agent_name__"]

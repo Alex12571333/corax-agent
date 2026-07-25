@@ -30,21 +30,30 @@ class ChatPromptTests(unittest.TestCase):
 
 
 class CliCommandTests(unittest.TestCase):
-    def test_default_command_is_setup(self) -> None:
+    def test_default_command_is_console_chat(self) -> None:
         args = build_parser().parse_args([])
+        self.assertEqual(_resolve_command(args), "chat")
+
+    def test_explicit_setup_command(self) -> None:
+        args = build_parser().parse_args(["setup"])
         self.assertEqual(_resolve_command(args), "setup")
 
     def test_gateway_subcommand(self) -> None:
         args = build_parser().parse_args(["gateway"])
         self.assertEqual(_resolve_command(args), "gateway")
 
+    def test_security_subcommand_keeps_control_arguments(self) -> None:
+        args = build_parser().parse_args(["security", "mode", "auto"])
+        self.assertEqual(_resolve_command(args), "security")
+        self.assertEqual(args.command_args, ["mode", "auto"])
+
     def test_legacy_chat_flag_is_gateway(self) -> None:
         args = build_parser().parse_args(["--chat"])
         self.assertEqual(_resolve_command(args), "gateway")
 
-    def test_menu_alias_is_setup(self) -> None:
+    def test_menu_alias_is_advanced_settings(self) -> None:
         args = build_parser().parse_args(["menu"])
-        self.assertEqual(_resolve_command(args), "setup")
+        self.assertEqual(_resolve_command(args), "settings")
 
 
 if __name__ == "__main__":

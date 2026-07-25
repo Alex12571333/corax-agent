@@ -34,6 +34,18 @@ CAPABILITY_ROOTS = {
     "editor": REPO_ROOT.parent / "corax-editor-capability",
     "shell": REPO_ROOT.parent / "corax-shell-capability",
     "gateway": REPO_ROOT.parent / "corax-gateway-capability",
+    "security.policy": REPO_ROOT.parent / "corax-security-policy",
+    "memory.loop": REPO_ROOT.parent / "corax-memory-loop",
+    "console.connector": REPO_ROOT.parent / "corax-console",
+    "state.file": REPO_ROOT.parent / "corax-state-store",
+    "context.manager": REPO_ROOT.parent / "corax-context-manager",
+    "mcp.manager": REPO_ROOT.parent / "corax-mcp-manager",
+    "skills.runtime": REPO_ROOT.parent / "corax-skills-runtime",
+    "hooks.runtime": REPO_ROOT.parent / "corax-hooks-runtime",
+    "subagents.orchestrator": REPO_ROOT.parent / "corax-subagents",
+    "sandbox.executor": REPO_ROOT.parent / "corax-sandbox-executor",
+    "model.router": REPO_ROOT.parent / "corax-model-router",
+    "observability.jsonl": REPO_ROOT.parent / "corax-observability",
 }
 
 
@@ -49,23 +61,67 @@ class TestRuntime(unittest.TestCase):
         asyncio.run(self.runtime.start())
         self.assertTrue(self.runtime.running)
         self.assertIsInstance(self.runtime.providers.get("stub"), StubPlanner)
-        self.assertIsInstance(self.runtime.memory.get("none"), NullMemory)
-        self.assertIsInstance(self.runtime.connectors.get("terminal"), TerminalConnector)
+        self.assertIsInstance(self.runtime.memory.get("memory.none"), NullMemory)
+        if HAS_AGENT_SDK and CAPABILITY_ROOTS["console.connector"].is_dir():
+            self.assertTrue(self.runtime.connectors.has("console.connector"))
         self.assertIsInstance(self.runtime.capabilities.get("echo"), EchoCapability)
         # The package capabilities load only when agent-sdk is installed AND the
         # sibling repos are present on disk.
         if HAS_AGENT_SDK:
-            for cap_id in ("filesystem", "editor", "shell", "gateway"):
+            for cap_id in ("filesystem", "editor", "shell"):
                 if CAPABILITY_ROOTS[cap_id].is_dir():
                     self.assertTrue(self.runtime.capabilities.has(cap_id))
+            if CAPABILITY_ROOTS["gateway"].is_dir():
+                self.assertTrue(self.runtime.services.has("gateway"))
+            if CAPABILITY_ROOTS["security.policy"].is_dir():
+                self.assertTrue(self.runtime.policies.has("security.policy"))
+            if CAPABILITY_ROOTS["memory.loop"].is_dir():
+                self.assertTrue(self.runtime.services.has("memory.loop"))
+                self.assertIsNotNone(self.runtime.active_memory_loop())
+            if CAPABILITY_ROOTS["state.file"].is_dir():
+                self.assertTrue(self.runtime.storage.has("state.file"))
+                self.assertIsNotNone(self.runtime.active_state_store())
+            if CAPABILITY_ROOTS["context.manager"].is_dir():
+                self.assertTrue(self.runtime.services.has("context.manager"))
+                self.assertIsNotNone(self.runtime.active_context_manager())
+            if CAPABILITY_ROOTS["mcp.manager"].is_dir():
+                self.assertTrue(self.runtime.services.has("mcp.manager"))
+                self.assertIsNotNone(self.runtime.active_mcp_manager())
+            if CAPABILITY_ROOTS["skills.runtime"].is_dir():
+                self.assertTrue(self.runtime.services.has("skills.runtime"))
+                self.assertIsNotNone(self.runtime.active_skills_runtime())
+            if CAPABILITY_ROOTS["hooks.runtime"].is_dir():
+                self.assertTrue(self.runtime.services.has("hooks.runtime"))
+                self.assertIsNotNone(self.runtime.active_hooks_runtime())
+            if CAPABILITY_ROOTS["subagents.orchestrator"].is_dir():
+                self.assertTrue(self.runtime.services.has("subagents.orchestrator"))
+                self.assertIsNotNone(self.runtime.active_subagent_orchestrator())
+                self.assertTrue(self.runtime.tools.has("subagents.delegate"))
+            if CAPABILITY_ROOTS["sandbox.executor"].is_dir():
+                self.assertTrue(self.runtime.services.has("sandbox.executor"))
+                self.assertIsNotNone(self.runtime.active_sandbox_executor())
+            if CAPABILITY_ROOTS["model.router"].is_dir():
+                self.assertTrue(self.runtime.models.has("model.router"))
+                self.assertIsNotNone(self.runtime.active_model_router())
+            if CAPABILITY_ROOTS["observability.jsonl"].is_dir():
+                self.assertTrue(
+                    self.runtime.observability.has("observability.jsonl")
+                )
+                self.assertIsNotNone(self.runtime.active_observability())
+        self.assertFalse(self.runtime.capabilities.has("llm.local"))
+        self.assertFalse(self.runtime.capabilities.has("telegram.connector"))
+        self.assertFalse(self.runtime.capabilities.has("gateway"))
 
     def test_status_after_start(self) -> None:
         asyncio.run(self.runtime.start())
         status = asyncio.run(self.runtime.status())
         self.assertTrue(status.running)
         self.assertEqual(status.planner_active, "stub")
-        self.assertEqual(status.memory_active, "none")
-        self.assertEqual(status.connectors_active, ["terminal"])
+        self.assertEqual(status.memory_active, "memory.none")
+        self.assertEqual(
+            status.connectors_active,
+            ["console.connector", "telegram.connector"],
+        )
         self.assertEqual(
             status.capabilities_enabled,
             [
@@ -73,13 +129,29 @@ class TestRuntime(unittest.TestCase):
                 "filesystem",
                 "editor",
                 "shell",
-                "gateway",
-                "llm.local",
-                "telegram.connector",
                 "web.search",
+                "subagents.delegate",
             ],
         )
-        self.assertEqual(status.registry_counts["providers"], 1)
+        self.assertEqual(status.registry_counts["model_provider"], 3)
+        self.assertEqual(
+            status.active_by_kind["runtime_service"],
+            [
+                "gateway",
+                "memory.loop",
+                "context.manager",
+                "mcp.manager",
+                "skills.runtime",
+                "hooks.runtime",
+                "subagents.orchestrator",
+                "sandbox.executor",
+            ],
+        )
+        self.assertEqual(status.active_by_kind["storage_provider"], ["state.file"])
+        self.assertEqual(
+            status.active_by_kind["observability"],
+            ["observability.jsonl"],
+        )
         self.assertIn("RUNNING", status.render())
         self.assertIn("running", status.to_dict())
 
@@ -98,13 +170,15 @@ class TestRuntime(unittest.TestCase):
     def test_reload_config_keeps_running(self) -> None:
         asyncio.run(self.runtime.start())
         new_config = cfg.default_config()
-        new_config.connectors.active = []  # drop the terminal connector
+        new_config.extensions.active["channel_connector"] = []
+        new_config.refresh_legacy_views()
         asyncio.run(self.runtime.reload_config(new_config))
         self.assertTrue(self.runtime.running)
         self.assertEqual(len(self.runtime.connectors), 0)
 
     def test_unknown_provider_is_skipped(self) -> None:
-        self.config.planner.active = "openai"  # no built-in for it
+        self.config.extensions.active["model_provider"] = ["openai"]
+        self.config.extensions.bindings["planner"] = "openai"
         asyncio.run(self.runtime.start())
         self.assertFalse(self.runtime.providers.has("openai"))
         self.assertEqual(len(self.runtime.providers), 0)
@@ -183,6 +257,68 @@ class TestRuntime(unittest.TestCase):
                 else:
                     os.environ["CORAX_GATEWAY_STATE_PATH"] = old_value
 
+    def test_memory_loop_is_wired_to_selected_provider(self) -> None:
+        asyncio.run(self.runtime.start())
+        result = asyncio.run(
+            self.runtime.memory_before_turn(
+                "what do you remember?",
+                session_id="memory-session",
+            )
+        )
+        self.assertEqual(result["context"], "")
+        self.assertEqual(result["provider"], "memory.none")
+
+    def test_context_manager_compacts_old_history(self) -> None:
+        asyncio.run(self.runtime.start())
+        messages = [{"role": "system", "content": "safety"}]
+        for index in range(20):
+            messages.append(
+                {"role": "assistant", "content": f"old-{index}-" * 1_000}
+            )
+        messages.append({"role": "user", "content": "current"})
+        compacted = asyncio.run(
+            self.runtime.compact_messages(messages, session_id="context-test")
+        )
+        self.assertLess(len(compacted), len(messages))
+        self.assertEqual(compacted[0]["content"], "safety")
+        self.assertEqual(compacted[-1]["content"], "current")
+
+    def test_skills_runtime_augments_only_matching_turn(self) -> None:
+        import os
+        import tempfile
+
+        old_value = os.environ.get("CORAX_SKILLS_PATHS")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            skill_dir = root / "code-review"
+            skill_dir.mkdir()
+            (skill_dir / "SKILL.md").write_text(
+                "---\n"
+                "name: code-review\n"
+                "description: Review source code changes and diffs.\n"
+                "---\n\n"
+                "Inspect the complete diff before reviewing.\n",
+                encoding="utf-8",
+            )
+            os.environ["CORAX_SKILLS_PATHS"] = str(root)
+            runtime = CoraxRuntime(cfg.default_config())
+            asyncio.run(runtime.start())
+            try:
+                messages = asyncio.run(
+                    runtime.augment_with_skills(
+                        [{"role": "user", "content": "Review this code diff"}],
+                        session_id="skills-test",
+                    )
+                )
+                self.assertEqual(messages[-1]["role"], "user")
+                self.assertIn("complete diff", messages[-2]["content"])
+            finally:
+                asyncio.run(runtime.stop())
+                if old_value is None:
+                    os.environ.pop("CORAX_SKILLS_PATHS", None)
+                else:
+                    os.environ["CORAX_SKILLS_PATHS"] = old_value
+
     def test_start_keeps_custom_gateway_state_path(self) -> None:
         import os
 
@@ -211,7 +347,7 @@ class TestCapabilityIntegration(unittest.TestCase):
         workspace = Path(self.tempdir.name)
         config = cfg.default_config()
         for cap_id, path in CAPABILITY_ROOTS.items():
-            config.capabilities.available[cap_id].path = str(path)
+            config.extensions.available[cap_id].path = str(path)
         self.runtime = CoraxRuntime(
             config,
             root_path=REPO_ROOT,
@@ -261,6 +397,7 @@ class TestCapabilityIntegration(unittest.TestCase):
             shell.execute(
                 self._request(
                     {
+                        "operation": "validate",
                         "command": "printf 'shell-ok\\n'",
                         "timeout_seconds": 5,
                     }
@@ -273,7 +410,11 @@ class TestCapabilityIntegration(unittest.TestCase):
         self.assertEqual(read.status, ResultStatus.SUCCESS)
         self.assertEqual(read.payload["content"], "hello corax\n")
         self.assertEqual(shell_result.status, ResultStatus.SUCCESS)
-        self.assertEqual(shell_result.payload["stdout"], "shell-ok\n")
+        self.assertTrue(shell_result.payload["safe"])
+        self.assertIs(
+            getattr(shell, "_executor", None),
+            self.runtime.active_sandbox_executor(),
+        )
 
     def _request(self, payload: dict) -> "CapabilityRequest":
         return CapabilityRequest(

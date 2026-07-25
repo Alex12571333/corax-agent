@@ -1,26 +1,23 @@
 # Corax Agent
 
-A **minimal agent scaffold** — runtime, configuration, a terminal settings
-menu, registries and clean extension points. This is the *landing site* for a
-real agent: memory, connectors, capabilities and an LLM planner all plug in
-later **without changing this structure**.
-
-> This stage is intentionally inert. The planner, memory and connectors are
-> built-in placeholders; the only real tools are the workspace-confined
-> filesystem, editor and shell capability packages. No LLM, Telegram or MCP yet
-> — those arrive through the registries.
+A typed agent runtime with configuration, lifecycle, a terminal settings menu,
+an execution kernel and role-specific extension registries. Tools, channels,
+models, memory and runtime services share one package format without sharing
+one execution contract.
 
 ## What it does today
 
 1. Starts and stops cleanly.
 2. Reads / writes config (`corax.yaml`, JSON fallback).
 3. Shows a terminal settings menu and persists settings.
-4. Builds a runtime from built-in components plus standalone SDK capabilities.
-5. Loads `filesystem`, `editor` and `shell` capabilities from sibling repos.
-6. Lists capabilities / connectors / memory / providers from config.
-7. When `agent-core` is installed, runs tasks through the real execution
-   kernel (`runtime.execute(...)`); otherwise degrades gracefully.
-8. Exposes clear, role-based extension points for future modules.
+4. Discovers and validates standalone `extension.json` packages.
+5. Registers each package by kind: tools, channels, models, memory, policy or services.
+6. Exposes only tools to the planner and Agent Core execution kernel.
+7. Invokes infrastructure through its typed runtime contract.
+8. Runs bounded recall before each conversation turn and privacy-aware
+   retention after it through the selected memory provider.
+9. Supports the local model, Telegram channel, gateway and memory adapters
+   without placing infrastructure in the tool list.
 
 ## Requirements
 
@@ -28,20 +25,51 @@ later **without changing this structure**.
 * Optional: `pyyaml` for full YAML fidelity. Without it, the scaffold uses the
   built-in minimal YAML reader/writer (`corax/yaml_lite.py`), or a `corax.json`
   config.
-* The capability **packages** (`filesystem`, `editor`, `shell`) need
+* External extension packages need
   `agent-sdk` / `agent-core`. The scaffold itself runs without them — those
-  capabilities are simply skipped with a warning.
+  packages are simply skipped with a warning.
 
 ```bash
 pip install -e ".[yaml,dev]"
 ```
 
+## Reproducible installation
+
+[`corax-distribution`](https://github.com/Alex12571333/corax-distribution)
+installs the complete private composition into an isolated virtual
+environment. Its release-candidate lock uses immutable commit SHAs:
+
+```bash
+git clone https://github.com/Alex12571333/corax-distribution.git
+cd corax-distribution
+python3 -m corax_distribution --dry-run
+python3 -m corax_distribution --prefix ~/.corax
+~/.corax/bin/corax setup
+```
+
 ## Usage
 
 ```bash
-corax setup                 # first-run/settings menu
+corax                       # first-run wizard, then interactive console chat
+corax chat                  # interactive console chat
+corax setup                 # guided setup wizard
+corax settings              # advanced settings menu
 corax gateway               # run the Telegram chat gateway
 corax status                # print runtime status and exit
+corax security status       # show ask / auto / full
+corax security mode auto    # switch permission mode
+corax mcp status            # connected MCP servers and errors
+corax mcp tools             # discovered policy-gated MCP tools
+corax skills list           # installed portable Agent Skills
+corax skills reload         # rescan trusted skill roots
+corax hooks status          # fingerprints and approval state
+corax hooks reload          # reload hook config and allowlist
+corax subagents             # delegation limits and counters
+corax sandbox               # active isolation backend and limits
+corax models                # model routes, providers and fallbacks
+corax observability         # privacy-first trace sink status
+corax eval                  # deterministic ecosystem contract checks
+corax doctor                # local composition readiness
 corax init                  # create config + workspace/data/logs and exit
 corax --config ./corax.yaml setup
 ```
@@ -49,6 +77,12 @@ corax --config ./corax.yaml setup
 Legacy development aliases still work (`python main.py --chat`,
 `python main.py --status`, `python main.py --init`), but the public CLI shape is
 `corax <command>`.
+
+On a fresh installation, `corax` automatically runs the same guided flow as
+`corax setup`. The wizard acknowledges execution risk, configures workspace,
+verifies the selected local model with a real completion, selects memory and
+security modes, and optionally enables Telegram. Re-running it preserves
+current values as defaults and never writes credentials to the config.
 
 ## Project layout
 
@@ -66,8 +100,8 @@ corax-agent/
 │   ├── yaml_lite.py        # minimal YAML reader/writer (PyYAML-optional)
 │   ├── health.py           # uniform Health payload
 │   ├── ui/                 # menu · terminal · screens · banner
-│   ├── registry/           # capabilities · connectors · memory · providers
-│   ├── loader/             # agent-sdk capability packages + agent-core kernel
+│   ├── registry/           # role-specific extension registries
+│   ├── loader/             # agent-sdk extension packages + agent-core kernel
 │   ├── planner/            # StubPlanner (built-in)
 │   ├── connectors/         # TerminalConnector (built-in)
 │   ├── memory/             # NullMemory (built-in)
@@ -81,19 +115,73 @@ corax-agent/
 Code is grouped **by role** — a real `OpenAIPlanner` lands in `corax/planner/`
 next to `StubPlanner`, a `TelegramConnector` in `corax/connectors/`, and so on.
 
-## Capability integration
+## Extension integration
 
-The default `corax.yaml` enables:
+The default `corax.yaml` groups packages under `extensions.active`:
 
-* `echo` — built-in, returns its input unchanged
-* `filesystem` from `../corax-filesystem-capability`
-* `editor` from `../corax-editor-capability`
-* `shell` from `../corax-shell-capability`
+- tools: `echo`, `filesystem`, `editor`, `shell`, `web.search`;
+- channels: `console.connector`, `telegram.connector`;
+- models: `stub`, `llm.local`, `model.router`;
+- memory: `memory.none`;
+- policy: `security.policy`;
+- services: `gateway`, `memory.loop`, `context.manager`, `mcp.manager`,
+  `skills.runtime`, `hooks.runtime`, `subagents.orchestrator`,
+  `sandbox.executor`.
+- storage: `state.file`.
+- observability: `observability.jsonl`.
 
-Each package is loaded by `corax/loader/capabilities.py` from its root
-`capability.json` manifest and `main.py` entrypoint. The runtime passes the
-agent workspace to filesystem and editor so their sandbox is the same
-`workspace/` directory the agent manages.
+Each external package is loaded from its root `extension.json`. The runtime
+validates that the entrypoint implements the declared kind before adding it to
+the corresponding registry. Only tools pass through `runtime.execute(...)`.
+The selected policy is injected into every Agent Core session and is never
+model-callable.
+
+The selected memory provider is bound to the host-only `memory.loop` service.
+Every conversation turn recalls bounded context before model generation and
+retains only explicit or stable, non-secret user facts after the response.
+Recalled memory is inserted as untrusted data, never as executable instructions.
+The console stores its bounded session history through the host-only
+`state.file` provider and resumes it after a restart.
+Every model request also crosses `context.manager`, which preserves system
+instructions and the active turn while compacting stale history to a fixed budget.
+Configured stdio or Streamable HTTP MCP servers are connected by `mcp.manager`.
+Their tools become high-risk Corax tools and cross the normal Agent Core policy
+checkpoint.
+`skills.runtime` indexes `name` and `description` from trusted `SKILL.md`
+directories, then loads only the instructions relevant to the current turn.
+`hooks.runtime` runs approved lifecycle hooks out of process with `shell=False`,
+bounded I/O, timeouts, and content fingerprints. Tool hooks wrap the original
+tool metadata, so Agent Core authorization remains authoritative.
+`subagents.orchestrator` adds the confirm-gated `subagents.delegate` tool.
+Children run in parallel fresh contexts, receive no tools, and return only
+bounded summaries to the parent.
+`sandbox.executor` is injected into `shell`; it denies network, strips the
+child environment, limits resources and writes, and fails closed when no
+Seatbelt/Docker backend is available.
+`model.router` is the default primary model provider. It delegates to existing
+providers and falls back only after retryable failures.
+`observability.jsonl` receives host and kernel traces, omits prompts, outputs
+and messages by default, redacts secret-looking metadata, and rotates a bounded
+local file. Inspect it with `corax observability`.
+`corax eval` runs the separately packaged, deterministic manifest,
+composition and core-independence checks when the `dev` extra is installed.
+`corax doctor` checks the selected model, policy, sandbox, state,
+observability, workspace and core locally without contacting external services.
+
+Security mode can also be controlled by an authorised Telegram operator:
+
+```text
+/security status
+/security mode ask
+/security mode auto
+/security mode full
+/security approve <task-id>
+/security deny <task-id>
+```
+
+Entering `full` requires repeating the command with the returned short
+challenge. Configure remote administrators with
+`CORAX_SECURITY_ADMIN_IDS=12345,67890`.
 
 ## Tests
 
@@ -105,14 +193,13 @@ python -m unittest discover -s tests -t .
 pytest --cov=corax
 ```
 
-The capability-integration test runs only when `agent-core` / `agent-sdk` and
-the sibling capability repos are present; otherwise it is skipped.
+Integration tests exercise every sibling package when the repositories are
+present.
 
 ## What's next
 
-These slot into the existing registries with no architectural change:
-`TelegramConnector`, `OpenAIPlanner`, `SQLiteMemory`, `MCPAdapter`. See
-[docs/EXTENDING.md](docs/EXTENDING.md).
+See [docs/EXTENDING.md](docs/EXTENDING.md) for the developer contract and the
+rule for choosing an extension kind.
 
 ## Related (existing, do not modify)
 

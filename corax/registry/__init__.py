@@ -94,6 +94,7 @@ from .capabilities import CapabilityRegistryAdapter  # noqa: E402
 from .connectors import ConnectorRegistry  # noqa: E402
 from .memory import MemoryRegistry  # noqa: E402
 from .providers import ProviderRegistry  # noqa: E402
+from .extensions import ExtensionCatalog, TypedExtensionRegistry  # noqa: E402
 
 __all__ = [
     "Registry",
@@ -103,4 +104,6 @@ __all__ = [
     "MemoryRegistry",
     "ProviderRegistry",
     "CapabilityRegistryAdapter",
+    "ExtensionCatalog",
+    "TypedExtensionRegistry",
 ]

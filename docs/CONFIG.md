@@ -54,6 +54,12 @@ valid). It checks: required sections, `log_level`, `security.mode`, that active
 planner/memory/connectors/capabilities exist and are enabled, and that limits
 are positive integers. `python main.py --init` runs it and reports warnings.
 
+`security.mode` accepts `ask`, `auto`, or `full`. Old `normal`, `strict`, and
+`paranoid` values are migrated to the conservative `ask` mode. The selected
+`policy_provider` persists live command changes in the runtime data directory;
+the config value is its initial mode. `full` changes policy decisions only:
+immutable deny rules and the actual filesystem/shell/OS boundaries remain.
+
 ## Editing via the menu
 
 `python main.py` opens a menu with sections for Runtime, Planner, Memory,

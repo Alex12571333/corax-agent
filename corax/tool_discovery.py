@@ -1,9 +1,4 @@
-"""Adapter for the standalone Corax tool-discovery plugin.
-
-The plugin is deliberately manifest-only: it scans ``capability.json`` files
-from configured capability packages and returns ids for the small active tool
-set the model should see on a given user turn.
-"""
+"""Typed-manifest tool selection backed by the lexical discovery helper."""
 
 from __future__ import annotations
 
@@ -13,20 +8,11 @@ from typing import Iterable
 
 from .config import AgentConfig
 
-_INTERNAL_IDS = ("gateway", "llm.local", "telegram.connector")
-
-# A tool with no genuine relevance signal still scores a small positive value
-# from the selector's constant capability-type bonus (e.g. a low-risk web search
-# nets ~+0.15 with zero keyword/hint match). Requiring a real signal keeps such a
-# tool from becoming the *only* selected tool on an unrecognised phrasing — in
-# which case the gateway correctly falls back to offering the full tool set
-# rather than stranding the model with one irrelevant tool. Genuine matches
-# (keyword/tag/operation/hint) score well above this floor.
 _MIN_RELEVANCE_SCORE = 1.0
 
 
 class RuntimeToolSelector:
-    """Select active capability ids for a single user request."""
+    """Select active tools; the catalogue rejects every non-tool kind."""
 
     def __init__(
         self,
@@ -40,13 +26,11 @@ class RuntimeToolSelector:
         self.log = log or logging.getLogger("corax.tool_discovery")
         self._selector = None
         self._options_cls = None
-
         try:
             from tool_discovery import SelectionOptions, ToolCatalog, ToolSelector
         except ImportError:
-            self.log.debug("corax-plugin-tool-discovery is not installed")
+            self.log.debug("typed tool-discovery helper is unavailable")
             return
-
         roots = list(_manifest_roots(config, root_path=root_path))
         if not roots:
             return
@@ -62,30 +46,25 @@ class RuntimeToolSelector:
         return self._selector is not None and self._options_cls is not None
 
     def select(self, user_text: str, _available_specs: list[dict]) -> list[str]:
-        """Return capability ids selected for ``user_text``.
-
-        ``_available_specs`` is accepted so the gateway can use the same callable
-        shape for future selector implementations that inspect runtime health.
-        """
         if not self.available:
             return []
         options = self._options_cls(
             top_k=self.top_k,
             min_score=_MIN_RELEVANCE_SCORE,
-            exclude_ids=_INTERNAL_IDS,
             capability_type="tool",
             max_permission="dangerous",
             max_risk="critical",
         )
-        return [manifest.id for manifest in self._selector.select(user_text, options)]
+        return [
+            manifest.id
+            for manifest in self._selector.select(user_text, options)
+        ]
 
 
 def _manifest_roots(config: AgentConfig, *, root_path: str | Path) -> Iterable[Path]:
     root = Path(root_path)
-    for cap_id in config.capabilities.enabled:
-        if cap_id in _INTERNAL_IDS:
-            continue
-        spec = config.capabilities.available.get(cap_id)
+    for extension_id in config.extensions.active_for("tool"):
+        spec = config.extensions.available.get(extension_id)
         if spec is None or not spec.enabled or not spec.path:
             continue
         path = Path(spec.path).expanduser()
