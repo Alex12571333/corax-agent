@@ -125,12 +125,13 @@ returns to live follow mode. Assistant Markdown is rendered as styled headings,
 lists, quotes, links, inline emphasis/code, and fenced code blocks while the
 answer is still streaming.
 
-The hunter raven is a packaged raster hologram rather than character art.
-iTerm2, Kitty, and WezTerm display the PNG through their native image protocol.
-Apple Terminal uses a packaged 30×9 RGB reduction of that PNG rendered as
-background-colored Prompt Toolkit cells, so it works without image escapes,
-ASCII line art, or an extra runtime dependency. Unknown terminals and
-tmux/screen use the same compact header without unsupported escape sequences.
+The hunter raven ships in both raster and terminal-native forms. iTerm2, Kitty,
+and WezTerm display the angry cartoon pixel-art PNG through their native image
+protocol. Apple Terminal, other ANSI terminals, and tmux/screen render a
+packaged 30×15 Unicode Braille sprite: 60×60 addressable dots with a
+cyan-violet holographic gradient, following the same high-detail technique as
+the Hermes banner. No runtime converter or optional image dependency is
+required.
 
 Every model-selected tool is visible. The TUI and classic console show the
 tool name, safe argument summary, approval state, and completion or failure;
@@ -338,7 +339,7 @@ Host and operator surfaces:
 | --- | --- |
 | [`corax-agent`](https://github.com/Alex12571333/corax-agent) | Composition host, lifecycle, configuration, CLI, and runtime bindings. |
 | [`corax-console`](https://github.com/Alex12571333/corax-console) | First-run wizard and interactive terminal chat. |
-| [`corax-tui`](https://github.com/Alex12571333/corax-tui) | Full-screen terminal host: streaming transcript, collapsed thinking, formatted answers, native raster hologram, tool activity, approvals, context bar, and slash completion. |
+| [`corax-tui`](https://github.com/Alex12571333/corax-tui) | Full-screen terminal host: streaming transcript, collapsed thinking, formatted answers, adaptive PNG/Braille hunter hologram, tool activity, approvals, context bar, and slash completion. |
 | [`corax-ui`](https://github.com/Alex12571333/corax-ui) | Shared design tokens and dependency-free terminal renderer; not a runtime extension. |
 | [`corax-gateway-capability`](https://github.com/Alex12571333/corax-gateway-capability) | Channel-neutral sessions and gateway policy. |
 | [`corax-distribution`](https://github.com/Alex12571333/corax-distribution) | Immutable release lock and isolated source-composition installer. |
@@ -405,9 +406,11 @@ corax observability
 the model connectivity check. A shell request fails closed when neither an
 approved Seatbelt nor Docker backend is available.
 
-Before an upgrade, back up the runtime configuration and data directory. The
-installer requires a fresh prefix by design; install a new release beside the
-old one, validate it, and only then switch the launcher used by the operator.
+The distribution installer requires a fresh prefix by design. For versioned
+side-by-side upgrades it migrates the active installation's configuration,
+data (including security mode and memory), and workspace into the new prefix;
+logs, caches, environments, and source trees stay isolated. Validate the new
+release before switching the operator-facing launcher.
 
 ## Development
 
