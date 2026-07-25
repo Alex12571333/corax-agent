@@ -127,10 +127,10 @@ Every model-selected tool is visible. The TUI and classic console show the
 tool name, safe argument summary, approval state, and completion or failure;
 Telegram sends the same start, approval, and outcome activity as separate
 messages. Raw tool payloads and secret-like arguments are not rendered.
-After an approved protected capability succeeds, it is not offered again
-inside that user turn: the model must answer from the approved result instead
-of creating another permission prompt. No changed action is silently approved
-or executed, and the normal policy resets on the next user turn.
+Tool calls are not cached or suppressed: repeated and changed calls remain
+available for real multi-step work. In `ask` mode every protected call gets
+its own approval; `auto` reviews routine calls automatically, while `full`
+still respects immutable denials and sandbox boundaries.
 
 `corax chat` uses the same streaming chat loop and event contract in a
 line-oriented renderer. It preserves real-time thinking, answers, approval
