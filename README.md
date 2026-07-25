@@ -127,8 +127,10 @@ answer is still streaming.
 
 The hunter raven is a packaged raster hologram rather than character art.
 iTerm2, Kitty, and WezTerm display the PNG through their native image protocol.
-Apple Terminal, unknown terminals, and tmux/screen use the same compact header
-without emitting unsupported image escapes or falling back to ASCII art.
+Apple Terminal uses a packaged 30×9 RGB reduction of that PNG rendered as
+background-colored Prompt Toolkit cells, so it works without image escapes,
+ASCII line art, or an extra runtime dependency. Unknown terminals and
+tmux/screen use the same compact header without unsupported escape sequences.
 
 Every model-selected tool is visible. The TUI and classic console show the
 tool name, safe argument summary, approval state, and completion or failure;
