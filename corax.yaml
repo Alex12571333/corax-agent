@@ -202,7 +202,7 @@ limits:
   max_payload_mb: 20
 
 ui:
-  theme: terminal
+  theme: corax-hologram
   mascot: corax
   show_banner: true
 

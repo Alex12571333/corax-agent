@@ -4,16 +4,17 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "corax-agent"
-version = "0.2.0"
+version = "0.2.1"
 description = "Corax Agent — typed extension runtime with strict tool and infrastructure boundaries."
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 license = { text = "MIT" }
 authors = [{ name = "Corax" }]
-keywords = ["agent", "scaffold", "runtime", "cli"]
+keywords = ["agent", "runtime", "cli"]
 dependencies = [
     "agent-core @ git+https://github.com/Alex12571333/agent-core.git",
     "agent-sdk @ git+https://github.com/Alex12571333/agent-sdk.git",
+    "corax-ui @ git+https://github.com/Alex12571333/corax-ui.git",
     "corax-capability-filesystem @ git+https://github.com/Alex12571333/corax-filesystem-capability.git",
     "corax-capability-editor @ git+https://github.com/Alex12571333/corax-editor-capability.git",
     "corax-shell-capability @ git+https://github.com/Alex12571333/corax-shell-capability.git@05524a4336e7ea337b7058cd14e58115598c99af",

@@ -1,16 +1,9 @@
-"""The Corax startup banner (ASCII art)."""
+"""Compatibility export for the shared Corax wordmark."""
 
 from __future__ import annotations
 
-BANNER = r"""
-   ____ ___  ____  ___  __  __
-  / ___/ _ \|  _ \/ _ \ \ \/ /
- | |  | | | | |_) | |_| | \  /
- | |__| |_| |  _ <|  _  | /  \
-  \____\___/|_| \_\_| |_|/_/\_\
+from corax_ui import LOGO
 
-   CORAX
-   minimal agent scaffold
-"""
+BANNER = "\n" + "\n".join(LOGO) + "\n"
 
 __all__ = ["BANNER"]

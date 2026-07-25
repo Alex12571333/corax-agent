@@ -194,7 +194,7 @@ class LimitsConfig:
 
 @dataclass
 class UIConfig:
-    theme: str = "terminal"
+    theme: str = "corax-hologram"
     mascot: str = "corax"
     show_banner: bool = True
 
@@ -591,7 +591,7 @@ def default_config() -> AgentConfig:
             task_timeout_seconds=60,
             max_payload_mb=20,
         ),
-        ui=UIConfig(theme="terminal", mascot="corax", show_banner=True),
+        ui=UIConfig(theme="corax-hologram", mascot="corax", show_banner=True),
         llm=LLMConfig(
             base_url="http://192.168.0.10:8000/v1",
             model="google/gemma-4-12B-it",

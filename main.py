@@ -28,17 +28,12 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from corax_ui import TerminalTheme, safe_text
+
+from corax import __version__ as CORAX_VERSION
 from corax import config as config_mod
 from corax.app import CoraxApp
 from corax.paths import default_config_path, ensure_paths
-from corax.ui.banner import BANNER
-
-_RESET = "\033[0m"
-_BOLD = "\033[1m"
-_DIM = "\033[2m"
-_GREEN = "\033[32m"
-_YELLOW = "\033[33m"
-_CYAN = "\033[36m"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -114,13 +109,11 @@ async def _run(args: argparse.Namespace) -> int:
     try:
         if command == "status":
             status = await app.runtime.status()
-            print("\nCorax runtime status\n")
-            print(status.render())
-            print()
+            _print_result("Runtime status", status.render())
         elif command == "security":
             security_command = " ".join(args.command_args) or "status"
             result = await app.runtime.security_control(security_command)
-            print(result.get("message") or result)
+            _print_result("Security", result.get("message") or result)
             return 0 if result.get("ok") or result.get("challenge") else 2
         elif command == "mcp":
             manager_id = app.config.extensions.bindings.get("mcp", "mcp.manager")
@@ -137,7 +130,7 @@ async def _run(args: argparse.Namespace) -> int:
                 {"operation": operation},
                 session_id="mcp-control",
             )
-            print(result)
+            _print_result("MCP", result)
             return 0
         elif command == "skills":
             service_id = app.config.extensions.bindings.get(
@@ -153,7 +146,7 @@ async def _run(args: argparse.Namespace) -> int:
                 {"operation": operation},
                 session_id="skills-control",
             )
-            print(result)
+            _print_result("Skills", result)
             return 0
         elif command == "hooks":
             service_id = app.config.extensions.bindings.get("hooks", "hooks.runtime")
@@ -167,7 +160,7 @@ async def _run(args: argparse.Namespace) -> int:
                 {"operation": operation},
                 session_id="hooks-control",
             )
-            print(result)
+            _print_result("Hooks", result)
             return 0
         elif command == "subagents":
             service_id = app.config.extensions.bindings.get(
@@ -181,7 +174,7 @@ async def _run(args: argparse.Namespace) -> int:
                 {"operation": "status"},
                 session_id="subagents-control",
             )
-            print(result)
+            _print_result("Subagents", result)
             return 0
         elif command == "sandbox":
             service_id = app.config.extensions.bindings.get(
@@ -195,21 +188,21 @@ async def _run(args: argparse.Namespace) -> int:
                 {"operation": "status"},
                 session_id="sandbox-control",
             )
-            print(result)
+            _print_result("Sandbox", result)
             return 0
         elif command == "models":
             router = app.runtime.active_model_router()
             if router is None or not hasattr(router, "status"):
                 print("model.router is not loaded.")
                 return 1
-            print(router.status())
+            _print_result("Models", router.status())
             return 0
         elif command == "observability":
             provider = app.runtime.active_observability()
             if provider is None or not hasattr(provider, "status"):
                 print("observability.jsonl is not loaded.")
                 return 1
-            print(provider.status())
+            _print_result("Observability", provider.status())
             return 0
         elif command == "eval":
             try:
@@ -224,7 +217,7 @@ async def _run(args: argparse.Namespace) -> int:
                 app.runtime.root_path,
                 app.runtime.root_path.parent,
             )
-            print(report.render())
+            _print_result("Evaluations", report.render())
             return 0 if report.ok else 1
         elif command == "doctor":
             return await _run_doctor(app)
@@ -304,9 +297,17 @@ async def _run_doctor(app: "CoraxApp") -> int:
         ),
     ]
     passed = sum(ok for _, ok, _ in checks)
-    print(f"Corax doctor: {passed}/{len(checks)} passed")
+    theme = _theme()
+    print(theme.header(f"Corax doctor · {passed}/{len(checks)} passed"))
     for name, ok, detail in checks:
-        print(f"  {'PASS' if ok else 'FAIL'}  {name}: {detail}")
+        print(
+            theme.status(
+                "PASS" if ok else "FAIL",
+                f"{name}: {detail}",
+                "success" if ok else "danger",
+            )
+        )
+    print(theme.rule())
     return 0 if passed == len(checks) else 1
 
 
@@ -591,6 +592,11 @@ async def _run_console_chat(app: "CoraxApp") -> int:
             memory_after_turn=runtime.memory_after_turn,
             load_state=load_state,
             save_state=save_state,
+            version=CORAX_VERSION,
+            workspace=str(runtime.workspace_path),
+            security=runtime.security_mode(),
+            memory=app.config.extensions.bindings.get("memory", "memory.none"),
+            show_banner=app.config.ui.show_banner,
         )
         return await chat.run()
 
@@ -784,11 +790,11 @@ async def _run_chat(app: "CoraxApp", config_path: Path) -> int:
             if system_prompt is not None:
                 gateway_kwargs["system_prompt"] = system_prompt
             gateway = CoraxTelegramGateway(**gateway_kwargs)
-            print(_style("Corax Telegram gateway is running. Ctrl-C to stop.", _GREEN))
+            print(_theme().status("GATEWAY", "Telegram is running · Ctrl-C to stop", "success"))
             outcome = await _run_gateway_until_stopped(gateway)
 
         if outcome == "reload":
-            print(_style("Reloading agent...", _YELLOW))
+            print(_theme().status("RELOAD", "reloading agent", "warning"))
             await runtime.reload_config(config_mod.load_config(config_path))
             model_id = runtime.config.extensions.bindings.get(
                 "primary_model", "llm.local"
@@ -842,7 +848,7 @@ async def _run_gateway_until_stopped(gateway: Any) -> str:
         gateway.stop()
         if interrupts == 1:
             print()
-            print(_style("Stopping Telegram gateway...", _YELLOW))
+            print(_theme().status("GATEWAY", "stopping Telegram", "warning"))
         else:
             raise KeyboardInterrupt
         raise KeyboardInterrupt
@@ -886,19 +892,18 @@ def _print_chat_dashboard(
         ("workspace", str(runtime.workspace_path)),
     ]
 
-    print()
-    print(_style("Corax Chat Gateway", _BOLD + _CYAN))
-    print(_style("-" * 64, _DIM))
+    theme = _theme()
+    print(theme.header("Corax Chat Gateway"))
     for label, value in rows:
-        print(f"{_style(label.rjust(13), _DIM)}  {_style(value, _GREEN if label in {'kernel', 'gateway'} else '')}")
-    print(_style("-" * 64, _DIM))
+        role = "success" if label in {"kernel", "gateway"} else "text"
+        print(theme.field(label, value, role))
+    print(theme.rule())
 
 
 def _print_setup_overview(app: "CoraxApp") -> None:
     runtime = app.runtime
-    print()
-    print(_style("Corax Setup", _BOLD + _CYAN))
-    print(_style("-" * 64, _DIM))
+    theme = _theme()
+    print(theme.header("Corax Setup"))
     rows = [
         ("config", str(app.config_path)),
         ("profile", app.config.agent.profile),
@@ -909,54 +914,49 @@ def _print_setup_overview(app: "CoraxApp") -> None:
         ("next", "corax"),
     ]
     for label, value in rows:
-        color = _YELLOW if value == "token missing" else ""
-        print(f"{_style(label.rjust(10), _DIM)}  {_style(value, color)}")
-    print(_style("-" * 64, _DIM))
+        role = "warning" if value == "token missing" else "text"
+        print(theme.field(label, value, role))
+    print(theme.rule())
 
 
 def _print_warning(title: str, message: str) -> None:
-    print()
-    print(_style(f"! {title}", _YELLOW + _BOLD))
-    print(_style(f"  {message}", _YELLOW))
+    print("\n" + _theme().status(title, message, "warning"))
 
 
-def _style(text: str, color: str) -> str:
-    if not color or not _color_enabled():
-        return text
-    return f"{color}{text}{_RESET}"
+def _theme() -> TerminalTheme:
+    return TerminalTheme.detect(sys.stdout)
 
 
-def _color_enabled() -> bool:
-    mode = os.getenv("CORAX_COLOR", "auto").strip().lower()
-    if mode in {"1", "true", "yes", "always", "on"}:
-        return True
-    if mode in {"0", "false", "no", "never", "off"}:
-        return False
-    return sys.stdout.isatty()
+def _print_result(title: str, value: object) -> None:
+    theme = _theme()
+    print(theme.header(title))
+    print(safe_text(value))
+    print(theme.rule())
 
 
 def _do_init(config_path: Path) -> int:
     existed = config_path.exists()
     config = config_mod.load_config(config_path) if existed else config_mod.create_default_config(config_path)
     paths = ensure_paths(config, config_path)
-    print(BANNER.rstrip("\n"))
+    theme = _theme()
+    if config.ui.show_banner:
+        print(theme.logo())
     print()
     if existed:
-        print(f"Config already present: {config_path}")
+        print(theme.status("CONFIG", f"present: {config_path}", "accent"))
     else:
-        print(f"Created default config: {config_path}")
-    print("Ensured directories:")
-    print(f"  workspace : {paths.workspace}")
-    print(f"  data      : {paths.data}")
-    print(f"  logs      : {paths.logs}")
+        print(theme.status("CONFIG", f"created: {config_path}", "success"))
+    print(theme.field("workspace", paths.workspace))
+    print(theme.field("data", paths.data))
+    print(theme.field("logs", paths.logs))
     print()
     errors = config_mod.validate_config(config)
     if errors:
-        print("Config warnings:")
+        print(theme.status("CONFIG", "validation warnings", "warning"))
         for err in errors:
             print(f"  - {err}")
         return 1
-    print("Config is valid.")
+    print(theme.status("READY", "configuration is valid", "success"))
     return 0
 
 

@@ -21,7 +21,7 @@ modify the global Python installation or overwrite an existing deployment.
 Current runtime requirements:
 
 - macOS or Linux;
-- Python 3.11 or newer;
+- Python 3.12 or newer;
 - Git;
 - an OpenAI-compatible model endpoint;
 - Docker, or macOS Seatbelt, when the shell tool is enabled.
@@ -88,6 +88,32 @@ Inside console chat, use:
 /memory remember <text>
 /exit
 ```
+
+## Interface
+
+The console uses the shared
+[`corax-ui`](https://github.com/Alex12571333/corax-ui) visual contract: a
+palette designed for near-black terminals, cyan and ultraviolet holographic
+light, thin technical borders, compact status labels, and the Corax raven. The
+terminal renderer is static and dependency-free, so startup remains fast and
+output remains useful in logs and pipes.
+
+`corax-ui` is a host library, not an Agent Core extension or a model-callable
+tool. Its platform-neutral `tokens.json` is the source of truth for color,
+typography, spacing, and radius. Future web or desktop surfaces can consume the
+same semantic tokens without moving presentation policy into `agent-core`.
+
+Color is enabled automatically for an interactive terminal. Override detection
+when needed:
+
+```bash
+CORAX_COLOR=always corax
+CORAX_COLOR=never corax
+NO_COLOR=1 corax
+```
+
+Model and tool text is stripped of terminal control sequences before display.
+Meaning is always repeated in text or symbols; color is never the only signal.
 
 ## CLI
 
@@ -197,6 +223,8 @@ Common secret and integration variables:
 | `CORAX_HOOKS_JSON` | Lifecycle hook definitions. |
 | `CORAX_HOOK_APPROVALS_JSON` | Approved hook fingerprints. |
 | `CORAX_SANDBOX_BACKEND` | `auto`, `seatbelt`, or `docker`. |
+| `CORAX_COLOR` | Terminal color policy: `auto`, `always`, or `never`. |
+| `NO_COLOR` | Disable terminal color when `CORAX_COLOR` is not explicit. |
 
 Do not store tokens in `corax.yaml`, prompts, extension manifests, or Git.
 
@@ -248,6 +276,7 @@ Host and operator surfaces:
 | --- | --- |
 | [`corax-agent`](https://github.com/Alex12571333/corax-agent) | Composition host, lifecycle, configuration, CLI, and runtime bindings. |
 | [`corax-console`](https://github.com/Alex12571333/corax-console) | First-run wizard and interactive terminal chat. |
+| [`corax-ui`](https://github.com/Alex12571333/corax-ui) | Shared design tokens and dependency-free terminal renderer; not a runtime extension. |
 | [`corax-gateway-capability`](https://github.com/Alex12571333/corax-gateway-capability) | Channel-neutral sessions and gateway policy. |
 | [`corax-distribution`](https://github.com/Alex12571333/corax-distribution) | Immutable release lock and isolated source-composition installer. |
 

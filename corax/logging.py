@@ -9,9 +9,9 @@ them.
 from __future__ import annotations
 
 import logging
-import os
 from pathlib import Path
-import sys
+
+from corax_ui import TerminalTheme
 
 _LOG_FORMAT = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
 _CONSOLE_FORMAT = "%(asctime)s %(levelname)-7s %(corax_component)s %(message)s"
@@ -19,15 +19,12 @@ _DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 _CONSOLE_DATE_FORMAT = "%H:%M:%S"
 _LOGGER_NAME = "corax"
 
-_RESET = "\033[0m"
-_DIM = "\033[2m"
-_BOLD = "\033[1m"
-_COLORS = {
-    "DEBUG": "\033[36m",
-    "INFO": "\033[32m",
-    "WARNING": "\033[33m",
-    "ERROR": "\033[31m",
-    "CRITICAL": "\033[1;31m",
+_ROLES = {
+    "DEBUG": "accent",
+    "INFO": "success",
+    "WARNING": "warning",
+    "ERROR": "danger",
+    "CRITICAL": "danger",
 }
 
 
@@ -36,18 +33,26 @@ class _CoraxConsoleFormatter(logging.Formatter):
 
     def __init__(self, *, color: bool) -> None:
         super().__init__(_CONSOLE_FORMAT, datefmt=_CONSOLE_DATE_FORMAT)
-        self.color = color
+        self.theme = TerminalTheme(color)
 
     def format(self, record: logging.LogRecord) -> str:
         record.corax_component = self._component(record.name)
         line = super().format(record)
-        if not self.color:
+        if not self.theme.enabled:
             return line
-        color = _COLORS.get(record.levelname, "")
+        role = _ROLES.get(record.levelname, "text")
         timestamp = self.formatTime(record, self.datefmt)
-        line = line.replace(timestamp, f"{_DIM}{timestamp}{_RESET}", 1)
-        line = line.replace(record.levelname.ljust(7), f"{color}{record.levelname:<7}{_RESET}", 1)
-        line = line.replace(record.corax_component, f"{_BOLD}{record.corax_component}{_RESET}", 1)
+        line = line.replace(timestamp, self.theme.paint(timestamp, "muted", dim=True), 1)
+        line = line.replace(
+            record.levelname.ljust(7),
+            self.theme.paint(f"{record.levelname:<7}", role, bold=True),
+            1,
+        )
+        line = line.replace(
+            record.corax_component,
+            self.theme.paint(record.corax_component, "text", bold=True),
+            1,
+        )
         return line
 
     @staticmethod
@@ -98,9 +103,4 @@ def _resolve_level(level: str) -> int:
 
 
 def _use_color(stream: object) -> bool:
-    mode = os.getenv("CORAX_COLOR", "auto").strip().lower()
-    if mode in {"1", "true", "yes", "always", "on"}:
-        return True
-    if mode in {"0", "false", "no", "never", "off"}:
-        return False
-    return bool(getattr(stream, "isatty", lambda: False)()) and sys.platform != "win32"
+    return TerminalTheme.detect(stream).enabled
