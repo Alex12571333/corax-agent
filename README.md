@@ -128,9 +128,10 @@ opens command suggestions with descriptions. The status bar shows the active
 model, context use, security mode, memory provider, and session. Corax
 discovers the selected model's real context window from its OpenAI-compatible
 `/models` metadata and updates current use from streaming `prompt_tokens`.
-Until exact usage arrives it shows a clearly marked estimate; the context
-manager's independent character compaction budget is never shown as if it
-were the model's token limit.
+Occupied tokens are shown as an exact integer, so adjacent turns cannot be
+hidden by `k` rounding. Until provider usage arrives the bar shows unknown or
+pending state; the context manager's independent character compaction budget
+is never shown as if it were the model's token limit.
 
 Assistant Markdown is rendered as styled headings, lists, quotes, links,
 inline emphasis/code, and fenced code blocks while the answer is streaming and
