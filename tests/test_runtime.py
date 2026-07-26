@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import io
+import logging
 import tempfile
 import unittest
 from pathlib import Path
@@ -111,6 +113,21 @@ class TestRuntime(unittest.TestCase):
         self.assertFalse(self.runtime.capabilities.has("llm.local"))
         self.assertFalse(self.runtime.capabilities.has("telegram.connector"))
         self.assertFalse(self.runtime.capabilities.has("gateway"))
+
+    def test_info_logging_does_not_print_startup_extension_inventory(self) -> None:
+        output = io.StringIO()
+        logger = logging.getLogger("corax.test.quiet-start")
+        logger.handlers.clear()
+        logger.propagate = False
+        logger.setLevel(logging.INFO)
+        logger.addHandler(logging.StreamHandler(output))
+        runtime = CoraxRuntime(self.config, logger)
+        try:
+            asyncio.run(runtime.start())
+        finally:
+            asyncio.run(runtime.stop())
+            logger.handlers.clear()
+        self.assertNotIn("runtime started:", output.getvalue())
 
     def test_status_after_start(self) -> None:
         asyncio.run(self.runtime.start())

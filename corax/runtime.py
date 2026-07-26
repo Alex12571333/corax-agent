@@ -179,7 +179,7 @@ class CoraxRuntime:
             correlation_id=f"runtime-{self._started_at.isoformat()}",
             metadata={"event": "runtime_start", "mode": self.config.agent.mode},
         )
-        self.log.info("runtime started: %s", self.extensions.active_by_kind())
+        self.log.debug("runtime started: %s", self.extensions.active_by_kind())
 
     async def stop(self) -> None:
         if not self._running:

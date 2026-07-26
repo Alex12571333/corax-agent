@@ -78,6 +78,8 @@ Secrets are read from environment variables and are never written to
 
 Use `corax chat` when a simple line-oriented console is preferable, for
 example in a minimal terminal or while diagnosing display compatibility.
+Normal startup is quiet; the full extension inventory is available through
+`corax status` and at `DEBUG` log level instead of being printed before chat.
 
 Inside terminal chat, use:
 

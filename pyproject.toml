@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "corax-agent"
-version = "0.3.7"
+version = "0.3.9"
 description = "Corax Agent — typed extension runtime with strict tool and infrastructure boundaries."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -19,14 +19,14 @@ dependencies = [
     "corax-capability-editor @ git+https://github.com/Alex12571333/corax-editor-capability.git",
     "corax-shell-capability @ git+https://github.com/Alex12571333/corax-shell-capability.git@05524a4336e7ea337b7058cd14e58115598c99af",
     "corax-plugin-tool-discovery @ git+https://github.com/Alex12571333/corax-plugin-tool-discovery.git",
-    "corax-llm-local-connector @ git+https://github.com/Alex12571333/corax-llm-local-connector.git@4a03beb047a46cf7f898d4245f7a428e0d1a2589",
+    "corax-llm-local-connector @ git+https://github.com/Alex12571333/corax-llm-local-connector.git@a52b968db8be59ade9da763ae4abb1ad6093556e",
     "corax-telegram-connector @ git+https://github.com/Alex12571333/corax-telegram-connector.git@da4c08ed871c3bc0461118aa3945e2ad3990fa98",
     "corax-web-search-capability @ git+https://github.com/Alex12571333/corax-web-search-capability.git@51d6aa46755ad98f4e7636c587490e70ba7d641d",
     "corax-runtime-gateway @ git+https://github.com/Alex12571333/corax-gateway-capability.git@838c83e3cf1f86cb2376ada63a1b3c76f5ca6129",
     "corax-security-policy @ git+https://github.com/Alex12571333/corax-security-policy.git",
     "corax-memory-loop @ git+https://github.com/Alex12571333/corax-memory-loop.git",
-    "corax-console @ git+https://github.com/Alex12571333/corax-console.git@1b57f23987557c506a74bdf1d1219f3c01355ee1",
-    "corax-tui @ git+https://github.com/Alex12571333/corax-tui.git@cf55e2f36fee064487361f9f8eecea9926de888d",
+    "corax-console @ git+https://github.com/Alex12571333/corax-console.git@f4e03ccd6c94108ad4b3bf114282119b2ed23c33",
+    "corax-tui @ git+https://github.com/Alex12571333/corax-tui.git@0fd1b7e9e0fe2363e5acdc0e1ba378d7adecf10f",
     "corax-state-store @ git+https://github.com/Alex12571333/corax-state-store.git",
     "corax-context-manager @ git+https://github.com/Alex12571333/corax-context-manager.git",
     "corax-mcp-manager @ git+https://github.com/Alex12571333/corax-mcp-manager.git",
