@@ -2,8 +2,8 @@
 """Corax Agent — CLI entrypoint.
 
 Usage:
-    corax                          # first-run setup, then full-screen TUI
-    corax tui                      # full-screen terminal chat
+    corax                          # first-run setup, then inline TUI
+    corax tui                      # inline terminal chat
     corax chat                     # simple line-oriented console fallback
     corax setup                    # guided setup wizard
     corax settings                 # advanced settings menu
@@ -66,7 +66,7 @@ def build_parser() -> argparse.ArgumentParser:
             "init",
             "menu",
         ),
-        help="command to run (default: full-screen terminal chat)",
+        help="command to run (default: inline terminal chat)",
     )
     parser.add_argument(
         "command_args",

@@ -2,7 +2,7 @@
 
 ![Corax Agent — modular local-first agent runtime](docs/assets/corax-agent-hero.png)
 
-Corax is a local-first agent runtime with a full-screen terminal interface,
+Corax is a local-first agent runtime with an inline terminal interface,
 typed extensions, persistent sessions, optional long-term memory, Telegram
 access, and a policy-enforced execution kernel.
 
@@ -54,7 +54,7 @@ runtime directory unless the paths are changed in the configuration.
 
 ## First run
 
-Start the full-screen terminal interface:
+Start the inline terminal interface:
 
 ```bash
 ~/.corax/bin/corax
@@ -106,24 +106,33 @@ you to copy its task ID. The explicit `/security approve <task-id>` and
 
 ## Interface
 
-`corax` opens the full-screen
-[`corax-tui`](https://github.com/Alex12571333/corax-tui) by default. It keeps
-the transcript scrollable while model output arrives, separates real-time
-thinking from the answer, and keeps thinking collapsed to a one-line status by
-default. Use `Ctrl-T` or `/thinking` to expand and collapse it.
-Typing `/` opens command suggestions with descriptions. The fixed status bar
-shows the active model, context use, security mode, memory provider, and
-session. Corax discovers the selected model's real context window from its
-OpenAI-compatible `/models` metadata and updates current use from streaming
-`prompt_tokens`. Until exact usage arrives it shows a clearly marked estimate;
-the context manager's independent character compaction budget is never shown
-as if it were the model's token limit.
+`corax` opens the inline
+[`corax-tui`](https://github.com/Alex12571333/corax-tui) by default. Completed
+messages, tool calls, approvals, and answers are appended once to the
+terminal's native scrollback. Only the current streaming tail, context bar,
+composer, and completion menu are redrawn. Corax does not enter the alternate
+screen, capture the mouse, or put the transcript inside a fixed viewport with
+its own scrollbar.
 
-`Page Up`, `Page Down`, and the mouse wheel detach the transcript from live
-output without streaming deltas snapping it back to the bottom. `Ctrl-End`
-returns to live follow mode. Assistant Markdown is rendered as styled headings,
-lists, quotes, links, inline emphasis/code, and fenced code blocks while the
-answer is still streaming.
+Terminal scrolling, selection, search, and copy mode therefore keep working
+normally while Corax is open. On exit, the live footer is removed, terminal
+input modes are restored, and the conversation remains above the shell
+prompt. Live output is capped to a compact 12-row tail; a completed block moves
+to native history without being replayed on later frames.
+
+Real-time thinking is kept separate from the answer and collapsed by default.
+Use `Ctrl-T` or `/thinking` to expand or collapse the current block. Typing `/`
+opens command suggestions with descriptions. The status bar shows the active
+model, context use, security mode, memory provider, and session. Corax
+discovers the selected model's real context window from its OpenAI-compatible
+`/models` metadata and updates current use from streaming `prompt_tokens`.
+Until exact usage arrives it shows a clearly marked estimate; the context
+manager's independent character compaction budget is never shown as if it
+were the model's token limit.
+
+Assistant Markdown is rendered as styled headings, lists, quotes, links,
+inline emphasis/code, and fenced code blocks while the answer is streaming and
+when it settles into scrollback.
 
 The hunter raven ships in both raster and terminal-native forms. iTerm2, Kitty,
 and WezTerm display the angry cartoon pixel-art PNG through their native image
@@ -143,8 +152,7 @@ its own approval; `auto` reviews routine calls automatically, while `full`
 still respects immutable denials and sandbox boundaries.
 
 `corax chat` uses the same streaming chat loop and event contract in a
-line-oriented renderer. It preserves real-time thinking, answers, approval
-resume, and tool visibility without taking over the terminal screen.
+line-oriented renderer. It remains the minimal compatibility fallback.
 
 Both terminal surfaces use the shared
 [`corax-ui`](https://github.com/Alex12571333/corax-ui) visual contract: a
@@ -173,7 +181,7 @@ Meaning is always repeated in text or symbols; color is never the only signal.
 
 | Command | Purpose |
 | --- | --- |
-| `corax` or `corax tui` | Open the full-screen terminal interface. |
+| `corax` or `corax tui` | Open the inline native-scrollback terminal interface. |
 | `corax chat` | Open the line-oriented streaming console fallback. |
 | `corax setup` | Run the guided setup wizard. |
 | `corax settings` | Open the advanced terminal settings menu. |
@@ -339,7 +347,7 @@ Host and operator surfaces:
 | --- | --- |
 | [`corax-agent`](https://github.com/Alex12571333/corax-agent) | Composition host, lifecycle, configuration, CLI, and runtime bindings. |
 | [`corax-console`](https://github.com/Alex12571333/corax-console) | First-run wizard and interactive terminal chat. |
-| [`corax-tui`](https://github.com/Alex12571333/corax-tui) | Full-screen terminal host: streaming transcript, collapsed thinking, formatted answers, adaptive PNG/Braille hunter hologram, tool activity, approvals, context bar, and slash completion. |
+| [`corax-tui`](https://github.com/Alex12571333/corax-tui) | Inline native-scrollback terminal host: streaming tail, collapsed thinking, formatted answers, adaptive PNG/Braille hunter hologram, visible tools and approvals, context bar, and slash completion. |
 | [`corax-ui`](https://github.com/Alex12571333/corax-ui) | Shared design tokens and dependency-free terminal renderer; not a runtime extension. |
 | [`corax-gateway-capability`](https://github.com/Alex12571333/corax-gateway-capability) | Channel-neutral sessions and gateway policy. |
 | [`corax-distribution`](https://github.com/Alex12571333/corax-distribution) | Immutable release lock and isolated source-composition installer. |

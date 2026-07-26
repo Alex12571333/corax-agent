@@ -30,7 +30,7 @@ class ChatPromptTests(unittest.TestCase):
 
 
 class CliCommandTests(unittest.TestCase):
-    def test_default_command_is_full_screen_tui(self) -> None:
+    def test_default_command_is_inline_tui(self) -> None:
         args = build_parser().parse_args([])
         self.assertEqual(_resolve_command(args), "tui")
 
