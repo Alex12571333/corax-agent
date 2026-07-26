@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 import io
 import logging
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 try:  # agent-core is only needed for the live capability integration test.
     from agent_core import CapabilityRequest, ResultStatus
@@ -35,6 +37,8 @@ CAPABILITY_ROOTS = {
     "filesystem": REPO_ROOT.parent / "corax-filesystem-capability",
     "editor": REPO_ROOT.parent / "corax-editor-capability",
     "shell": REPO_ROOT.parent / "corax-shell-capability",
+    "web.search": REPO_ROOT.parent / "corax-web-search-capability",
+    "web.fetch": REPO_ROOT.parent / "corax-web-search-capability" / "web_fetch",
     "gateway": REPO_ROOT.parent / "corax-gateway-capability",
     "security.policy": REPO_ROOT.parent / "corax-security-policy",
     "memory.loop": REPO_ROOT.parent / "corax-memory-loop",
@@ -70,7 +74,13 @@ class TestRuntime(unittest.TestCase):
         # The package capabilities load only when agent-sdk is installed AND the
         # sibling repos are present on disk.
         if HAS_AGENT_SDK:
-            for cap_id in ("filesystem", "editor", "shell"):
+            for cap_id in (
+                "filesystem",
+                "editor",
+                "shell",
+                "web.search",
+                "web.fetch",
+            ):
                 if CAPABILITY_ROOTS[cap_id].is_dir():
                     self.assertTrue(self.runtime.capabilities.has(cap_id))
             if CAPABILITY_ROOTS["gateway"].is_dir():
@@ -147,6 +157,7 @@ class TestRuntime(unittest.TestCase):
                 "editor",
                 "shell",
                 "web.search",
+                "web.fetch",
                 "subagents.delegate",
             ],
         )
@@ -300,6 +311,95 @@ class TestRuntime(unittest.TestCase):
         self.assertEqual(compacted[0]["content"], "safety")
         self.assertEqual(compacted[-1]["content"], "current")
 
+    def test_every_model_request_gets_fresh_trusted_local_time(self) -> None:
+        from agent_core import ExtensionKind
+
+        kst = timezone(timedelta(hours=9), "KST")
+        moments = iter(
+            [
+                datetime(2026, 7, 26, 23, 59, 58, tzinfo=kst),
+                datetime(2026, 7, 27, 0, 0, 1, tzinfo=kst),
+                datetime(2026, 7, 27, 0, 0, 2, tzinfo=kst),
+            ]
+        )
+
+        class Model:
+            id = "clock.test"
+            kind = ExtensionKind.MODEL_PROVIDER
+
+            def __init__(self) -> None:
+                self.requests = []
+
+            async def generate(self, request):
+                self.requests.append(request)
+                return SimpleNamespace(
+                    is_success=True,
+                    payload={"text": "ok"},
+                    status=None,
+                )
+
+            async def stream_generate_events(self, request):
+                self.requests.append(request)
+                yield {"type": "done"}
+
+        runtime = CoraxRuntime(self.config, clock=lambda: next(moments))
+        model = Model()
+        runtime.models.register(model.id, model)
+        payload = {
+            "messages": [
+                {"role": "system", "content": "base policy"},
+                {"role": "user", "content": "what is current?"},
+            ]
+        }
+        asyncio.run(runtime.invoke_extension(model.id, payload))
+        asyncio.run(runtime.invoke_extension(model.id, payload))
+
+        async def stream() -> None:
+            async for _event in runtime.stream_extension(model.id, payload):
+                pass
+
+        asyncio.run(stream())
+
+        blocks = [
+            next(
+                message["content"]
+                for message in request.messages
+                if message.get("role") == "system"
+                and message["content"].startswith(
+                    "Trusted Corax runtime context"
+                )
+            )
+            for request in model.requests
+        ]
+        self.assertEqual(len(blocks), 3)
+        self.assertIn("Local date: 2026-07-26", blocks[0])
+        self.assertIn("Local time: 23:59:58", blocks[0])
+        self.assertIn("Local date: 2026-07-27", blocks[1])
+        self.assertIn("Local time: 00:00:02", blocks[2])
+        self.assertIn("Timezone: KST (UTC+09:00)", blocks[0])
+        self.assertIn("web search is required", blocks[0])
+        self.assertIn("source URLs", blocks[0])
+        self.assertIn("Never guess current facts", blocks[0])
+        self.assertEqual(payload["messages"][0]["content"], "base policy")
+        self.assertFalse(
+            any(
+                "Trusted Corax runtime context" in message["content"]
+                for message in payload["messages"]
+            )
+        )
+        for request in model.requests:
+            self.assertEqual(request.messages[0]["content"], "base policy")
+            self.assertEqual(
+                sum(
+                    message["content"].startswith(
+                        "Trusted Corax runtime context"
+                    )
+                    for message in request.messages
+                    if message.get("role") == "system"
+                ),
+                1,
+            )
+
     def test_stream_reports_exact_host_context_budget(self) -> None:
         from agent_core import ExtensionKind
 
@@ -351,11 +451,123 @@ class TestRuntime(unittest.TestCase):
                     "used": 137,
                     "limit": 48_000,
                     "unit": "chars",
+                    "scope": "prepared",
+                    "source": "host",
                 },
                 {"type": "delta", "content": "ok"},
                 {"type": "done"},
             ],
         )
+
+    def test_model_window_budget_uses_provider_prompt_calibration(self) -> None:
+        from agent_core import ExtensionKind
+
+        manager_requests = []
+
+        class ContextManager:
+            id = "context.manager"
+            kind = ExtensionKind.RUNTIME_SERVICE
+            max_chars = 48_000
+
+            async def handle(self, request):
+                manager_requests.append(dict(request.payload))
+                return SimpleNamespace(
+                    is_success=True,
+                    payload={
+                        "messages": list(request.payload["messages"]),
+                        "chars_after": 100,
+                        "bytes_after": 200,
+                        "prompt_bytes_after": 240,
+                        "budget_limit": 100_000,
+                        "budget_unit": "bytes",
+                    },
+                )
+
+        class StreamingModel:
+            id = "stream.window"
+            kind = ExtensionKind.MODEL_PROVIDER
+
+            async def stream_generate_events(self, request):
+                yield {
+                    "type": "context",
+                    "used": 120,
+                    "unit": "tokens",
+                    "scope": "prompt",
+                    "source": "provider",
+                }
+                yield {"type": "done"}
+
+        self.runtime.services.register("context.manager", ContextManager())
+        self.runtime.models.register("stream.window", StreamingModel())
+        self.runtime.set_model_context_window(131_072)
+        payload = {
+            "messages": [{"role": "user", "content": "hello"}],
+            "model": "qwen",
+            "max_tokens": 4_096,
+            "tools": [{"type": "function", "function": {"name": "echo"}}],
+            "tool_choice": "auto",
+        }
+
+        async def run() -> None:
+            for _ in range(2):
+                async for _event in self.runtime.stream_extension(
+                    "stream.window",
+                    payload,
+                    session_id="window-stream",
+                ):
+                    pass
+
+        asyncio.run(run())
+
+        first, second = manager_requests
+        self.assertEqual(first["context_window_tokens"], 131_072)
+        self.assertEqual(first["reserved_tokens"], 5_120)
+        self.assertGreater(first["prompt_overhead_bytes"], 0)
+        self.assertIsNone(first["observed_bytes_per_token"])
+        self.assertEqual(second["observed_bytes_per_token"], 2.0)
+        for request in manager_requests:
+            self.assertTrue(
+                any(
+                    str(message.get("content", "")).startswith(
+                        "Trusted Corax runtime context"
+                    )
+                    for message in request["messages"]
+                )
+            )
+
+    def test_context_overflow_fails_before_model_request(self) -> None:
+        from agent_core import ExtensionKind
+
+        class ContextManager:
+            id = "context.manager"
+            kind = ExtensionKind.RUNTIME_SERVICE
+
+            async def handle(self, request):
+                return SimpleNamespace(
+                    is_success=True,
+                    payload={
+                        "messages": list(request.payload["messages"]),
+                        "overflow": True,
+                    },
+                )
+
+        class Model:
+            id = "overflow.test"
+            kind = ExtensionKind.MODEL_PROVIDER
+
+            async def generate(self, request):
+                raise AssertionError("model must not receive oversized context")
+
+        self.runtime.services.register("context.manager", ContextManager())
+        self.runtime.models.register("overflow.test", Model())
+
+        with self.assertRaisesRegex(RuntimeError, "exceeds"):
+            asyncio.run(
+                self.runtime.invoke_extension(
+                    "overflow.test",
+                    {"messages": [{"role": "user", "content": "too large"}]},
+                )
+            )
 
     def test_skills_runtime_augments_only_matching_turn(self) -> None:
         import os

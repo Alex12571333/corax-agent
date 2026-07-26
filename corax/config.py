@@ -356,6 +356,7 @@ def default_config() -> AgentConfig:
                 "llm.local",
                 "telegram.connector",
                 "web.search",
+                "web.fetch",
             ],
             available={
                 "echo": ProviderSpec(
@@ -404,6 +405,12 @@ def default_config() -> AgentConfig:
                     description="Web search via a self-hosted SearXNG instance",
                     path="../corax-web-search-capability",
                 ),
+                "web.fetch": ProviderSpec(
+                    enabled=True,
+                    type="tool",
+                    description="Guarded public-page fetch for grounded citations",
+                    path="../corax-web-search-capability/web_fetch",
+                ),
             },
         ),
         extensions=ExtensionsConfig(
@@ -414,6 +421,7 @@ def default_config() -> AgentConfig:
                     "editor",
                     "shell",
                     "web.search",
+                    "web.fetch",
                 ],
                 "channel_connector": [
                     "console.connector",
@@ -544,6 +552,11 @@ def default_config() -> AgentConfig:
                     kind="tool",
                     description="SearXNG web search tool",
                     path="../corax-web-search-capability",
+                ),
+                "web.fetch": ExtensionSpec(
+                    kind="tool",
+                    description="Guarded public-page fetch for grounded citations",
+                    path="../corax-web-search-capability/web_fetch",
                 ),
                 "gateway": ExtensionSpec(
                     kind="runtime_service",
@@ -801,6 +814,11 @@ def config_from_dict(data: dict[str, Any]) -> AgentConfig:
     websearch = data.get("websearch", {}) or {}
 
     defaults = default_config()
+    if "web.fetch" not in extensions.available:
+        extensions.available["web.fetch"] = defaults.extensions.available[
+            "web.fetch"
+        ]
+        extensions.active.setdefault("tool", []).append("web.fetch")
     config = AgentConfig(
         agent=AgentMeta(
             name=agent.get("name", defaults.agent.name),

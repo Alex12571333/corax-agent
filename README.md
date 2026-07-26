@@ -130,8 +130,10 @@ discovers the selected model's real context window from its OpenAI-compatible
 `/models` metadata and updates current use from streaming `prompt_tokens`.
 Occupied tokens are shown as an exact integer, so adjacent turns cannot be
 hidden by `k` rounding. Until provider usage arrives the bar shows unknown or
-pending state; the context manager's independent character compaction budget
-is never shown as if it were the model's token limit.
+pending state. The same discovered window drives conservative UTF-8 preflight
+compaction; provider `prompt_tokens` remains the authoritative occupied value.
+Conversation checkpoints are retained across turns rather than being cut at a
+fixed 40-message UI limit.
 
 Assistant Markdown is rendered as styled headings, lists, quotes, links,
 inline emphasis/code, and fenced code blocks while the answer is streaming and
@@ -153,6 +155,14 @@ Tool calls are not cached or suppressed: repeated and changed calls remain
 available for real multi-step work. In `ask` mode every protected call gets
 its own approval; `auto` reviews routine calls automatically, while `full`
 still respects immutable denials and sandbox boundaries.
+
+For current or latest outside-world facts, the host adds its trusted local
+date, time, and timezone to every model request. `web.search` rewrites stale
+years only for current-intent queries and returns URL/date provenance;
+`web.fetch` then opens selected public results through DNS-pinned SSRF guards.
+The model policy requires search → fetch → cite and forbids inventing facts
+when fresh sources are missing or contradictory. Reasoning is bounded by
+output tokens, elapsed time, stall time, and a capped TUI buffer.
 
 `corax chat` uses the same streaming chat loop and event contract in a
 line-oriented renderer. It remains the minimal compatibility fallback.
@@ -362,7 +372,7 @@ Agent tools:
 | [`corax-filesystem-capability`](https://github.com/Alex12571333/corax-filesystem-capability) | Workspace-confined filesystem operations. |
 | [`corax-editor-capability`](https://github.com/Alex12571333/corax-editor-capability) | Targeted text edits inside the workspace. |
 | [`corax-shell-capability`](https://github.com/Alex12571333/corax-shell-capability) | Guarded local command execution. |
-| [`corax-web-search-capability`](https://github.com/Alex12571333/corax-web-search-capability) | Search through a self-hosted SearXNG endpoint. |
+| [`corax-web-search-capability`](https://github.com/Alex12571333/corax-web-search-capability) | One web capability bundle: current-aware SearXNG search plus guarded public-page fetch for grounded citations. |
 | [`corax-plugin-tool-discovery`](https://github.com/Alex12571333/corax-plugin-tool-discovery) | Manifest-only tool catalog and top-K selection helper; not a runtime extension. |
 
 Models and channels:
@@ -381,7 +391,7 @@ Memory, state, and context:
 | [`universal-agent-memory`](https://github.com/Alex12571333/universal-agent-memory) | Durable self-hosted memory backend and typed Corax adapter. |
 | [`mnemonic-vault`](https://github.com/Alex12571333/mnemonic-vault) | File-first memory backend and typed Corax adapter. |
 | [`corax-state-store`](https://github.com/Alex12571333/corax-state-store) | Atomic local checkpoints. |
-| [`corax-context-manager`](https://github.com/Alex12571333/corax-context-manager) | Deterministic context compaction and budgeting. |
+| [`corax-context-manager`](https://github.com/Alex12571333/corax-context-manager) | Deterministic compaction driven by the discovered model window with provider-calibrated reporting. |
 
 Runtime controls and integrations:
 

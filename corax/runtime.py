@@ -8,12 +8,14 @@ their role-specific contracts.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from agent_core import (
     ChannelMessage,
@@ -40,6 +42,44 @@ _BUILTIN_FACTORIES: dict[str, Callable[[], Any]] = {
     "terminal": TerminalConnector,
     "echo": EchoCapability,
 }
+
+_TEMPORAL_CONTEXT_HEADER = "Trusted Corax runtime context for this model request:"
+_CONTEXT_HOST_RESERVE_TOKENS = 1_024
+
+
+def _local_now() -> datetime:
+    zone_name = os.environ.get("TZ", "").removeprefix(":").strip()
+    if zone_name:
+        try:
+            return datetime.now(ZoneInfo(zone_name))
+        except (ValueError, ZoneInfoNotFoundError):
+            pass
+    return datetime.now().astimezone()
+
+
+def _temporal_system_message(now: datetime) -> dict[str, str]:
+    """Build trusted, request-local time and current-information rules."""
+
+    if now.tzinfo is None or now.utcoffset() is None:
+        now = now.astimezone()
+    zone = getattr(now.tzinfo, "key", None) or now.tzname() or "local"
+    offset = now.strftime("%z")
+    offset = f"{offset[:3]}:{offset[3:]}" if offset else "unknown"
+    return {
+        "role": "system",
+        "content": (
+            f"{_TEMPORAL_CONTEXT_HEADER}\n"
+            f"- Local date: {now.date().isoformat()}\n"
+            f"- Local time: {now.time().isoformat(timespec='seconds')}\n"
+            f"- Timezone: {zone} (UTC{offset})\n"
+            "- Resolve relative dates such as today and tomorrow from this block.\n"
+            "- For current/latest/recent outside-world facts or events, web search "
+            "is required before answering. Fetch relevant result pages when the "
+            "web.fetch tool is available, assert only sourced facts, and report "
+            "source URLs plus publication/event dates. Never guess current facts; "
+            "if live retrieval is unavailable or inconclusive, say so."
+        ),
+    }
 
 
 @dataclass
@@ -123,6 +163,7 @@ class CoraxRuntime:
         root_path: str | Path | None = None,
         workspace_path: str | Path | None = None,
         core_version: str = "0.2.0",
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.config = config
         self.log = logger or logging.getLogger("corax.runtime")
@@ -132,6 +173,9 @@ class CoraxRuntime:
         ).resolve()
         self.data_path = (self.root_path / config.runtime.data_path).resolve()
         self.core_version = core_version
+        self._clock = clock or _local_now
+        self.model_context_window_tokens: int | None = None
+        self._model_bytes_per_token: dict[str, float] = {}
 
         self.extensions = ExtensionCatalog()
         self.tools = self.extensions.registry(ExtensionKind.TOOL)
@@ -483,53 +527,163 @@ class CoraxRuntime:
         *,
         session_id: str = "",
     ) -> list:
-        compacted, _ = await self._compact_messages_with_context(
+        compacted, _, _ = await self._compact_messages_with_context(
             messages,
             session_id=session_id,
         )
         return compacted
+
+    def set_model_context_window(self, value: int | None) -> None:
+        """Set the provider-discovered prompt window used for preflight."""
+
+        self.model_context_window_tokens = (
+            value if type(value) is int and value > 0 else None
+        )
+
+    def _with_temporal_context(self, messages: tuple | list) -> list:
+        prepared = list(messages)
+        insert_at = 0
+        while (
+            insert_at < len(prepared)
+            and isinstance(prepared[insert_at], dict)
+            and prepared[insert_at].get("role") == "system"
+        ):
+            insert_at += 1
+        prepared.insert(insert_at, _temporal_system_message(self._clock()))
+        return prepared
 
     async def _compact_messages_with_context(
         self,
         messages: tuple | list,
         *,
         session_id: str = "",
-    ) -> tuple[list, dict[str, Any] | None]:
+        model_key: str = "",
+        max_tokens: Any = None,
+        prompt_overhead_bytes: int = 0,
+    ) -> tuple[list, dict[str, Any] | None, int | None]:
         manager = self.active_context_manager()
         original = list(messages)
         if manager is None:
-            return original, None
+            return original, None, None
+        payload: dict[str, Any] = {"messages": original}
+        if self.model_context_window_tokens is not None:
+            output_tokens = (
+                max_tokens
+                if type(max_tokens) is int and max_tokens > 0
+                else 0
+            )
+            payload.update(
+                {
+                    "context_window_tokens": self.model_context_window_tokens,
+                    "reserved_tokens": (
+                        output_tokens + _CONTEXT_HOST_RESERVE_TOKENS
+                    ),
+                    "prompt_overhead_bytes": max(0, prompt_overhead_bytes),
+                    "observed_bytes_per_token": self._model_bytes_per_token.get(
+                        model_key
+                    ),
+                }
+            )
         try:
             result = await manager.handle(
                 ExtensionRequest(
                     operation="compact",
-                    payload={"messages": original},
+                    payload=payload,
                     session_id=session_id,
                 )
             )
-        except Exception as exc:  # noqa: BLE001 - compaction is fail-soft
+        except Exception as exc:  # noqa: BLE001 - legacy compaction is fail-soft
             self.log.debug("context compaction failed: %s", exc)
-            return original, None
-        payload = result.payload or {}
-        compacted = payload.get("messages", [])
+            if self.model_context_window_tokens is not None:
+                raise RuntimeError("model context preflight failed") from exc
+            return original, None, None
+        result_payload = result.payload or {}
+        compacted = result_payload.get("messages", [])
         if not getattr(result, "is_success", False) or not isinstance(
             compacted, list
         ):
-            return original, None
-        used = payload.get("chars_after")
-        try:
-            limit = getattr(manager, "max_chars", None)
-        except Exception:  # noqa: BLE001 - optional budget reporting is fail-soft
-            limit = None
+            if self.model_context_window_tokens is not None:
+                raise RuntimeError("model context preflight failed")
+            return original, None, None
+        if result_payload.get("overflow") is True:
+            raise RuntimeError(
+                "prepared model context exceeds the active model window"
+            )
+        limit = result_payload.get("budget_limit")
+        unit = result_payload.get("budget_unit")
+        used = result_payload.get(
+            "bytes_after" if unit == "bytes" else "chars_after"
+        )
+        if type(limit) is not int or limit <= 0:
+            try:
+                limit = getattr(manager, "max_chars", None)
+            except Exception:  # noqa: BLE001 - optional reporting is fail-soft
+                limit = None
+        if unit not in {"bytes", "chars"}:
+            unit = "chars"
         context = (
-            {"type": "context", "used": used, "limit": limit, "unit": "chars"}
+            {
+                "type": "context",
+                "used": used,
+                "limit": limit,
+                "unit": unit,
+                "scope": "prepared",
+                "source": "host",
+            }
             if type(used) is int
             and used >= 0
             and type(limit) is int
             and limit > 0
             else None
         )
-        return compacted, context
+        prompt_bytes = result_payload.get("prompt_bytes_after")
+        return (
+            compacted,
+            context,
+            prompt_bytes
+            if type(prompt_bytes) is int and prompt_bytes > 0
+            else None,
+        )
+
+    @staticmethod
+    def _prompt_overhead_bytes(data: dict[str, Any]) -> int:
+        fields = {
+            key: data[key]
+            for key in ("tools", "tool_choice")
+            if key in data
+        }
+        return len(
+            json.dumps(fields, ensure_ascii=False, default=str).encode("utf-8")
+        )
+
+    def _record_context_calibration(
+        self,
+        model_key: str,
+        *,
+        prompt_bytes: int | None,
+        prompt_tokens: Any,
+    ) -> None:
+        if (
+            not model_key
+            or type(prompt_bytes) is not int
+            or prompt_bytes <= 0
+            or type(prompt_tokens) is not int
+            or prompt_tokens <= 0
+        ):
+            return
+        observed = prompt_bytes / prompt_tokens
+        previous = self._model_bytes_per_token.get(model_key)
+        self._model_bytes_per_token[model_key] = (
+            min(previous, observed) if previous is not None else observed
+        )
+
+    @staticmethod
+    def _result_prompt_tokens(result: Any) -> int | None:
+        payload = getattr(result, "payload", None)
+        raw = payload.get("raw") if isinstance(payload, dict) else None
+        usage = raw.get("usage") if isinstance(raw, dict) else None
+        value = usage.get("prompt_tokens") if isinstance(usage, dict) else None
+        return value if type(value) is int and value >= 0 else None
 
     async def memory_before_turn(
         self,
@@ -703,9 +857,14 @@ class CoraxRuntime:
                 prompt=prompt,
                 session_id=session_id,
             )
-            messages = await self.compact_messages(
+            messages = self._with_temporal_context(messages)
+            model_key = str(data.get("model") or extension_id)
+            messages, _, prompt_bytes = await self._compact_messages_with_context(
                 messages,
                 session_id=session_id,
+                model_key=model_key,
+                max_tokens=data.get("max_tokens"),
+                prompt_overhead_bytes=self._prompt_overhead_bytes(data),
             )
             request = ModelRequest(
                 prompt=prompt,
@@ -740,6 +899,11 @@ class CoraxRuntime:
                     )
                 else:
                     result = await item.generate(request)
+                self._record_context_calibration(
+                    model_key,
+                    prompt_bytes=prompt_bytes,
+                    prompt_tokens=self._result_prompt_tokens(result),
+                )
             except Exception as exc:
                 await self.record_observation(
                     TraceStage.ERROR,
@@ -881,10 +1045,16 @@ class CoraxRuntime:
             prompt=prompt,
             session_id=session_id,
         )
-        messages, context = await self._compact_messages_with_context(
+        messages = self._with_temporal_context(messages)
+        model_key = str(data.get("model") or extension_id)
+        messages, context, prompt_bytes = await self._compact_messages_with_context(
             messages,
             session_id=session_id,
+            model_key=model_key,
+            max_tokens=data.get("max_tokens"),
+            prompt_overhead_bytes=self._prompt_overhead_bytes(data),
         )
+        has_context_messages = bool(messages)
         request = ModelRequest(
             prompt=prompt,
             messages=tuple(messages),
@@ -906,9 +1076,19 @@ class CoraxRuntime:
             },
         )
         try:
-            if context is not None and messages:
+            if context is not None and has_context_messages:
                 yield context
             async for event in item.stream_generate_events(request):
+                if (
+                    event.get("type") == "context"
+                    and event.get("source") == "provider"
+                    and event.get("scope") == "prompt"
+                ):
+                    self._record_context_calibration(
+                        model_key,
+                        prompt_bytes=prompt_bytes,
+                        prompt_tokens=event.get("used"),
+                    )
                 yield event
         except Exception as exc:
             await self.record_observation(

@@ -1447,7 +1447,7 @@ class HostRoleRoundTripTests(unittest.IsolatedAsyncioTestCase):
                 session_id="stream-test",
             )
         ]
-        self.assertEqual(events[0], {"type": "delta", "content": "hello"})
+        self.assertIn({"type": "delta", "content": "hello"}, events)
         self.assertEqual(events[-1]["type"], "done")
         self.assertFalse(self.runtime.tools.has("llm.local"))
 

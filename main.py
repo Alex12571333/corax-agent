@@ -29,12 +29,117 @@ import sys
 from pathlib import Path
 from typing import Any
 
+try:
+    import resource
+except ImportError:  # pragma: no cover - unavailable on Windows
+    resource = None  # type: ignore[assignment]
+
 from corax_ui import TerminalTheme, safe_text
 
 from corax import __version__ as CORAX_VERSION
 from corax import config as config_mod
 from corax.app import CoraxApp
 from corax.paths import default_config_path, ensure_paths
+
+
+def _minimal_runtime_snapshot(app: CoraxApp) -> dict[str, object]:
+    try:
+        rss: int | None = (
+            int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+            if resource is not None
+            else None
+        )
+        if sys.platform != "darwin":
+            rss = rss * 1024 if rss is not None else None
+    except (OSError, ValueError):
+        rss = None
+    process = {"pid": os.getpid(), "rss_bytes": rss}
+    runtime = app.runtime
+    if runtime is None:
+        return {**process, "running": False}
+    try:
+        status = runtime.snapshot()
+    except Exception as exc:  # noqa: BLE001 - signal handling must still exit
+        return {
+            **process,
+            "running": bool(runtime.running),
+            "snapshot_error": type(exc).__name__,
+        }
+    snapshot: dict[str, object] = {
+        **process,
+        "running": status.running,
+        "uptime_seconds": round(status.uptime_seconds, 3),
+        "mode": status.mode,
+    }
+    diagnostic = getattr(app, "_chat_diagnostic_snapshot", None)
+    if callable(diagnostic):
+        try:
+            snapshot["chat"] = diagnostic()
+        except Exception as exc:  # noqa: BLE001 - signal logging must still exit
+            snapshot["chat_error"] = type(exc).__name__
+    return snapshot
+
+
+def _log_shutdown_signal(
+    app: CoraxApp,
+    signum: int,
+) -> None:
+    name = signal.Signals(signum).name
+    logger = app.log or logging.getLogger("corax")
+    logger.warning(
+        "shutdown requested: signal=%s runtime=%s",
+        name,
+        _minimal_runtime_snapshot(app),
+    )
+
+
+def _request_shutdown(
+    app: CoraxApp,
+    task: Any,
+    state: dict[str, int],
+    signum: int,
+) -> None:
+    if not state["signum"]:
+        state["signum"] = int(signum)
+        _log_shutdown_signal(app, signum)
+    task.cancel()
+
+
+def _install_shutdown_signal_handlers(
+    app: CoraxApp,
+) -> tuple[dict[str, int], dict[int, Any]]:
+    loop = asyncio.get_running_loop()
+    task = asyncio.current_task()
+    state = {"signum": 0}
+    previous: dict[int, Any] = {}
+    if task is None:
+        return state, previous
+
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        try:
+            old_handler = signal.getsignal(signum)
+            loop.add_signal_handler(
+                signum,
+                _request_shutdown,
+                app,
+                task,
+                state,
+                signum,
+            )
+        except (NotImplementedError, OSError, RuntimeError, ValueError):
+            continue
+        previous[signum] = old_handler
+    return state, previous
+
+
+def _restore_signal_handlers(previous: dict[int, Any]) -> None:
+    loop = asyncio.get_running_loop()
+    for signum, handler in previous.items():
+        try:
+            loop.remove_signal_handler(signum)
+            signal.signal(signum, handler)
+        except (NotImplementedError, OSError, RuntimeError, ValueError):
+            pass
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -108,6 +213,7 @@ async def _run(args: argparse.Namespace) -> int:
 
     app = CoraxApp(config_path)
     await app.boot()
+    shutdown_state, previous_signal_handlers = _install_shutdown_signal_handlers(app)
     try:
         if command == "status":
             status = await app.runtime.status()
@@ -232,7 +338,13 @@ async def _run(args: argparse.Namespace) -> int:
         else:
             _print_setup_overview(app)
             await app.run_menu()
+    except asyncio.CancelledError:
+        signum = shutdown_state["signum"]
+        if signum:
+            return 128 + signum
+        raise
     finally:
+        _restore_signal_handlers(previous_signal_handlers)
         await app.shutdown()
     return 0
 
@@ -602,6 +714,11 @@ async def _run_console_chat(
                     },
                 )
 
+        context_window = await discover_model_context_window(
+            app.config.llm.base_url,
+            app.config.llm.model,
+        )
+        runtime.set_model_context_window(context_window)
         chat = ConsoleChat(
             connector=connector,
             run_model=run_model,
@@ -622,7 +739,9 @@ async def _run_console_chat(
             security=runtime.security_mode(),
             memory=app.config.extensions.bindings.get("memory", "memory.none"),
             show_banner=app.config.ui.show_banner,
+            max_history_messages=None,
         )
+        app._chat_diagnostic_snapshot = chat.diagnostic_snapshot
         if use_tui:
             try:
                 from corax_tui import run_tui
@@ -631,10 +750,6 @@ async def _run_console_chat(
                     "corax-tui is not installed; falling back to simple chat."
                 )
             else:
-                context_window = await discover_model_context_window(
-                    app.config.llm.base_url,
-                    app.config.llm.model,
-                )
                 return await run_tui(chat, context_window=context_window)
         return await chat.run()
 
@@ -717,6 +832,14 @@ async def _run_chat(app: "CoraxApp", config_path: Path) -> int:
 
     from corax.gateway import CoraxTelegramGateway
     from corax.tool_discovery import RuntimeToolSelector
+    from corax_console import discover_model_context_window
+
+    runtime.set_model_context_window(
+        await discover_model_context_window(
+            app.config.llm.base_url,
+            app.config.llm.model,
+        )
+    )
 
     specs = _tool_capability_specs(runtime)
     selector = RuntimeToolSelector(app.config, root_path=runtime.root_path)
@@ -870,38 +993,13 @@ def _telegram_stream_transport() -> str:
 
 
 async def _run_gateway_until_stopped(gateway: Any) -> str:
-    """Run the gateway with a graceful Ctrl-C path.
-
-    Telegram long-poll uses a blocking HTTPS read inside the connector. Raising
-    KeyboardInterrupt once breaks that read; the connector turns it into a
-    regular failed poll, and the gateway exits because ``stop()`` was already
-    set. A second Ctrl-C is treated as the user's request to force termination.
-    """
-    previous_handler = signal.getsignal(signal.SIGINT)
-    interrupts = 0
-
-    def _handle_sigint(_signum: int, _frame: Any) -> None:
-        nonlocal interrupts
-        interrupts += 1
-        gateway.stop()
-        if interrupts == 1:
-            print()
-            print(_theme().status("GATEWAY", "stopping Telegram", "warning"))
-        else:
-            raise KeyboardInterrupt
-        raise KeyboardInterrupt
+    """Run the gateway while preserving the process-wide shutdown handlers."""
 
     try:
-        signal.signal(signal.SIGINT, _handle_sigint)
-    except (ValueError, RuntimeError):
         return await gateway.run()
-    try:
-        return await gateway.run()
-    except KeyboardInterrupt:
+    except (asyncio.CancelledError, KeyboardInterrupt):
         gateway.stop()
-        return "stopped"
-    finally:
-        signal.signal(signal.SIGINT, previous_handler)
+        raise
 
 
 def _print_chat_dashboard(

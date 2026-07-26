@@ -19,6 +19,7 @@ extensions:
       - editor
       - shell
       - web.search
+      - web.fetch
     channel_connector:
       - console.connector
       - telegram.connector
@@ -160,6 +161,11 @@ extensions:
       enabled: true
       description: "Web search via a self-hosted SearXNG instance"
       path: ../corax-web-search-capability
+    web.fetch:
+      kind: tool
+      enabled: true
+      description: "Guarded public-page fetch for grounded citations"
+      path: ../corax-web-search-capability/web_fetch
     gateway:
       kind: runtime_service
       enabled: true

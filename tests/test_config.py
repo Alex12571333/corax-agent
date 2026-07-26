@@ -196,6 +196,26 @@ class TestWebSearchConfig(unittest.TestCase):
             config.extensions.available["web.search"].path,
             "../corax-web-search-capability",
         )
+        self.assertIn("web.fetch", config.extensions.active["tool"])
+        self.assertEqual(config.extensions.available["web.fetch"].kind, "tool")
+        self.assertEqual(
+            config.extensions.available["web.fetch"].path,
+            "../corax-web-search-capability/web_fetch",
+        )
+
+    def test_pre_fetch_config_is_upgraded_without_reenabling_disabled_tool(self) -> None:
+        data = cfg.default_config().to_dict()
+        data["extensions"]["available"].pop("web.fetch")
+        data["extensions"]["active"]["tool"].remove("web.fetch")
+        upgraded = cfg.config_from_dict(data)
+        self.assertIn("web.fetch", upgraded.extensions.active["tool"])
+
+        data = cfg.default_config().to_dict()
+        data["extensions"]["available"]["web.fetch"]["enabled"] = False
+        data["extensions"]["active"]["tool"].remove("web.fetch")
+        disabled = cfg.config_from_dict(data)
+        self.assertFalse(disabled.extensions.available["web.fetch"].enabled)
+        self.assertNotIn("web.fetch", disabled.extensions.active["tool"])
 
     def test_websearch_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
