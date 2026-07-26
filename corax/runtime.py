@@ -44,7 +44,17 @@ _BUILTIN_FACTORIES: dict[str, Callable[[], Any]] = {
 }
 
 _TEMPORAL_CONTEXT_HEADER = "Trusted Corax runtime context for this model request:"
+_CONTEXT_DEFAULT_OUTPUT_TOKENS = 4_096
 _CONTEXT_HOST_RESERVE_TOKENS = 1_024
+
+
+def _context_reserved_tokens(max_tokens: Any) -> int:
+    output_tokens = (
+        max_tokens
+        if type(max_tokens) is int and max_tokens > 0
+        else _CONTEXT_DEFAULT_OUTPUT_TOKENS
+    )
+    return output_tokens + _CONTEXT_HOST_RESERVE_TOKENS
 
 
 def _local_now() -> datetime:
@@ -527,10 +537,14 @@ class CoraxRuntime:
         *,
         session_id: str = "",
     ) -> list:
-        compacted, _, _ = await self._compact_messages_with_context(
+        compacted, _, _, overflow = await self._compact_messages_with_context(
             messages,
             session_id=session_id,
         )
+        if overflow:
+            raise RuntimeError(
+                "prepared model context exceeds the active model window"
+            )
         return compacted
 
     def set_model_context_window(self, value: int | None) -> None:
@@ -560,24 +574,17 @@ class CoraxRuntime:
         model_key: str = "",
         max_tokens: Any = None,
         prompt_overhead_bytes: int = 0,
-    ) -> tuple[list, dict[str, Any] | None, int | None]:
+    ) -> tuple[list, dict[str, Any] | None, int | None, bool]:
         manager = self.active_context_manager()
         original = list(messages)
         if manager is None:
-            return original, None, None
+            return original, None, None, False
         payload: dict[str, Any] = {"messages": original}
         if self.model_context_window_tokens is not None:
-            output_tokens = (
-                max_tokens
-                if type(max_tokens) is int and max_tokens > 0
-                else 0
-            )
             payload.update(
                 {
                     "context_window_tokens": self.model_context_window_tokens,
-                    "reserved_tokens": (
-                        output_tokens + _CONTEXT_HOST_RESERVE_TOKENS
-                    ),
+                    "reserved_tokens": _context_reserved_tokens(max_tokens),
                     "prompt_overhead_bytes": max(0, prompt_overhead_bytes),
                     "observed_bytes_per_token": self._model_bytes_per_token.get(
                         model_key
@@ -596,7 +603,7 @@ class CoraxRuntime:
             self.log.debug("context compaction failed: %s", exc)
             if self.model_context_window_tokens is not None:
                 raise RuntimeError("model context preflight failed") from exc
-            return original, None, None
+            return original, None, None, False
         result_payload = result.payload or {}
         compacted = result_payload.get("messages", [])
         if not getattr(result, "is_success", False) or not isinstance(
@@ -604,11 +611,7 @@ class CoraxRuntime:
         ):
             if self.model_context_window_tokens is not None:
                 raise RuntimeError("model context preflight failed")
-            return original, None, None
-        if result_payload.get("overflow") is True:
-            raise RuntimeError(
-                "prepared model context exceeds the active model window"
-            )
+            return original, None, None, False
         limit = result_payload.get("budget_limit")
         unit = result_payload.get("budget_unit")
         used = result_payload.get(
@@ -643,6 +646,7 @@ class CoraxRuntime:
             prompt_bytes
             if type(prompt_bytes) is int and prompt_bytes > 0
             else None,
+            result_payload.get("overflow") is True,
         )
 
     @staticmethod
@@ -655,6 +659,123 @@ class CoraxRuntime:
         return len(
             json.dumps(fields, ensure_ascii=False, default=str).encode("utf-8")
         )
+
+    @staticmethod
+    def _model_request(
+        prompt: str,
+        messages: tuple | list,
+        data: dict[str, Any],
+        session_id: str,
+    ) -> ModelRequest:
+        parameters = dict(data)
+        return ModelRequest(
+            prompt=prompt,
+            messages=tuple(messages),
+            model=parameters.pop("model", None),
+            modalities=tuple(parameters.pop("modalities", ("text",))),
+            parameters=parameters,
+            session_id=session_id,
+        )
+
+    async def _prepare_model_request(
+        self,
+        provider: Any,
+        *,
+        prompt: str,
+        messages: tuple | list,
+        data: dict[str, Any],
+        session_id: str,
+        model_key: str,
+    ) -> tuple[ModelRequest, dict[str, Any] | None, int | None]:
+        request = self._model_request(prompt, messages, data, session_id)
+        original_messages = request.messages
+        retry_exact = False
+        try:
+            exact_context = await self._preflight_model_context(
+                provider,
+                request,
+                None,
+            )
+        except RuntimeError:
+            retry_exact = True
+        else:
+            if exact_context is not None:
+                return request, exact_context, None
+
+        messages, fallback, prompt_bytes, overflow = (
+            await self._compact_messages_with_context(
+                messages,
+                session_id=session_id,
+                model_key=model_key,
+                max_tokens=data.get("max_tokens"),
+                prompt_overhead_bytes=self._prompt_overhead_bytes(data),
+            )
+        )
+        request = self._model_request(prompt, messages, data, session_id)
+        if retry_exact:
+            context = await self._preflight_model_context(
+                provider,
+                request,
+                fallback,
+                fallback_overflow=(
+                    overflow
+                    or fallback is None
+                    or request.messages == original_messages
+                ),
+            )
+        elif overflow:
+            raise RuntimeError(
+                "prepared model context exceeds the active model window"
+            )
+        else:
+            context = fallback
+        return request, context, prompt_bytes
+
+    async def _preflight_model_context(
+        self,
+        provider: Any,
+        request: ModelRequest,
+        fallback: dict[str, Any] | None,
+        *,
+        fallback_overflow: bool = False,
+    ) -> dict[str, Any] | None:
+        def use_fallback() -> dict[str, Any] | None:
+            if fallback_overflow:
+                raise RuntimeError(
+                    "prepared model context exceeds the active model window"
+                )
+            return fallback
+
+        counter = getattr(provider, "count_tokens", None)
+        window = self.model_context_window_tokens
+        if not callable(counter) or window is None:
+            return use_fallback()
+        try:
+            used = await counter(request)
+        except Exception as exc:  # noqa: BLE001 - optional provider preflight
+            self.log.debug("provider token preflight failed: %s", exc)
+            return use_fallback()
+        if used is None:
+            self.log.debug("provider token preflight returned no count")
+            return use_fallback()
+        if type(used) is not int or used < 0:
+            self.log.debug("provider token preflight returned an invalid count")
+            return use_fallback()
+        if (
+            used + _context_reserved_tokens(request.parameters.get("max_tokens"))
+            > window
+        ):
+            raise RuntimeError(
+                "prepared model context exceeds the active model window"
+            )
+        return {
+            "type": "context",
+            "used": used,
+            "limit": window,
+            "unit": "tokens",
+            "scope": "prompt",
+            "source": "provider",
+        }
 
     def _record_context_calibration(
         self,
@@ -859,21 +980,23 @@ class CoraxRuntime:
             )
             messages = self._with_temporal_context(messages)
             model_key = str(data.get("model") or extension_id)
-            messages, _, prompt_bytes = await self._compact_messages_with_context(
-                messages,
-                session_id=session_id,
-                model_key=model_key,
-                max_tokens=data.get("max_tokens"),
-                prompt_overhead_bytes=self._prompt_overhead_bytes(data),
-            )
-            request = ModelRequest(
-                prompt=prompt,
-                messages=tuple(messages),
-                model=data.pop("model", None),
-                modalities=tuple(data.pop("modalities", ("text",))),
-                parameters=data,
-                session_id=session_id,
-            )
+            if operation == "plan":
+                request = self._model_request(
+                    prompt,
+                    messages,
+                    data,
+                    session_id,
+                )
+                prompt_bytes = None
+            else:
+                request, _, prompt_bytes = await self._prepare_model_request(
+                    item,
+                    prompt=prompt,
+                    messages=messages,
+                    data=data,
+                    session_id=session_id,
+                    model_key=model_key,
+                )
             correlation_id = getattr(request, "request_id", "") or f"model-{session_id}"
             await self.record_observation(
                 TraceStage.PLANNER_CALLED,
@@ -1047,21 +1170,13 @@ class CoraxRuntime:
         )
         messages = self._with_temporal_context(messages)
         model_key = str(data.get("model") or extension_id)
-        messages, context, prompt_bytes = await self._compact_messages_with_context(
-            messages,
+        request, context, prompt_bytes = await self._prepare_model_request(
+            item,
+            prompt=prompt,
+            messages=messages,
+            data=data,
             session_id=session_id,
             model_key=model_key,
-            max_tokens=data.get("max_tokens"),
-            prompt_overhead_bytes=self._prompt_overhead_bytes(data),
-        )
-        has_context_messages = bool(messages)
-        request = ModelRequest(
-            prompt=prompt,
-            messages=tuple(messages),
-            model=data.pop("model", None),
-            modalities=tuple(data.pop("modalities", ("text",))),
-            parameters=data,
-            session_id=session_id,
         )
         correlation_id = getattr(request, "request_id", "") or f"stream-{session_id}"
         await self.record_observation(
@@ -1076,7 +1191,7 @@ class CoraxRuntime:
             },
         )
         try:
-            if context is not None and has_context_messages:
+            if context is not None and request.messages:
                 yield context
             async for event in item.stream_generate_events(request):
                 if (

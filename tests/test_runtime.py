@@ -459,6 +459,326 @@ class TestRuntime(unittest.TestCase):
             ],
         )
 
+    def test_provider_preflight_counts_final_request_for_batch_and_stream(self) -> None:
+        from agent_core import ExtensionKind
+
+        order = []
+
+        class ContextManager:
+            id = "context.manager"
+            kind = ExtensionKind.RUNTIME_SERVICE
+            max_chars = 48_000
+
+            async def handle(self, request):
+                messages = list(request.payload["messages"])
+                messages.insert(
+                    -1,
+                    {"role": "system", "content": "compacted-history-marker"},
+                )
+                return SimpleNamespace(
+                    is_success=True,
+                    payload={
+                        "messages": messages,
+                        "chars_after": 137,
+                        "overflow": True,
+                    },
+                )
+
+        class Model:
+            id = "preflight.test"
+            kind = ExtensionKind.MODEL_PROVIDER
+
+            def __init__(self) -> None:
+                self.counted = []
+                self.generated = []
+
+            async def count_tokens(self, request):
+                order.append("count")
+                self.counted.append(request)
+                return (
+                    2_222
+                    if any(
+                        message.get("content") == "compacted-history-marker"
+                        for message in request.messages
+                    )
+                    else 127_000
+                )
+
+            async def generate(self, request):
+                order.append("generate")
+                self.generated.append(request)
+                return SimpleNamespace(
+                    is_success=True,
+                    payload={"text": "ok"},
+                    status=None,
+                )
+
+            async def stream_generate_events(self, request):
+                order.append("stream")
+                self.generated.append(request)
+                yield {"type": "done"}
+
+        model = Model()
+        self.runtime.services.register("context.manager", ContextManager())
+        self.runtime.models.register(model.id, model)
+        self.runtime.set_model_context_window(131_072)
+        payload = {
+            "messages": [
+                {"role": "user", "content": "first question"},
+                {"role": "assistant", "content": "first answer"},
+                {"role": "user", "content": "second question"},
+            ],
+            "max_tokens": 4_096,
+        }
+
+        asyncio.run(self.runtime.invoke_extension(model.id, payload))
+
+        async def collect() -> list[dict]:
+            return [
+                event
+                async for event in self.runtime.stream_extension(
+                    model.id,
+                    payload,
+                )
+            ]
+
+        events = asyncio.run(collect())
+        self.assertEqual(
+            order,
+            ["count", "count", "generate", "count", "count", "stream"],
+        )
+        self.assertIs(model.counted[1], model.generated[0])
+        self.assertIs(model.counted[3], model.generated[1])
+        for request in (model.counted[1], model.counted[3]):
+            self.assertTrue(
+                any(
+                    message.get("content") == "compacted-history-marker"
+                    for message in request.messages
+                )
+            )
+            self.assertTrue(
+                any(
+                    str(message.get("content", "")).startswith(
+                        "Trusted Corax runtime context"
+                    )
+                    for message in request.messages
+                )
+            )
+        self.assertEqual(
+            events,
+            [
+                {
+                    "type": "context",
+                    "used": 2_222,
+                    "limit": 131_072,
+                    "unit": "tokens",
+                    "scope": "prompt",
+                    "source": "provider",
+                },
+                {"type": "done"},
+            ],
+        )
+
+    def test_exact_preflight_preserves_full_history_when_it_fits(self) -> None:
+        from agent_core import ExtensionKind
+
+        class ContextManager:
+            id = "context.manager"
+            kind = ExtensionKind.RUNTIME_SERVICE
+
+            async def handle(self, request):
+                raise AssertionError("exact-fit history must not be compacted")
+
+        class Model:
+            id = "preflight.full-history"
+            kind = ExtensionKind.MODEL_PROVIDER
+
+            def __init__(self) -> None:
+                self.request = None
+
+            async def count_tokens(self, request):
+                return 2_222
+
+            async def generate(self, request):
+                self.request = request
+                return SimpleNamespace(
+                    is_success=True,
+                    payload={"text": "ok"},
+                    status=None,
+                )
+
+        model = Model()
+        self.runtime.services.register("context.manager", ContextManager())
+        self.runtime.models.register(model.id, model)
+        self.runtime.set_model_context_window(131_072)
+        history = [
+            {"role": "user", "content": "first question"},
+            {"role": "assistant", "content": "first answer"},
+            {"role": "user", "content": "second question"},
+        ]
+
+        asyncio.run(
+            self.runtime.invoke_extension(
+                model.id,
+                {"messages": history},
+            )
+        )
+
+        contents = [message.get("content") for message in model.request.messages]
+        for message in history:
+            self.assertIn(message["content"], contents)
+
+    def test_provider_preflight_overflow_stops_batch_and_stream(self) -> None:
+        from agent_core import ExtensionKind
+
+        class ContextManager:
+            id = "context.manager"
+            kind = ExtensionKind.RUNTIME_SERVICE
+            max_chars = 48_000
+
+            async def handle(self, request):
+                return SimpleNamespace(
+                    is_success=True,
+                    payload={
+                        "messages": list(request.payload["messages"]),
+                        "chars_after": 137,
+                    },
+                )
+
+        class Model:
+            id = "preflight.overflow"
+            kind = ExtensionKind.MODEL_PROVIDER
+
+            def __init__(self) -> None:
+                self.model_calls = 0
+                self.count_calls = 0
+
+            async def count_tokens(self, request):
+                self.count_calls += 1
+                return 5_000 if self.count_calls % 2 else None
+
+            async def generate(self, request):
+                self.model_calls += 1
+                raise AssertionError("oversized request reached the model")
+
+            async def stream_generate_events(self, request):
+                self.model_calls += 1
+                yield {"type": "done"}
+
+        model = Model()
+        self.runtime.services.register("context.manager", ContextManager())
+        self.runtime.models.register(model.id, model)
+        self.runtime.set_model_context_window(10_000)
+        payload = {
+            "messages": [{"role": "user", "content": "too large"}],
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "exceeds"):
+            asyncio.run(self.runtime.invoke_extension(model.id, payload))
+
+        async def collect() -> None:
+            async for _event in self.runtime.stream_extension(model.id, payload):
+                pass
+
+        with self.assertRaisesRegex(RuntimeError, "exceeds"):
+            asyncio.run(collect())
+        self.assertEqual(model.model_calls, 0)
+
+    def test_plan_skips_model_request_token_preflight(self) -> None:
+        from agent_core import ExtensionKind
+
+        class Model:
+            id = "preflight.plan"
+            kind = ExtensionKind.MODEL_PROVIDER
+
+            async def count_tokens(self, request):
+                raise AssertionError("plan sends a different request contract")
+
+            async def plan(self, request):
+                return SimpleNamespace(
+                    is_success=True,
+                    payload={"plan": "ok"},
+                    status=None,
+                )
+
+        self.runtime.models.register(Model.id, Model())
+        self.runtime.set_model_context_window(131_072)
+        result = asyncio.run(
+            self.runtime.invoke_extension(
+                Model.id,
+                {"operation": "plan", "prompt": "make a plan"},
+            )
+        )
+        self.assertEqual(result, {"plan": "ok"})
+
+    def test_provider_preflight_failure_keeps_host_fallback(self) -> None:
+        from agent_core import ExtensionKind
+
+        class ContextManager:
+            id = "context.manager"
+            kind = ExtensionKind.RUNTIME_SERVICE
+            max_chars = 48_000
+
+            async def handle(self, request):
+                return SimpleNamespace(
+                    is_success=True,
+                    payload={
+                        "messages": list(request.payload["messages"]),
+                        "chars_after": 137,
+                    },
+                )
+
+        class Model:
+            kind = ExtensionKind.MODEL_PROVIDER
+
+            def __init__(self, model_id, failure):
+                self.id = model_id
+                self.failure = failure
+
+            async def count_tokens(self, request):
+                if self.failure is not None:
+                    raise self.failure
+                return None
+
+            async def stream_generate_events(self, request):
+                yield {"type": "done"}
+
+        class ModelWithoutCounter:
+            id = "preflight.missing"
+            kind = ExtensionKind.MODEL_PROVIDER
+
+            async def stream_generate_events(self, request):
+                yield {"type": "done"}
+
+        self.runtime.services.register("context.manager", ContextManager())
+        self.runtime.set_model_context_window(131_072)
+        models = (
+            ModelWithoutCounter(),
+            Model("preflight.none", None),
+            Model("preflight.error", RuntimeError("tokenizer unavailable")),
+        )
+        for model in models:
+            self.runtime.models.register(model.id, model)
+
+        async def collect(model_id) -> list[dict]:
+            return [
+                event
+                async for event in self.runtime.stream_extension(
+                    model_id,
+                    {"messages": [{"role": "user", "content": "hello"}]},
+                )
+            ]
+
+        with self.assertLogs("corax.runtime", level="DEBUG") as logs:
+            results = [asyncio.run(collect(model.id)) for model in models]
+
+        for events in results:
+            self.assertEqual(events[0]["source"], "host")
+            self.assertEqual(events[0]["used"], 137)
+            self.assertEqual(events[-1], {"type": "done"})
+        self.assertIn("returned no count", "\n".join(logs.output))
+        self.assertIn("tokenizer unavailable", "\n".join(logs.output))
+
     def test_model_window_budget_uses_provider_prompt_calibration(self) -> None:
         from agent_core import ExtensionKind
 
