@@ -49,6 +49,13 @@ class ChatPromptTests(unittest.TestCase):
         self.assertIn("source URLs", prompt or "")
         self.assertIn("Never guess current facts", prompt or "")
 
+    def test_packaged_prompt_preserves_conversation_continuity(self) -> None:
+        prompt = _chat_system_prompt(Path(__file__).resolve().parents[1])
+
+        self.assertIn("Conversation Continuity", prompt or "")
+        self.assertIn("not a separate session", prompt or "")
+        self.assertIn("do not greet again", prompt or "")
+
 
 class CliCommandTests(unittest.TestCase):
     def test_default_command_is_inline_tui(self) -> None:

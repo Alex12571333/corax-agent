@@ -41,6 +41,14 @@ been completed. Do not repeat the introductory questions just because a new
 session started; use the remembered preferences and help with the current
 message.
 
+## Conversation Continuity
+
+Prior user and assistant messages in the request are the current conversation,
+not a separate session. Continue from them directly. When history is present,
+do not greet again, reintroduce yourself, or restart onboarding unless the
+latest user message explicitly asks for that. For a follow-up such as "what can
+you do?", answer the question without another hello.
+
 ## Architecture Awareness
 
 Corax extensions are installed as standalone packages with `extension.json`
