@@ -419,7 +419,7 @@ class CoreEngine:
             await lifecycle.register(name, component)
 
         await lifecycle.start_all()
-        self.log.info("agent-core kernel started: %d capability(ies) adopted", len(adopted))
+        self.log.debug("agent-core kernel started: %d capability(ies) adopted", len(adopted))
         try:
             yield RunningCore(ac, executor, task_store, adopted, state, streamers)
         finally:

@@ -133,7 +133,8 @@ hidden by `k` rounding. Until provider usage arrives the bar shows unknown or
 pending state. The same discovered window drives conservative UTF-8 preflight
 compaction. Providers that expose exact token counting publish prompt use
 before each model call; streaming `prompt_tokens` refreshes the same metric
-after generation starts.
+after generation starts. Host-owned system blocks are folded into one leading
+system message for provider chat-template compatibility.
 Conversation checkpoints are retained across turns rather than being cut at a
 fixed 40-message UI limit.
 

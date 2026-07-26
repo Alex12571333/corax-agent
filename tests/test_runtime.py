@@ -137,7 +137,9 @@ class TestRuntime(unittest.TestCase):
         finally:
             asyncio.run(runtime.stop())
             logger.handlers.clear()
-        self.assertNotIn("runtime started:", output.getvalue())
+        startup_log = output.getvalue()
+        self.assertNotIn("runtime started:", startup_log)
+        self.assertNotIn("agent-core kernel started:", startup_log)
 
     def test_status_after_start(self) -> None:
         asyncio.run(self.runtime.start())
@@ -360,17 +362,7 @@ class TestRuntime(unittest.TestCase):
 
         asyncio.run(stream())
 
-        blocks = [
-            next(
-                message["content"]
-                for message in request.messages
-                if message.get("role") == "system"
-                and message["content"].startswith(
-                    "Trusted Corax runtime context"
-                )
-            )
-            for request in model.requests
-        ]
+        blocks = [request.messages[0]["content"] for request in model.requests]
         self.assertEqual(len(blocks), 3)
         self.assertIn("Local date: 2026-07-26", blocks[0])
         self.assertIn("Local time: 23:59:58", blocks[0])
@@ -388,15 +380,13 @@ class TestRuntime(unittest.TestCase):
             )
         )
         for request in model.requests:
-            self.assertEqual(request.messages[0]["content"], "base policy")
+            self.assertTrue(request.messages[0]["content"].startswith("base policy"))
+            self.assertIn(
+                "Trusted Corax runtime context",
+                request.messages[0]["content"],
+            )
             self.assertEqual(
-                sum(
-                    message["content"].startswith(
-                        "Trusted Corax runtime context"
-                    )
-                    for message in request.messages
-                    if message.get("role") == "system"
-                ),
+                [message.get("role") for message in request.messages].count("system"),
                 1,
             )
 
@@ -498,7 +488,8 @@ class TestRuntime(unittest.TestCase):
                 return (
                     2_222
                     if any(
-                        message.get("content") == "compacted-history-marker"
+                        "compacted-history-marker"
+                        in str(message.get("content", ""))
                         for message in request.messages
                     )
                     else 127_000
@@ -552,7 +543,8 @@ class TestRuntime(unittest.TestCase):
         for request in (model.counted[1], model.counted[3]):
             self.assertTrue(
                 any(
-                    message.get("content") == "compacted-history-marker"
+                    "compacted-history-marker"
+                    in str(message.get("content", ""))
                     for message in request.messages
                 )
             )

@@ -668,9 +668,35 @@ class CoraxRuntime:
         session_id: str,
     ) -> ModelRequest:
         parameters = dict(data)
+        prepared = list(messages)
+        system = [
+            message
+            for message in prepared
+            if isinstance(message, dict) and message.get("role") == "system"
+        ]
+        if system:
+            merged = dict(system[0])
+            merged["content"] = "\n\n".join(
+                content
+                if isinstance(content := message.get("content", ""), str)
+                else json.dumps(content, ensure_ascii=False, default=str)
+                for message in system
+                if message.get("content", "") not in ("", None)
+            )
+            prepared = [
+                merged,
+                *[
+                    message
+                    for message in prepared
+                    if not (
+                        isinstance(message, dict)
+                        and message.get("role") == "system"
+                    )
+                ],
+            ]
         return ModelRequest(
             prompt=prompt,
-            messages=tuple(messages),
+            messages=tuple(prepared),
             model=parameters.pop("model", None),
             modalities=tuple(parameters.pop("modalities", ("text",))),
             parameters=parameters,
