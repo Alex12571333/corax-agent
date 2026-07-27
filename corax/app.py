@@ -61,6 +61,9 @@ class CoraxApp:
     async def run_menu(self) -> str:
         if self.runtime is None or self.config is None:
             raise RuntimeError("boot() must be called before run_menu()")
+        if self.config.agent.first_run:
+            self.config.agent.first_run = False
+            self._dirty = True
         menu = Menu(
             config=self.config,
             config_path=self.config_path,
@@ -72,6 +75,22 @@ class CoraxApp:
         if menu.changed:
             self._dirty = True
         return result
+
+    async def reload_config(self) -> AgentConfig:
+        """Reload one canonical config into both the app and runtime."""
+
+        if self.runtime is None:
+            raise RuntimeError("boot() must be called before reload_config()")
+        config = config_mod.load_config(self.config_path)
+        errors = config_mod.validate_config(config)
+        if errors:
+            raise ValueError("invalid Corax config:\n- " + "\n- ".join(errors))
+        paths = ensure_paths(config, self.config_path)
+        await self.runtime.reload_config(config)
+        self.config = config
+        self.paths = paths
+        self.log = setup_logging(config.runtime.log_level, paths.logs)
+        return config
 
     async def shutdown(self) -> None:
         if self._dirty and self.config is not None:

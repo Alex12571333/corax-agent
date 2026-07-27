@@ -7,7 +7,7 @@ Keeping them free of I/O makes them trivial to unit-test and keeps
 
 from __future__ import annotations
 
-from ..config import AgentConfig, ProviderSpec
+from ..config import AgentConfig, ExtensionSpec
 from ..paths import AgentPaths
 from ..runtime import RuntimeStatus
 
@@ -46,7 +46,7 @@ def status_screen(status: RuntimeStatus) -> list[str]:
 
 def providers_screen(
     title: str,
-    providers: dict[str, ProviderSpec],
+    providers: dict[str, ExtensionSpec],
     active: list[str],
 ) -> list[str]:
     out = [title, ""]
@@ -55,7 +55,7 @@ def providers_screen(
         return out
     for pid, spec in providers.items():
         active_mark = "*" if pid in active else " "
-        out.append(f"  {active_mark} {_mark(spec.enabled)} {pid}  ({spec.type})")
+        out.append(f"  {active_mark} {_mark(spec.enabled)} {pid}  ({spec.kind})")
         if spec.description:
             out.append(f"        {spec.description}")
     out.append("")
@@ -81,11 +81,10 @@ def security_screen(config: AgentConfig) -> list[str]:
     out = [
         "Security",
         "",
-        f"  1. mode             : {sec.mode}",
-        f"  2. core_readonly    : {sec.core_readonly}",
-        f"  3. allow_shell      : {sec.allow_shell}",
-        f"  4. allow_file_write : {sec.allow_file_write}",
-        "     modes: ask | auto | full (full needs command confirmation)",
+        f"  1. initial mode : {sec.mode}",
+        "     modes: ask | auto | full",
+        "     live decisions come from the bound policy provider",
+        "     and execution remains inside the sandbox",
         "",
         "  blocked_paths:",
     ]

@@ -1,10 +1,8 @@
 """Registries — the extension seams of Corax.
 
-A :class:`Registry` is a named, ordered collection of items keyed by id,
-each carrying an ``enabled`` flag. Real connectors, memory backends,
-providers and capabilities will register here at runtime; the scaffold
-registers stubs. The interface is intentionally tiny so nothing about
-the call sites changes when real implementations arrive.
+A :class:`Registry` is a named, ordered collection of active items keyed by id.
+Activation belongs to the canonical extension config; a populated registry
+contains only instances that actually loaded.
 """
 
 from __future__ import annotations
@@ -21,11 +19,10 @@ class RegistryError(KeyError):
 class RegistryEntry:
     id: str
     item: Any
-    enabled: bool = True
 
 
 class Registry:
-    """A minimal id -> item store with enable/disable semantics."""
+    """A minimal store for already-active runtime instances."""
 
     #: Override in subclasses for nicer logs / introspection.
     kind: str = "item"
@@ -35,21 +32,15 @@ class Registry:
         self._entries: dict[str, RegistryEntry] = {}
 
     # -- mutation -------------------------------------------------------- #
-    def register(self, id: str, item: Any, enabled: bool = True) -> None:
+    def register(self, id: str, item: Any) -> None:
         if id in self._entries:
             raise RegistryError(f"{self.name}: '{id}' is already registered")
-        self._entries[id] = RegistryEntry(id=id, item=item, enabled=enabled)
+        self._entries[id] = RegistryEntry(id=id, item=item)
 
     def unregister(self, id: str) -> None:
         if id not in self._entries:
             raise RegistryError(f"{self.name}: '{id}' is not registered")
         del self._entries[id]
-
-    def enable(self, id: str) -> None:
-        self._entry(id).enabled = True
-
-    def disable(self, id: str) -> None:
-        self._entry(id).enabled = False
 
     def clear(self) -> None:
         self._entries.clear()
@@ -57,9 +48,6 @@ class Registry:
     # -- access ---------------------------------------------------------- #
     def get(self, id: str) -> Any:
         return self._entry(id).item
-
-    def is_enabled(self, id: str) -> bool:
-        return self._entry(id).enabled
 
     def has(self, id: str) -> bool:
         return id in self._entries
@@ -69,9 +57,6 @@ class Registry:
 
     def list_all(self) -> list[RegistryEntry]:
         return list(self._entries.values())
-
-    def list_enabled(self) -> list[RegistryEntry]:
-        return [e for e in self._entries.values() if e.enabled]
 
     # -- dunder ---------------------------------------------------------- #
     def __len__(self) -> int:

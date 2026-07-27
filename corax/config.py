@@ -74,33 +74,6 @@ class RuntimeConfig:
 
 
 @dataclass
-class ProviderSpec:
-    enabled: bool = True
-    type: str = "provider"
-    description: str = ""
-    path: str = ""
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "ProviderSpec":
-        return cls(
-            enabled=bool(data.get("enabled", True)),
-            type=str(data.get("type", "provider")),
-            description=str(data.get("description", "")),
-            path=str(data.get("path", "")),
-        )
-
-    def to_dict(self) -> dict[str, Any]:
-        data = {
-            "enabled": self.enabled,
-            "type": self.type,
-            "description": self.description,
-        }
-        if self.path:
-            data["path"] = self.path
-        return data
-
-
-@dataclass
 class ExtensionSpec:
     """Configuration for one installable typed extension."""
 
@@ -129,15 +102,6 @@ class ExtensionSpec:
             data["path"] = self.path
         return data
 
-    def as_legacy(self) -> ProviderSpec:
-        return ProviderSpec(
-            enabled=self.enabled,
-            type=self.kind,
-            description=self.description,
-            path=self.path,
-        )
-
-
 @dataclass
 class ExtensionsConfig:
     """Single extension catalogue plus activation and role bindings."""
@@ -151,35 +115,8 @@ class ExtensionsConfig:
 
 
 @dataclass
-class PlannerConfig:
-    active: str = "stub"
-    providers: dict[str, ProviderSpec] = field(default_factory=dict)
-
-
-@dataclass
-class MemoryConfig:
-    active: str = "none"
-    providers: dict[str, ProviderSpec] = field(default_factory=dict)
-
-
-@dataclass
-class ConnectorsConfig:
-    active: list[str] = field(default_factory=list)
-    providers: dict[str, ProviderSpec] = field(default_factory=dict)
-
-
-@dataclass
-class CapabilitiesConfig:
-    enabled: list[str] = field(default_factory=list)
-    available: dict[str, ProviderSpec] = field(default_factory=dict)
-
-
-@dataclass
 class SecurityConfig:
     mode: str = "ask"
-    core_readonly: bool = True
-    allow_shell: bool = False
-    allow_file_write: bool = False
     blocked_paths: list[str] = field(default_factory=list)
 
 
@@ -252,10 +189,6 @@ class WebSearchConfig:
 class AgentConfig:
     agent: AgentMeta = field(default_factory=AgentMeta)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
-    planner: PlannerConfig = field(default_factory=PlannerConfig)
-    memory: MemoryConfig = field(default_factory=MemoryConfig)
-    connectors: ConnectorsConfig = field(default_factory=ConnectorsConfig)
-    capabilities: CapabilitiesConfig = field(default_factory=CapabilitiesConfig)
     extensions: ExtensionsConfig = field(default_factory=ExtensionsConfig)
     security: SecurityConfig = field(default_factory=SecurityConfig)
     limits: LimitsConfig = field(default_factory=LimitsConfig)
@@ -266,43 +199,6 @@ class AgentConfig:
 
     def to_dict(self) -> dict[str, Any]:
         return config_to_dict(self)
-
-    def refresh_legacy_views(self) -> None:
-        """Populate deprecated 0.1 config views from the canonical catalogue."""
-
-        self.planner = PlannerConfig(
-            active=self.extensions.bindings.get("planner", ""),
-            providers={
-                extension_id: spec.as_legacy()
-                for extension_id, spec in self.extensions.available.items()
-                if spec.kind == "model_provider"
-            },
-        )
-        memory_active = self.extensions.bindings.get("memory", "")
-        self.memory = MemoryConfig(
-            active=memory_active,
-            providers={
-                extension_id: spec.as_legacy()
-                for extension_id, spec in self.extensions.available.items()
-                if spec.kind == "memory_provider"
-            },
-        )
-        self.connectors = ConnectorsConfig(
-            active=self.extensions.active_for("channel_connector"),
-            providers={
-                extension_id: spec.as_legacy()
-                for extension_id, spec in self.extensions.available.items()
-                if spec.kind == "channel_connector"
-            },
-        )
-        self.capabilities = CapabilitiesConfig(
-            enabled=self.extensions.active_for("tool"),
-            available={
-                extension_id: spec.as_legacy()
-                for extension_id, spec in self.extensions.available.items()
-                if spec.kind == "tool"
-            },
-        )
 
 
 # --------------------------------------------------------------------------- #
@@ -318,100 +214,6 @@ def default_config() -> AgentConfig:
             workspace_path="./workspace",
             data_path="./data",
             logs_path="./logs",
-        ),
-        planner=PlannerConfig(
-            active="stub",
-            providers={
-                "stub": ProviderSpec(
-                    enabled=True, type="planner",
-                    description="Local stub planner for scaffold testing",
-                )
-            },
-        ),
-        memory=MemoryConfig(
-            active="none",
-            providers={
-                "none": ProviderSpec(
-                    enabled=True, type="memory",
-                    description="No persistent memory yet",
-                )
-            },
-        ),
-        connectors=ConnectorsConfig(
-            active=["terminal"],
-            providers={
-                "terminal": ProviderSpec(
-                    enabled=True, type="connector",
-                    description="Terminal connector placeholder",
-                )
-            },
-        ),
-        capabilities=CapabilitiesConfig(
-            enabled=[
-                "echo",
-                "filesystem",
-                "editor",
-                "shell",
-                "gateway",
-                "llm.local",
-                "telegram.connector",
-                "web.search",
-                "web.fetch",
-            ],
-            available={
-                "echo": ProviderSpec(
-                    enabled=True, type="tool",
-                    description="Built-in echo capability",
-                ),
-                "filesystem": ProviderSpec(
-                    enabled=True,
-                    type="tool",
-                    description="Workspace-confined filesystem capability",
-                    path="../corax-filesystem-capability",
-                ),
-                "editor": ProviderSpec(
-                    enabled=True,
-                    type="tool",
-                    description="Workspace-confined text editor capability",
-                    path="../corax-editor-capability",
-                ),
-                "shell": ProviderSpec(
-                    enabled=True,
-                    type="tool",
-                    description="Guarded local shell command capability",
-                    path="../corax-shell-capability",
-                ),
-                "gateway": ProviderSpec(
-                    enabled=True,
-                    type="tool",
-                    description="Channel-agnostic gateway policy and session context",
-                    path="../corax-gateway-capability",
-                ),
-                "llm.local": ProviderSpec(
-                    enabled=True,
-                    type="connector",
-                    description="Local Spark LLM connector (text + optional image/video)",
-                    path="../corax-llm-local-connector",
-                ),
-                "telegram.connector": ProviderSpec(
-                    enabled=True,
-                    type="connector",
-                    description="Telegram chat connector (streaming, commands, HTML formatting)",
-                    path="../corax-telegram-connector",
-                ),
-                "web.search": ProviderSpec(
-                    enabled=True,
-                    type="tool",
-                    description="Web search via a self-hosted SearXNG instance",
-                    path="../corax-web-search-capability",
-                ),
-                "web.fetch": ProviderSpec(
-                    enabled=True,
-                    type="tool",
-                    description="Guarded public-page fetch for grounded citations",
-                    path="../corax-web-search-capability/web_fetch",
-                ),
-            },
         ),
         extensions=ExtensionsConfig(
             active={
@@ -592,9 +394,6 @@ def default_config() -> AgentConfig:
         ),
         security=SecurityConfig(
             mode="ask",
-            core_readonly=True,
-            allow_shell=False,
-            allow_file_write=False,
             blocked_paths=["../corax-core", "../corax-sdk", "~/.ssh", ".env"],
         ),
         limits=LimitsConfig(
@@ -622,21 +421,12 @@ def default_config() -> AgentConfig:
             safesearch="",
         ),
     )
-    config.refresh_legacy_views()
     return config
 
 
 # --------------------------------------------------------------------------- #
 # Serialisation
 # --------------------------------------------------------------------------- #
-def _providers_to_dict(providers: dict[str, ProviderSpec]) -> dict[str, Any]:
-    return {pid: spec.to_dict() for pid, spec in providers.items()}
-
-
-def _providers_from_dict(data: dict[str, Any]) -> dict[str, ProviderSpec]:
-    return {pid: ProviderSpec.from_dict(spec or {}) for pid, spec in (data or {}).items()}
-
-
 def _extensions_to_dict(config: ExtensionsConfig) -> dict[str, Any]:
     return {
         "active": {
@@ -761,9 +551,6 @@ def config_to_dict(config: AgentConfig) -> dict[str, Any]:
         "extensions": _extensions_to_dict(config.extensions),
         "security": {
             "mode": config.security.mode,
-            "core_readonly": config.security.core_readonly,
-            "allow_shell": config.security.allow_shell,
-            "allow_file_write": config.security.allow_file_write,
             "blocked_paths": list(config.security.blocked_paths),
         },
         "limits": {
@@ -839,9 +626,6 @@ def config_from_dict(data: dict[str, Any]) -> AgentConfig:
                 str(security.get("mode", defaults.security.mode)),
                 str(security.get("mode", defaults.security.mode)),
             ),
-            core_readonly=bool(security.get("core_readonly", defaults.security.core_readonly)),
-            allow_shell=bool(security.get("allow_shell", defaults.security.allow_shell)),
-            allow_file_write=bool(security.get("allow_file_write", defaults.security.allow_file_write)),
             blocked_paths=list(security.get("blocked_paths", []) or []),
         ),
         limits=LimitsConfig(
@@ -875,7 +659,6 @@ def config_from_dict(data: dict[str, Any]) -> AgentConfig:
             safesearch=str(websearch.get("safesearch", defaults.websearch.safesearch)),
         ),
     )
-    config.refresh_legacy_views()
     return config
 
 
@@ -991,8 +774,11 @@ def validate_config(config: AgentConfig) -> list[str]:
         "hooks": "runtime_service",
         "subagents": "runtime_service",
         "sandbox": "runtime_service",
+        "observability": "observability",
     }
     for role, extension_id in config.extensions.bindings.items():
+        if not extension_id:
+            continue
         spec = config.extensions.available.get(extension_id)
         if spec is None:
             errors.append(

@@ -191,9 +191,6 @@ security:
   # ask = prompt for guarded work; auto = risk reviewer; full = policy-layer
   # full access (hard denials and tool/OS boundaries remain).
   mode: ask
-  core_readonly: true
-  allow_shell: false
-  allow_file_write: false
   blocked_paths:
     - ../corax-core
     - ../corax-sdk

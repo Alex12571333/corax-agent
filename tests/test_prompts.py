@@ -4,19 +4,22 @@ from __future__ import annotations
 
 import asyncio
 import signal
+import sys
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
-from main import (
+from corax.cli import (
     _chat_system_prompt,
     _minimal_runtime_snapshot,
-    _request_shutdown,
-    _run,
     _needs_setup,
+    _parse_confirmation_command,
+    _request_shutdown,
     _resolve_command,
+    _run,
+    _run_setup_wizard,
     build_parser,
 )
 
@@ -79,6 +82,27 @@ class CliCommandTests(unittest.TestCase):
         self.assertEqual(_resolve_command(args), "security")
         self.assertEqual(args.command_args, ["mode", "auto"])
 
+    def test_confirmation_command_scopes(self) -> None:
+        self.assertEqual(
+            _parse_confirmation_command("approve task-1"),
+            ("task-1", "allow_once"),
+        )
+        self.assertEqual(
+            _parse_confirmation_command("approve task-1 turn"),
+            ("task-1", "allow_turn"),
+        )
+        self.assertEqual(
+            _parse_confirmation_command("approve task-1 session"),
+            ("task-1", "allow_session"),
+        )
+        self.assertEqual(
+            _parse_confirmation_command("deny task-1 rule"),
+            ("task-1", "deny_rule"),
+        )
+        task_id, error = _parse_confirmation_command("approve task-1 forever")
+        self.assertIsNone(task_id)
+        self.assertIn("once|turn|session", error)
+
     def test_legacy_chat_flag_is_gateway(self) -> None:
         args = build_parser().parse_args(["--chat"])
         self.assertEqual(_resolve_command(args), "gateway")
@@ -95,13 +119,86 @@ class CliCommandTests(unittest.TestCase):
         self.assertFalse(_needs_setup("doctor", True))
         self.assertFalse(_needs_setup("status", True))
 
+    def test_missing_console_marks_guided_setup_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(sys.modules, {"corax_console": None}):
+                result = asyncio.run(
+                    _run_setup_wizard(
+                        Path(tmp) / "corax.json",
+                        first_run=True,
+                    )
+                )
+
+        self.assertIsNone(result)
+
+    def test_setup_gated_commands_fall_back_to_builtin_menu(self) -> None:
+        for argv in ([], ["setup"], ["gateway"]):
+            with self.subTest(argv=argv), tempfile.TemporaryDirectory() as tmp:
+                app = SimpleNamespace(
+                    boot=AsyncMock(),
+                    shutdown=AsyncMock(),
+                    run_menu=AsyncMock(return_value="eof"),
+                )
+                with (
+                    patch(
+                        "corax.cli._resolve_config_path",
+                        return_value=Path(tmp) / "corax.json",
+                    ),
+                    patch(
+                        "corax.cli._run_setup_wizard",
+                        new=AsyncMock(return_value=None),
+                    ),
+                    patch("corax.cli.CoraxApp", return_value=app),
+                    patch("corax.cli._print_setup_overview"),
+                ):
+                    result = asyncio.run(_run(build_parser().parse_args(argv)))
+
+                self.assertEqual(result, 0)
+                app.run_menu.assert_awaited_once()
+                app.shutdown.assert_awaited_once()
+
+    def test_tui_and_chat_fall_back_when_console_is_incomplete(self) -> None:
+        cases = (
+            ("tui", False, "model"),
+            ("chat", True, ""),
+        )
+        for command, has_console, model_id in cases:
+            with self.subTest(command=command):
+                runtime = SimpleNamespace(
+                    channels=SimpleNamespace(
+                        has=MagicMock(return_value=has_console),
+                    ),
+                    active_generation_model_id=MagicMock(
+                        return_value=model_id,
+                    ),
+                )
+                app = SimpleNamespace(
+                    runtime=runtime,
+                    boot=AsyncMock(),
+                    shutdown=AsyncMock(),
+                    run_menu=AsyncMock(return_value="eof"),
+                )
+                run_console = AsyncMock()
+                with (
+                    patch("corax.cli._needs_setup", return_value=False),
+                    patch("corax.cli.CoraxApp", return_value=app),
+                    patch("corax.cli._run_console_chat", new=run_console),
+                ):
+                    result = asyncio.run(
+                        _run(build_parser().parse_args([command]))
+                    )
+
+                self.assertEqual(result, 0)
+                app.run_menu.assert_awaited_once()
+                run_console.assert_not_awaited()
+
 
 class SignalTests(unittest.TestCase):
     def test_snapshot_works_without_resource_module(self) -> None:
         app = SimpleNamespace(runtime=None)
         with (
-            patch("main.resource", None),
-            patch("main.os.getpid", return_value=4321),
+            patch("corax.cli.resource", None),
+            patch("corax.cli.os.getpid", return_value=4321),
         ):
             self.assertEqual(
                 _minimal_runtime_snapshot(app),
@@ -127,8 +224,8 @@ class SignalTests(unittest.TestCase):
             },
         )
         with (
-            patch("main.resource", None),
-            patch("main.os.getpid", return_value=4321),
+            patch("corax.cli.resource", None),
+            patch("corax.cli.os.getpid", return_value=4321),
         ):
             snapshot = _minimal_runtime_snapshot(app)
 
@@ -172,12 +269,12 @@ class SignalTests(unittest.TestCase):
                 state = {"signum": 0}
 
                 with (
-                    patch("main.os.getpid", return_value=4321),
+                    patch("corax.cli.os.getpid", return_value=4321),
                     patch(
-                        "main.resource.getrusage",
+                        "corax.cli.resource.getrusage",
                         return_value=SimpleNamespace(ru_maxrss=raw_rss),
                     ),
-                    patch("main.sys.platform", platform),
+                    patch("corax.cli.sys.platform", platform),
                 ):
                     _request_shutdown(app, task, state, signum)
 
@@ -216,12 +313,12 @@ class SignalTests(unittest.TestCase):
 
         args = build_parser().parse_args(["status"])
         with (
-            patch("main.CoraxApp", App),
+            patch("corax.cli.CoraxApp", App),
             patch(
-                "main._install_shutdown_signal_handlers",
+                "corax.cli._install_shutdown_signal_handlers",
                 side_effect=install,
             ),
-            patch("main._restore_signal_handlers"),
+            patch("corax.cli._restore_signal_handlers"),
         ):
             result = asyncio.run(_run(args))
 

@@ -15,7 +15,7 @@ class TypedExtensionRegistry(Registry):
         self.kind = kind.value
         super().__init__(f"{kind.value}Registry")
 
-    def register(self, id: str, item: Any, enabled: bool = True) -> None:
+    def register(self, id: str, item: Any) -> None:
         actual = getattr(item, "kind", None)
         if isinstance(actual, str):
             try:
@@ -34,7 +34,7 @@ class TypedExtensionRegistry(Registry):
                 f"{self.name}: config id {id!r} does not match "
                 f"extension id {declared_id!r}"
             )
-        super().register(id, item, enabled)
+        super().register(id, item)
 
 
 class ExtensionCatalog:
@@ -49,8 +49,8 @@ class ExtensionCatalog:
         resolved = kind if isinstance(kind, ExtensionKind) else ExtensionKind(kind)
         return self._registries[resolved]
 
-    def register(self, id: str, item: Any, enabled: bool = True) -> None:
-        self.registry(getattr(item, "kind")).register(id, item, enabled)
+    def register(self, id: str, item: Any) -> None:
+        self.registry(getattr(item, "kind")).register(id, item)
 
     def get(self, id: str) -> Any:
         for registry in self._registries.values():

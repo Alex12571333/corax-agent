@@ -20,23 +20,20 @@ defaults to `corax.yaml` (or `corax.json` when PyYAML is absent).
 |----------------|----------------------------------------------------------------------------|
 | `agent`        | `name`, `profile`, `mode`, `first_run`                                      |
 | `runtime`      | `autostart`, `log_level`, `workspace_path`, `data_path`, `logs_path`        |
-| `planner`      | `active`, `providers{ id: {enabled,type,description} }`                      |
-| `memory`       | `active`, `providers{…}`                                                     |
-| `connectors`   | `active[]`, `providers{…}`                                                   |
-| `capabilities` | `enabled[]`, `available{…}`                                                  |
-| `security`     | `mode`, `core_readonly`, `allow_shell`, `allow_file_write`, `blocked_paths[]`|
+| `extensions`   | `active{kind: ids[]}`, `bindings{role:id}`, `available{id:spec}`              |
+| `security`     | `mode` (initial policy mode), `blocked_paths[]`                              |
 | `limits`       | `max_parallel_tasks`, `max_plan_tasks`, `max_tasks_per_correlation`, `task_timeout_seconds`, `max_payload_mb` |
 | `ui`           | `theme`, `mascot`, `show_banner`                                            |
 
-`planner.active` / `memory.active` are **single ids**; `connectors.active` and
-`capabilities.enabled` are **lists**.
+`extensions` is the only activation catalogue. `bindings` select one provider
+for scalar roles; `active` contains the loaded ids for every extension kind.
 
 ## Settings API
 
 ```python
 from corax import settings
 
-settings.get_setting(config, "security.allow_shell")          # -> False
+settings.get_setting(config, "runtime.autostart")             # -> True
 settings.set_setting(config, "runtime.log_level", "DEBUG")    # coerces by type
 settings.toggle_provider(config, "planner", "stub", True)     # enable/disable
 settings.set_active_provider(config, "memory", "none")        # set/append active
@@ -51,8 +48,9 @@ any active/enabled list so the config stays consistent.
 
 `validate_config(config) -> list[str]` returns human-readable errors (empty =
 valid). It checks: required sections, `log_level`, `security.mode`, that active
-planner/memory/connectors/capabilities exist and are enabled, and that limits
-are positive integers. `python main.py --init` runs it and reports warnings.
+extension ids and role bindings exist, have the right kind, and are enabled,
+and that limits are positive integers. `corax init` runs it and reports
+warnings.
 
 `security.mode` accepts `ask`, `auto`, or `full`. Old `normal`, `strict`, and
 `paranoid` values are migrated to the conservative `ask` mode. The selected
@@ -62,6 +60,6 @@ immutable deny rules and the actual filesystem/shell/OS boundaries remain.
 
 ## Editing via the menu
 
-`python main.py` opens a menu with sections for Runtime, Planner, Memory,
+`corax settings` opens a menu with sections for Runtime, Planner, Memory,
 Connectors, Capabilities, Security, Limits and Paths. "Save and Exit" writes
 the file; "Exit without saving" discards in-memory changes.

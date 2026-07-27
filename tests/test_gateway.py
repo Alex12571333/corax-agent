@@ -6,13 +6,13 @@ tests are fast and deterministic.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import tempfile
 import unittest
 from pathlib import Path
 
 from corax.gateway import CoraxTelegramGateway, GatewayError
-from corax.gateway.policy import GatewayPolicyEngine
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TELEGRAM_REPO = REPO_ROOT.parent / "corax-telegram-connector"
@@ -65,19 +65,41 @@ class FakeBackend:
         self.sends: list[str] = []
         self.documents: list[dict] = []
         self.tools_run: list = []
+        self.policy_calls: list[tuple[str, str | None, dict | None]] = []
         self.gateway_calls: list[dict] = []
         self.fail_capability: str | None = None
         self.fail_operation: str | None = None
         self.confirm_capability: str | None = None
 
-    async def run_capability(self, cap_id, payload, *, session_id=None):
+    async def run_capability(
+        self,
+        cap_id,
+        payload,
+        *,
+        session_id=None,
+        policy_metadata=None,
+    ):
         op = payload.get("operation")
         self.calls.append((cap_id, op, payload))
+        if policy_metadata is not None:
+            self.policy_calls.append(
+                (cap_id, session_id, dict(policy_metadata))
+            )
         if cap_id == self.fail_capability or (self.fail_operation is not None and op == self.fail_operation):
             raise GatewayError("boom")
         if cap_id == self.confirm_capability:
             error = GatewayError("confirmation required")
             error.task_id = "task-confirm-1"
+            error.approval = {
+                "summary": "Delete a project file",
+                "operation": "delete",
+                "resource": "notes.txt",
+                "workspace": "/tmp/corax-workspace",
+                "network": {"domains": [], "scope": "none"},
+                "credentials": ["workspace access"],
+                "risk": "high",
+            }
+            error.choices = ("allow_once", "allow_session", "deny_once")
             raise error
         if cap_id == "gateway":
             self.gateway_calls.append(payload)
@@ -124,7 +146,9 @@ class FakeBackend:
                     "recovery_steps": result.get("recovery_steps", []),
                     "recovery_prompt": recovery_prompt,
                 }
-            if op in {"new_session", "record_turn", "record_artifact", "forget_session"}:
+            if op == "new_session":
+                return {"operation": op, "ok": True, "session_id": "gw-new-session"}
+            if op in {"record_turn", "record_artifact", "forget_session"}:
                 return {"operation": op, "ok": True}
             return {"operation": op, "ok": True}
         if op == "poll":
@@ -221,7 +245,7 @@ class ToolSpecTests(unittest.IsolatedAsyncioTestCase):
     def test_tools_built_from_capabilities_excluding_infra(self) -> None:
         gw = _gateway(FakeBackend())
         names = {t["function"]["name"] for t in gw._tool_specs}
-        self.assertEqual(names, {"filesystem", "shell", "clock", "telegram_send_document"})
+        self.assertEqual(names, {"filesystem", "shell", "clock"})
         self.assertEqual(gw._tool_to_cap["filesystem"], "filesystem")
         clock = next(t for t in gw._tool_specs if t["function"]["name"] == "clock")
         self.assertEqual(clock["function"]["description"], "clock")  # falls back to id
@@ -235,7 +259,7 @@ class ToolSpecTests(unittest.IsolatedAsyncioTestCase):
     def test_gateway_capability_is_internal_not_model_tool(self) -> None:
         gw = _gateway(FakeBackend(), capabilities=CAPS_WITH_GATEWAY)
         names = {t["function"]["name"] for t in gw._tool_specs}
-        self.assertIn("telegram_send_document", names)
+        self.assertNotIn("telegram_send_document", names)
         self.assertNotIn("gateway", names)
 
     async def test_active_tools_are_selected_per_turn(self) -> None:
@@ -284,12 +308,12 @@ class ToolSpecTests(unittest.IsolatedAsyncioTestCase):
         names = {t["function"]["name"] for t in await gw._active_tool_specs("read file", allow_media=False)}
         self.assertIn("filesystem", names)
 
-    async def test_send_document_is_active_only_when_user_requested_media(self) -> None:
+    async def test_send_document_is_never_model_callable(self) -> None:
         gw = _gateway(FakeBackend(), tool_selector=lambda _query, _specs: ["filesystem"])
         without_media = {t["function"]["name"] for t in await gw._active_tool_specs("create file", allow_media=False)}
         with_media = {t["function"]["name"] for t in await gw._active_tool_specs("send file", allow_media=True)}
         self.assertNotIn("telegram_send_document", without_media)
-        self.assertIn("telegram_send_document", with_media)
+        self.assertNotIn("telegram_send_document", with_media)
 
     def test_shell_tool_log_args_are_compact(self) -> None:
         gw = _gateway(FakeBackend())
@@ -321,22 +345,22 @@ class ToolSpecTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("top-secret", generic)
         self.assertNotIn("example.com", shell)
 
-    def test_failed_tool_result_includes_recovery_hint(self) -> None:
+    def test_failed_tool_result_has_minimal_fallback_without_gateway(self) -> None:
         gw = _gateway(FakeBackend())
-        content = gw._format_tool_result_for_model({"error": "missing module"})
-        payload = json.loads(content)
-        self.assertFalse(payload["ok"])
-        self.assertIn("recovery_hint", payload)
-        self.assertIn("try another available tool", payload["recovery_hint"])
-
-    def test_failed_tool_result_classifies_errors(self) -> None:
-        gw = _gateway(FakeBackend())
-        missing_file = json.loads(gw._format_tool_result_for_model({"error": "file not found"}))
-        dependency = json.loads(gw._format_tool_result_for_model({"error": "ModuleNotFoundError: bs4"}))
-        self.assertEqual(missing_file["error_kind"], "missing_file_or_resource")
-        self.assertTrue(any("nearby paths" in step for step in missing_file["recovery_steps"]))
-        self.assertEqual(dependency["error_kind"], "missing_dependency")
-        self.assertTrue(any("environment" in step for step in dependency["recovery_steps"]))
+        gw._has_gateway_capability = False
+        plan = asyncio.run(
+            gw._plan_tool_recovery(
+                "session",
+                "filesystem",
+                {},
+                {"error": "missing module"},
+            )
+        )
+        self.assertTrue(plan["tool_failed"])
+        self.assertFalse(plan["tool_result"]["ok"])
+        self.assertIn("try another available tool", plan["tool_result"]["recovery_hint"])
+        self.assertNotIn("error_kind", plan["tool_result"])
+        self.assertNotIn("recovery_steps", plan["tool_result"])
 
 
 class ChatToolLoopTests(unittest.IsolatedAsyncioTestCase):
@@ -370,8 +394,44 @@ class ChatToolLoopTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(any("🔧 TOOL · filesystem" in message for message in backend.sends))
         approval = next(message for message in backend.sends if "⏸ APPROVAL" in message)
-        self.assertIn("/approve or /deny", approval)
-        self.assertIn("/security approve task-confirm-1", approval)
+        self.assertIn("Action: Delete a project file", approval)
+        self.assertIn("Resource: notes.txt", approval)
+        self.assertIn("Risk: high", approval)
+        self.assertIn("/security approve task-confirm-1 once", approval)
+        self.assertIn("/security approve task-confirm-1 session", approval)
+        self.assertIn("/security deny task-confirm-1 once", approval)
+        self.assertNotIn(" turn", approval)
+        self.assertNotIn(" rule", approval)
+
+    async def test_tool_call_keeps_session_and_trusted_policy_context(self) -> None:
+        backend = FakeBackend(
+            poll_batches=[[
+                {
+                    **_text_update(5, "list files"),
+                    "update_id": 123,
+                }
+            ]],
+            llm_responses=[
+                {"tool_calls": [_tool_call("filesystem", '{"path": "."}')]},
+                {"text": "done"},
+            ],
+        )
+        gw = _gateway(backend, workspace_path="/tmp/corax-workspace")
+        await gw.run(max_iterations=1)
+        self.assertEqual(len(backend.policy_calls), 1)
+        capability, session_id, metadata = backend.policy_calls[0]
+        self.assertEqual(capability, "filesystem")
+        self.assertEqual(session_id, "sess-fixed")
+        self.assertEqual(
+            metadata,
+            {
+                "actor": "5",
+                "transport": "telegram",
+                "workspace": "/tmp/corax-workspace",
+                "environment": "telegram",
+                "turn_id": "telegram:5:123",
+            },
+        )
 
     async def test_plain_answer_no_tools(self) -> None:
         backend = FakeBackend(poll_batches=[[_text_update(5, "hi")]],
@@ -579,7 +639,7 @@ class ChatToolLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(backend.documents[0]["path"], "/tmp/corax-workspace/test.txt")
         self.assertIn("test.txt", backend.documents[0]["caption"])
 
-    async def test_send_document_tool_without_user_request_is_denied(self) -> None:
+    async def test_hallucinated_send_document_tool_is_denied(self) -> None:
         backend = FakeBackend(
             poll_batches=[[_text_update(5, "create test.txt")]],
             llm_responses=[
@@ -593,9 +653,9 @@ class ChatToolLoopTests(unittest.IsolatedAsyncioTestCase):
         gen_calls = [p for _c, op, p in backend.calls if op == "generate"]
         tool_msg = _last_tool_message(gen_calls[1]["messages"])
         self.assertEqual(tool_msg["role"], "tool")
-        self.assertIn("file delivery was not requested", tool_msg["content"])
+        self.assertIn("host-controlled", tool_msg["content"])
 
-    async def test_send_document_tool_with_user_request_sends_document(self) -> None:
+    async def test_send_document_pseudo_tool_cannot_bypass_kernel(self) -> None:
         backend = FakeBackend(
             poll_batches=[[_text_update(5, "пришли test.txt")]],
             llm_responses=[
@@ -605,9 +665,10 @@ class ChatToolLoopTests(unittest.IsolatedAsyncioTestCase):
         )
         gw = _gateway(backend, workspace_path="/tmp/corax-workspace")
         await gw.run(max_iterations=1)
-        self.assertEqual(backend.documents[0]["path"], "/tmp/corax-workspace/test.txt")
-        self.assertEqual(backend.documents[0]["caption"], "готово")
-        self.assertIn("Отправил.", backend.sends)
+        self.assertEqual(backend.documents, [])
+        self.assertTrue(
+            any("telegram_send_document" in message and "failed" in message for message in backend.sends)
+        )
 
     async def test_explicit_file_request_auto_sends_created_file(self) -> None:
         backend = FakeBackend(
@@ -631,7 +692,7 @@ class ChatToolLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(backend.documents[0]["path"], "/tmp/corax-workspace/ukraine_news.txt")
         self.assertTrue(any("Файл сохранен локально" in sent for sent in backend.sends))
 
-    async def test_gateway_capability_plans_send_document_tool(self) -> None:
+    async def test_gateway_does_not_plan_direct_model_document_delivery(self) -> None:
         backend = FakeBackend(
             poll_batches=[[_text_update(5, "пришли test.txt")]],
             llm_responses=[
@@ -641,9 +702,9 @@ class ChatToolLoopTests(unittest.IsolatedAsyncioTestCase):
         )
         gw = _gateway(backend, capabilities=CAPS_WITH_GATEWAY, workspace_path="/tmp/corax-workspace")
         await gw.run(max_iterations=1)
-        self.assertEqual(backend.documents[0]["path"], "/tmp/corax-workspace/gateway-planned.txt")
+        self.assertEqual(backend.documents, [])
         ops = [call["operation"] for call in backend.gateway_calls]
-        self.assertIn("plan_file_delivery", ops)
+        self.assertNotIn("plan_file_delivery", ops)
 
     async def test_recent_created_file_is_available_on_next_turn(self) -> None:
         backend = FakeBackend(
@@ -666,8 +727,10 @@ class ChatToolLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             any("Recent local files" in m["content"] and "Test2.txt" in m["content"] for m in second_turn_messages)
         )
-        self.assertEqual(backend.documents[0]["path"], "/tmp/corax-workspace/Test2.txt")
-        self.assertIn("Отправил.", backend.sends)
+        self.assertEqual(backend.documents, [])
+        self.assertTrue(
+            any("telegram_send_document" in message and "failed" in message for message in backend.sends)
+        )
 
     async def test_tool_call_then_final_answer(self) -> None:
         backend = FakeBackend(
@@ -796,6 +859,55 @@ class ChatToolLoopTests(unittest.IsolatedAsyncioTestCase):
         messages = gen_calls[0]["messages"]
         self.assertTrue(any("новости экономики" in m.get("content", "") for m in messages))
         self.assertTrue(any("Ищу свежие новости экономики" in m.get("content", "") for m in messages))
+
+    async def test_local_standby_state_survives_failed_gateway_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "telegram-gateway-state.json"
+            session_ids = iter(["local-1", "local-2"])
+            first_backend = FakeBackend(
+                poll_batches=[[_text_update(5, "remember this")]],
+                llm_responses=[{"text": "remembered locally"}],
+            )
+            first_backend.fail_capability = "gateway"
+            first = _gateway(
+                first_backend,
+                capabilities=CAPS_WITH_GATEWAY,
+                state_path=state_path,
+                new_session=lambda: next(session_ids),
+            )
+            await first.run(max_iterations=1)
+            self.assertTrue(state_path.exists())
+            self.assertEqual(first._sessions["5"], "local-1")
+
+            second_backend = FakeBackend(
+                poll_batches=[[_text_update(5, "what did I say?")]],
+                llm_responses=[{"text": "you asked me to remember this"}],
+            )
+            second_backend.fail_capability = "gateway"
+            second = _gateway(
+                second_backend,
+                capabilities=CAPS_WITH_GATEWAY,
+                state_path=state_path,
+                new_session=lambda: next(session_ids),
+            )
+            await second.run(max_iterations=1)
+
+        self.assertEqual(second._sessions["5"], "local-1")
+        generate_calls = [
+            payload
+            for capability_id, operation, payload in second_backend.calls
+            if capability_id == "llm.local" and operation == "generate"
+        ]
+        messages = generate_calls[0]["messages"]
+        self.assertTrue(
+            any("remember this" in message.get("content", "") for message in messages)
+        )
+        self.assertTrue(
+            any(
+                "remembered locally" in message.get("content", "")
+                for message in messages
+            )
+        )
 
     async def test_profile_memory_survives_new_session(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -989,12 +1101,23 @@ class ChatToolLoopTests(unittest.IsolatedAsyncioTestCase):
         original = backend.run_capability
         seen_bad = False
 
-        async def fail_first_read(cap_id, payload, *, session_id=None):
+        async def fail_first_read(
+            cap_id,
+            payload,
+            *,
+            session_id=None,
+            policy_metadata=None,
+        ):
             nonlocal seen_bad
             if cap_id == "filesystem" and payload.get("path") == "missing.txt" and not seen_bad:
                 seen_bad = True
                 raise GatewayError("file not found")
-            return await original(cap_id, payload, session_id=session_id)
+            return await original(
+                cap_id,
+                payload,
+                session_id=session_id,
+                policy_metadata=policy_metadata,
+            )
 
         backend.run_capability = fail_first_read
         await _gateway(backend).run(max_iterations=1)
@@ -1015,18 +1138,32 @@ class ChatToolLoopTests(unittest.IsolatedAsyncioTestCase):
         original = backend.run_capability
         seen_bad = False
 
-        async def fail_first_read(cap_id, payload, *, session_id=None):
+        async def fail_first_read(
+            cap_id,
+            payload,
+            *,
+            session_id=None,
+            policy_metadata=None,
+        ):
             nonlocal seen_bad
             if cap_id == "filesystem" and payload.get("path") == "missing.txt" and not seen_bad:
                 seen_bad = True
                 raise GatewayError("file not found")
-            return await original(cap_id, payload, session_id=session_id)
+            return await original(
+                cap_id,
+                payload,
+                session_id=session_id,
+                policy_metadata=policy_metadata,
+            )
 
         backend.run_capability = fail_first_read
         await _gateway(backend).run(max_iterations=1)
         gen_calls = [p for _c, op, p in backend.calls if op == "generate"]
         self.assertTrue(
-            any("no recovery attempt" in (m.get("content") or "") for m in gen_calls[2]["messages"])
+            any(
+                "recovery service" in (m.get("content") or "")
+                for m in gen_calls[2]["messages"]
+            )
         )
         self.assertEqual(backend.tools_run[-1][1]["path"], "notes.txt")
         self.assertIn("Нашел файл.", backend.sends)
@@ -1096,11 +1233,29 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_new_session_resets_gateway_capability(self) -> None:
         backend = FakeBackend(poll_batches=[[_cmd_update(5, "new_session", reply="🆕")]])
-        await _gateway(backend, capabilities=CAPS_WITH_GATEWAY).run(max_iterations=1)
+        gw = _gateway(
+            backend,
+            capabilities=CAPS_WITH_GATEWAY,
+            new_session=lambda: self.fail("local session generator must not run"),
+        )
+        await gw.run(max_iterations=1)
         calls = [call for call in backend.gateway_calls if call["operation"] == "new_session"]
         self.assertEqual(calls[0]["channel"], "telegram")
         self.assertEqual(calls[0]["conversation_id"], 5)
-        self.assertEqual(calls[0]["session_id"], "sess-fixed")
+        self.assertNotIn("session_id", calls[0])
+        self.assertEqual(gw._sessions["5"], "gw-new-session")
+        self.assertIn("🆕", backend.sends)
+
+    async def test_new_session_uses_local_fallback_when_gateway_fails(self) -> None:
+        backend = FakeBackend(poll_batches=[[_cmd_update(5, "new_session", reply="🆕")]])
+        backend.fail_operation = "new_session"
+        gw = _gateway(
+            backend,
+            capabilities=CAPS_WITH_GATEWAY,
+            new_session=lambda: "local-fallback",
+        )
+        await gw.run(max_iterations=1)
+        self.assertEqual(gw._sessions["5"], "local-fallback")
         self.assertIn("🆕", backend.sends)
 
     async def test_reload(self) -> None:
@@ -1164,7 +1319,7 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
             }
 
         await _gateway(backend, security_command=security).run(max_iterations=2)
-        self.assertEqual(calls, [("approve task-confirm-1", "5", "telegram")])
+        self.assertEqual(calls, [("approve task-confirm-1 once", "5", "telegram")])
         self.assertIn("✅ TOOL · filesystem · operation=delete · completed", backend.sends)
         self.assertNotIn("result-secret", "\n".join(backend.sends))
 
@@ -1191,8 +1346,21 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
             return {"ok": True, "status": "cancelled", "message": "task denied"}
 
         await _gateway(backend, security_command=security).run(max_iterations=2)
-        self.assertEqual(calls, ["deny task-confirm-1"])
+        self.assertEqual(calls, ["deny task-confirm-1 once"])
         self.assertIn("❌ TOOL · filesystem · operation=delete · denied", backend.sends)
+
+    async def test_approval_alias_forwards_explicit_scope(self) -> None:
+        backend = FakeBackend()
+        calls: list[str] = []
+
+        async def security(command, *, actor, transport):
+            calls.append(command)
+            return {"ok": True, "message": "allowed", "resolution": "allow_session"}
+
+        gw = _gateway(backend, security_command=security)
+        gw._pending_approvals["5"] = {"task-1": "filesystem"}
+        await gw.handle_update(_cmd_update(5, "approve", args="task-1 session"))
+        self.assertEqual(calls, ["approve task-1 session"])
 
     async def test_full_security_approval_command_remains_compatible(self) -> None:
         backend = FakeBackend()
@@ -1373,23 +1541,6 @@ class LoopTests(unittest.IsolatedAsyncioTestCase):
         await _async_sleep(0)  # the real idle sleep (0s)
 
 
-class GatewayPolicyTests(unittest.IsolatedAsyncioTestCase):
-    async def test_allows_all_but_blocked(self) -> None:
-        from agent_core import PermissionLevel, RiskLevel, SideEffect
-        from agent_core.policy.base import PolicyContext
-
-        policy = GatewayPolicyEngine()
-
-        def ctx(level):
-            return PolicyContext(session_id="s", capability_id="c", permission_level=level,
-                                 risk_level=RiskLevel.HIGH, side_effects={SideEffect.EXECUTE_CODE},
-                                 required_scopes=set())
-
-        self.assertTrue((await policy.evaluate(None, None, ctx(PermissionLevel.CONFIRM))).allowed)
-        self.assertTrue((await policy.evaluate(None, None, ctx(PermissionLevel.DANGEROUS))).allowed)
-        self.assertFalse((await policy.evaluate(None, None, ctx(PermissionLevel.BLOCKED))).allowed)
-
-
 class HostRoleRoundTripTests(unittest.IsolatedAsyncioTestCase):
     """Infrastructure crosses host role ports and never enters the tool kernel."""
 
@@ -1493,7 +1644,7 @@ class EchoWrapperTests(unittest.IsolatedAsyncioTestCase):
                 return ac.HealthStatus.HEALTHY
 
         engine = CoreEngine(default_config())
-        async with engine.session([("fake.tool", FakeCap())], policy=GatewayPolicyEngine()) as kernel:
+        async with engine.session([("fake.tool", FakeCap())], policy=ac.DefaultPolicyEngine()) as kernel:
             out = await kernel.invoke("fake.tool", {"x": 21}, wait_timeout=10)
             self.assertEqual(out, {"doubled": 42})  # payload echoed by the wrapper
             with self.assertRaises(KernelInvocationError) as ctx:

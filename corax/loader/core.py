@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import uuid
 from typing import Any, AsyncIterator, Iterable
@@ -37,12 +38,26 @@ class KernelInvocationError(RuntimeError):
 class ConfirmationRequired(KernelInvocationError):
     """A kernel task is parked until an operator approves or denies it."""
 
-    def __init__(self, task_id: str, capability_id: str) -> None:
+    def __init__(
+        self,
+        task_id: str,
+        capability_id: str,
+        *,
+        approval: dict[str, Any] | None = None,
+    ) -> None:
         self.task_id = task_id
         self.capability_id = capability_id
+        self.approval = dict(approval or {})
+        raw_choices = self.approval.get("choices", ())
+        self.choices = tuple(
+            str(choice)
+            for choice in raw_choices
+            if isinstance(choice, str)
+        )
         super().__init__(
             f"confirmation required for {capability_id!r}; "
-            f"use /security approve {task_id} or /security deny {task_id}"
+            f"use /security approve {task_id} once|turn|session "
+            f"or /security deny {task_id} once|rule"
         )
 
 
@@ -52,6 +67,7 @@ _DECLARATION_ATTRS = (
     "config_schema", "secrets", "input_schema", "output_schema",
 )
 _echo_wrapper_cache: dict[int, type] = {}
+_CONFIRMATION_APPROVAL_METADATA = "_confirmation_approval"
 
 
 class _ExtensionTraceWriter:
@@ -164,6 +180,7 @@ class RunningCore:
         task_type: str = "generic",
         session_id: str | None = None,
         timeout_seconds: float | None = None,
+        policy_metadata: dict[str, str] | None = None,
     ) -> str:
         """Enqueue a READY task for ``required_capability`` and return its id."""
         Task, TaskStatus = self._ac.Task, self._ac.TaskStatus
@@ -174,6 +191,7 @@ class RunningCore:
             input=dict(input or {}),
             required_capability=required_capability,
             timeout_seconds=timeout_seconds,
+            metadata=dict(policy_metadata or {}),
         )
         await self.task_store.save(task)
         return task.task_id
@@ -200,25 +218,34 @@ class RunningCore:
         self,
         task_id: str,
         *,
-        approved: bool,
+        approved: bool | None = None,
+        resolution: str | None = None,
         actor: str = "operator",
+        transport: str = "local",
         reason: str = "",
         wait_timeout: float = 60.0,
     ) -> dict[str, Any]:
         """Resolve a parked task and, when approved, return its final payload."""
 
+        resolved = self._resolution_value(
+            approved=approved,
+            resolution=resolution,
+        )
         task = await self.executor.resolve_confirmation(
             task_id,
             approved=approved,
+            resolution=resolved,
             actor=actor,
+            transport=transport,
             reason=reason,
         )
-        if not approved:
+        if not resolved.startswith("allow_"):
             return {
                 "ok": True,
                 "task_id": task_id,
                 "status": task.status.value,
-                "message": f"task {task_id} denied",
+                "resolution": resolved,
+                "message": f"task {task_id} denied ({resolved})",
             }
         task = await self.wait(task_id, timeout=wait_timeout)
         state_key = task.input.get("state_key")
@@ -230,9 +257,25 @@ class RunningCore:
             "ok": task.status is self._ac.TaskStatus.COMPLETED,
             "task_id": task_id,
             "status": task.status.value,
+            "resolution": resolved,
             "result": payload,
-            "message": f"task {task_id} ended {task.status.value}",
+            "message": (
+                f"task {task_id} ended {task.status.value} "
+                f"after {resolved}"
+            ),
         }
+
+    @staticmethod
+    def _resolution_value(
+        *,
+        approved: bool | None,
+        resolution: str | None,
+    ) -> str:
+        if resolution is not None:
+            return str(getattr(resolution, "value", resolution))
+        if approved is None:
+            raise ValueError("approved or resolution is required")
+        return "allow_once" if approved else "deny_once"
 
     async def run_task(self, *, wait_timeout: float = 5.0, **submit_kwargs: Any) -> Any:
         """``submit_task`` + ``wait`` in one call; returns the final Task."""
@@ -248,6 +291,7 @@ class RunningCore:
         state_key: str = "_invoke_output",
         task_type: str = "generic",
         wait_timeout: float = 60.0,
+        policy_metadata: dict[str, str] | None = None,
     ) -> dict:
         """The canonical *through-the-core* call: run a capability and get its payload.
 
@@ -270,6 +314,7 @@ class RunningCore:
             session_id=sid,
             task_type=task_type,
             wait_timeout=wait_timeout,
+            policy_metadata=policy_metadata,
         )
         echoed = None
         if state_key and self.state_manager is not None:
@@ -277,7 +322,19 @@ class RunningCore:
             echoed = state.temporary_context.get(state_key)
 
         if task.status is self._ac.TaskStatus.WAITING_CONFIRMATION:
-            raise ConfirmationRequired(task.task_id, capability_id)
+            approval: dict[str, Any] = {}
+            raw_approval = task.metadata.get(_CONFIRMATION_APPROVAL_METADATA, "")
+            try:
+                candidate = json.loads(raw_approval)
+            except (TypeError, ValueError):
+                candidate = {}
+            if isinstance(candidate, dict):
+                approval = candidate
+            raise ConfirmationRequired(
+                task.task_id,
+                capability_id,
+                approval=approval,
+            )
         if task.status is not self._ac.TaskStatus.COMPLETED:
             detail = ""
             if isinstance(echoed, dict) and echoed.get("_error"):

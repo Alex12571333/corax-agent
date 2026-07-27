@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import tempfile
 import unittest
 from pathlib import Path
 
 from corax import config as cfg
 from corax.app import CoraxApp
+from corax.logging import setup_logging
 from corax.runtime import CoraxRuntime
 from corax.ui.menu import Menu
 from tests.helpers import scripted_terminal
@@ -43,15 +45,18 @@ class TestMenuFlows(unittest.TestCase):
         self.assertEqual(menu.config.runtime.log_level, "DEBUG")
         self.assertTrue(menu.changed)
 
-    def test_toggle_security_flag(self) -> None:
-        menu, _ = _menu(["7", "3", "", "0"])  # security -> toggle allow_shell -> back
+    def test_edit_initial_security_mode(self) -> None:
+        menu, _ = _menu(["7", "1", "auto", "", "0"])
         menu.run()
-        self.assertTrue(menu.config.security.allow_shell)
+        self.assertEqual(menu.config.security.mode, "auto")
 
     def test_deactivate_connector(self) -> None:
         menu, _ = _menu(["5", "x", "terminal", "", "0"])
         menu.run()
-        self.assertNotIn("terminal", menu.config.connectors.active)
+        self.assertNotIn(
+            "terminal",
+            menu.config.extensions.active["channel_connector"],
+        )
         self.assertTrue(menu.changed)
 
     def test_edit_limit_int(self) -> None:
@@ -168,6 +173,117 @@ class TestAppLifecycle(unittest.TestCase):
             reloaded = cfg.load_config(config_path)
             self.assertEqual(reloaded.runtime.log_level, "WARNING")
             self.assertFalse(reloaded.agent.first_run)
+
+    def test_menu_eof_acknowledges_existing_first_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "agent.json"
+            config = cfg.default_config()
+            for kind in config.extensions.active:
+                config.extensions.active[kind] = []
+            config.extensions.active["tool"] = ["echo"]
+            config.extensions.bindings = {
+                role: "" for role in config.extensions.bindings
+            }
+            cfg.save_config(config, config_path)
+            term, _ = scripted_terminal([])
+            app = CoraxApp(config_path, terminal=term)
+
+            asyncio.run(app.boot())
+            result = asyncio.run(app.run_menu())
+            asyncio.run(app.shutdown())
+
+            self.assertEqual(result, "eof")
+            self.assertFalse(cfg.load_config(config_path).agent.first_run)
+
+    def test_reload_keeps_app_and_runtime_on_same_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "agent.json"
+            config = cfg.default_config()
+            for kind in config.extensions.active:
+                config.extensions.active[kind] = []
+            config.extensions.active["tool"] = ["echo"]
+            config.extensions.bindings = {
+                role: "" for role in config.extensions.bindings
+            }
+            cfg.save_config(config, path)
+
+            app = CoraxApp(path)
+            asyncio.run(app.boot())
+            try:
+                updated = cfg.load_config(path)
+                updated.agent.name = "reloaded"
+                updated.runtime.workspace_path = "new-workspace"
+                cfg.save_config(updated, path)
+                reloaded = asyncio.run(app.reload_config())
+
+                self.assertIs(app.config, reloaded)
+                self.assertIs(app.runtime.config, reloaded)
+                self.assertEqual(app.config.agent.name, "reloaded")
+                self.assertEqual(app.paths.workspace, app.runtime.workspace_path)
+            finally:
+                asyncio.run(app.shutdown())
+
+    def test_reload_reconfigures_log_level_and_destination(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "agent.json"
+            config = cfg.default_config()
+            for kind in config.extensions.active:
+                config.extensions.active[kind] = []
+            config.extensions.active["tool"] = ["echo"]
+            config.extensions.bindings = {
+                role: "" for role in config.extensions.bindings
+            }
+            config.runtime.logs_path = "old-logs"
+            cfg.save_config(config, path)
+
+            app = CoraxApp(path)
+            asyncio.run(app.boot())
+            try:
+                updated = cfg.load_config(path)
+                updated.runtime.log_level = "ERROR"
+                updated.runtime.logs_path = "new-logs"
+                cfg.save_config(updated, path)
+                asyncio.run(app.reload_config())
+
+                logger = logging.getLogger("corax")
+                file_handlers = [
+                    handler
+                    for handler in logger.handlers
+                    if isinstance(handler, logging.FileHandler)
+                ]
+                self.assertEqual(logger.level, logging.ERROR)
+                self.assertEqual(len(file_handlers), 1)
+                self.assertEqual(
+                    Path(file_handlers[0].baseFilename),
+                    (Path(tmp) / "new-logs" / "corax.log").resolve(),
+                )
+            finally:
+                asyncio.run(app.shutdown())
+                setup_logging("INFO")
+
+    def test_invalid_reload_keeps_app_and_runtime_on_previous_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "agent.json"
+            config = cfg.default_config()
+            cfg.save_config(config, path)
+            app = CoraxApp(path)
+            asyncio.run(app.boot())
+            previous_config = app.config
+            previous_paths = app.paths
+            try:
+                invalid = cfg.load_config(path)
+                invalid.extensions.active["tool"].append("echo")
+                cfg.save_config(invalid, path)
+
+                with self.assertRaisesRegex(ValueError, "active in multiple roles"):
+                    asyncio.run(app.reload_config())
+
+                self.assertIs(app.config, previous_config)
+                self.assertIs(app.runtime.config, previous_config)
+                self.assertIs(app.paths, previous_paths)
+                self.assertTrue(app.runtime.running)
+            finally:
+                asyncio.run(app.shutdown())
 
 
 if __name__ == "__main__":

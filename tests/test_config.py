@@ -67,6 +67,17 @@ class TestValidation(unittest.TestCase):
         errors = cfg.validate_config(config)
         self.assertTrue(any("bindings.planner" in e for e in errors))
 
+    def test_empty_optional_binding_is_valid(self) -> None:
+        config = cfg.default_config()
+        config.extensions.bindings["observability"] = ""
+        self.assertEqual(cfg.validate_config(config), [])
+
+    def test_observability_binding_kind_is_checked(self) -> None:
+        config = cfg.default_config()
+        config.extensions.bindings["observability"] = "echo"
+        errors = cfg.validate_config(config)
+        self.assertTrue(any("bindings.observability" in e for e in errors))
+
     def test_non_positive_limit_flagged(self) -> None:
         config = cfg.default_config()
         config.limits.max_parallel_tasks = 0
@@ -80,11 +91,11 @@ class TestRoundTrip(unittest.TestCase):
             path = Path(tmp) / filename
             original = cfg.default_config()
             original.runtime.log_level = "DEBUG"
-            original.security.allow_shell = True
+            original.security.mode = "auto"
             cfg.save_config(original, path)
             loaded = cfg.load_config(path)
             self.assertEqual(loaded.runtime.log_level, "DEBUG")
-            self.assertTrue(loaded.security.allow_shell)
+            self.assertEqual(loaded.security.mode, "auto")
             self.assertEqual(loaded.to_dict(), original.to_dict())
 
     def test_json_round_trip(self) -> None:
@@ -106,6 +117,22 @@ class TestRoundTrip(unittest.TestCase):
         data = cfg.default_config().to_dict()
         data["security"]["mode"] = "normal"
         self.assertEqual(cfg.config_from_dict(data).security.mode, "ask")
+
+    def test_removed_noop_security_flags_are_ignored(self) -> None:
+        data = cfg.default_config().to_dict()
+        data["security"].update(
+            {
+                "core_readonly": False,
+                "allow_shell": True,
+                "allow_file_write": True,
+            }
+        )
+        loaded = cfg.config_from_dict(data)
+        self.assertFalse(hasattr(loaded.security, "allow_shell"))
+        self.assertEqual(
+            set(loaded.to_dict()["security"]),
+            {"mode", "blocked_paths"},
+        )
 
 
 class TestLLMConfig(unittest.TestCase):

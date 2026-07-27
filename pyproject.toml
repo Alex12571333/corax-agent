@@ -12,30 +12,9 @@ license = { text = "MIT" }
 authors = [{ name = "Corax" }]
 keywords = ["agent", "runtime", "cli"]
 dependencies = [
-    "agent-core @ git+https://github.com/Alex12571333/agent-core.git",
-    "agent-sdk @ git+https://github.com/Alex12571333/agent-sdk.git",
-    "corax-ui @ git+https://github.com/Alex12571333/corax-ui.git",
-    "corax-capability-filesystem @ git+https://github.com/Alex12571333/corax-filesystem-capability.git",
-    "corax-capability-editor @ git+https://github.com/Alex12571333/corax-editor-capability.git",
-    "corax-shell-capability @ git+https://github.com/Alex12571333/corax-shell-capability.git@05524a4336e7ea337b7058cd14e58115598c99af",
-    "corax-plugin-tool-discovery @ git+https://github.com/Alex12571333/corax-plugin-tool-discovery.git",
-    "corax-llm-local-connector @ git+https://github.com/Alex12571333/corax-llm-local-connector.git@a80d5a3acdd9da74899f8c6f9679770c80424a79",
-    "corax-telegram-connector @ git+https://github.com/Alex12571333/corax-telegram-connector.git@da4c08ed871c3bc0461118aa3945e2ad3990fa98",
-    "corax-web-search-capability @ git+https://github.com/Alex12571333/corax-web-search-capability.git@2735f41f000afc24d0b2c85df24ef78762dc091f",
-    "corax-runtime-gateway @ git+https://github.com/Alex12571333/corax-gateway-capability.git@838c83e3cf1f86cb2376ada63a1b3c76f5ca6129",
-    "corax-security-policy @ git+https://github.com/Alex12571333/corax-security-policy.git",
-    "corax-memory-loop @ git+https://github.com/Alex12571333/corax-memory-loop.git",
-    "corax-console @ git+https://github.com/Alex12571333/corax-console.git@52d81f00750fa8c5c4a338e323ee52b570f600a7",
-    "corax-tui @ git+https://github.com/Alex12571333/corax-tui.git@eb321dd6307163fd30d04352a615c6322ede3546",
-    "corax-state-store @ git+https://github.com/Alex12571333/corax-state-store.git",
-    "corax-context-manager @ git+https://github.com/Alex12571333/corax-context-manager.git@b80b562b782db852abd728a62d2694f93acf2fe8",
-    "corax-mcp-manager @ git+https://github.com/Alex12571333/corax-mcp-manager.git",
-    "corax-skills-runtime @ git+https://github.com/Alex12571333/corax-skills-runtime.git",
-    "corax-hooks-runtime @ git+https://github.com/Alex12571333/corax-hooks-runtime.git",
-    "corax-subagents @ git+https://github.com/Alex12571333/corax-subagents.git",
-    "corax-sandbox-executor @ git+https://github.com/Alex12571333/corax-sandbox-executor.git",
-    "corax-model-router @ git+https://github.com/Alex12571333/corax-model-router.git",
-    "corax-observability @ git+https://github.com/Alex12571333/corax-observability.git",
+    "agent-core>=0.2,<0.3",
+    "agent-sdk>=0.2,<0.3",
+    "corax-ui>=0.2,<0.3",
 ]
 
 [project.optional-dependencies]
@@ -51,11 +30,8 @@ dev = [
 ]
 
 [project.scripts]
-corax = "main:main"
-corax-agent = "main:main"
-
-[tool.setuptools]
-py-modules = ["main"]
+corax = "corax.cli:main"
+corax-agent = "corax.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["corax*"]

@@ -16,17 +16,17 @@ class TestGetSet(unittest.TestCase):
     def test_get_nested(self) -> None:
         self.assertEqual(settings.get_setting(self.config, "agent.name"), "corax")
         self.assertEqual(settings.get_setting(self.config, "runtime.log_level"), "INFO")
-        self.assertFalse(settings.get_setting(self.config, "security.allow_shell"))
+        self.assertFalse(settings.get_setting(self.config, "runtime.autostart"))
 
     def test_set_string(self) -> None:
         settings.set_setting(self.config, "ui.theme", "dark")
         self.assertEqual(self.config.ui.theme, "dark")
 
     def test_set_bool_coerces(self) -> None:
-        settings.set_setting(self.config, "security.allow_shell", "true")
-        self.assertIs(self.config.security.allow_shell, True)
-        settings.set_setting(self.config, "security.allow_shell", "no")
-        self.assertIs(self.config.security.allow_shell, False)
+        settings.set_setting(self.config, "runtime.autostart", "false")
+        self.assertIs(self.config.runtime.autostart, False)
+        settings.set_setting(self.config, "runtime.autostart", "yes")
+        self.assertIs(self.config.runtime.autostart, True)
 
     def test_set_int_coerces(self) -> None:
         settings.set_setting(self.config, "limits.max_parallel_tasks", "8")
@@ -46,22 +46,30 @@ class TestProviders(unittest.TestCase):
 
     def test_disable_then_enable(self) -> None:
         settings.toggle_provider(self.config, "planner", "stub", False)
-        self.assertFalse(self.config.planner.providers["stub"].enabled)
+        self.assertFalse(self.config.extensions.available["stub"].enabled)
         settings.toggle_provider(self.config, "planner", "stub", True)
-        self.assertTrue(self.config.planner.providers["stub"].enabled)
+        self.assertTrue(self.config.extensions.available["stub"].enabled)
 
     def test_disable_scalar_active_clears_active(self) -> None:
         settings.toggle_provider(self.config, "memory", "none", False)
-        self.assertEqual(self.config.memory.active, "")
         self.assertEqual(self.config.extensions.bindings["memory"], "")
+
+    def test_disable_clears_every_binding_to_provider(self) -> None:
+        settings.toggle_provider(self.config, "planner", "model.router", False)
+        self.assertEqual(self.config.extensions.bindings["primary_model"], "")
+        self.assertEqual(self.config.extensions.bindings["model_router"], "")
+        self.assertEqual(cfg.validate_config(self.config), [])
 
     def test_disable_list_active_removes_from_list(self) -> None:
         settings.toggle_provider(self.config, "connectors", "terminal", False)
-        self.assertNotIn("terminal", self.config.connectors.active)
+        self.assertNotIn(
+            "terminal",
+            self.config.extensions.active["channel_connector"],
+        )
 
     def test_set_active_scalar(self) -> None:
         settings.set_active_provider(self.config, "planner", "stub")
-        self.assertEqual(self.config.planner.active, "stub")
+        self.assertEqual(self.config.extensions.bindings["planner"], "stub")
 
     def test_set_active_disabled_raises(self) -> None:
         settings.toggle_provider(self.config, "planner", "stub", False)
@@ -70,9 +78,15 @@ class TestProviders(unittest.TestCase):
 
     def test_set_active_list_appends(self) -> None:
         settings.deactivate_provider(self.config, "connectors", "terminal")
-        self.assertNotIn("terminal", self.config.connectors.active)
+        self.assertNotIn(
+            "terminal",
+            self.config.extensions.active["channel_connector"],
+        )
         settings.set_active_provider(self.config, "connectors", "terminal")
-        self.assertIn("terminal", self.config.connectors.active)
+        self.assertIn(
+            "terminal",
+            self.config.extensions.active["channel_connector"],
+        )
 
     def test_unknown_provider_raises(self) -> None:
         with self.assertRaises(SettingError):

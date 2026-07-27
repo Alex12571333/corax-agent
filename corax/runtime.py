@@ -8,6 +8,7 @@ their role-specific contracts.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -29,7 +30,7 @@ from agent_core import (
 )
 
 from .capabilities import EchoCapability
-from .config import AgentConfig, ExtensionSpec
+from .config import AgentConfig, ExtensionSpec, validate_config
 from .connectors import TerminalConnector
 from .loader import CoreEngine, ExtensionLoader
 from .memory import NullMemory
@@ -213,54 +214,137 @@ class CoraxRuntime:
         self.core = CoreEngine(self.config, log=self.log)
         self._running = False
         self._started_at: datetime | None = None
+        self._started_extensions: list[tuple[str, Any]] = []
+        self._managed_environment: dict[str, str] = {}
 
     async def start(self) -> None:
         if self._running:
             return
-        self._apply_environment()
-        self._populate_extensions()
-        for entry in self.extensions:
-            await entry.item.start()
-        self._wire_runtime_services()
-        await self._dispatch_hooks(
-            "runtime_start",
-            {"root_path": str(self.root_path), "workspace_path": str(self.workspace_path)},
-        )
-        self._running = True
-        self._started_at = datetime.now(timezone.utc)
-        await self.record_observation(
-            TraceStage.SESSION_ACQUIRED,
-            correlation_id=f"runtime-{self._started_at.isoformat()}",
-            metadata={"event": "runtime_start", "mode": self.config.agent.mode},
-        )
-        self.log.debug("runtime started: %s", self.extensions.active_by_kind())
+        if self._started_extensions:
+            await self.stop()
+        starting: tuple[str, Any] | None = None
+        try:
+            self._apply_environment()
+            self._populate_extensions()
+            for entry in list(self.extensions):
+                starting = (entry.id, entry.item)
+                try:
+                    await asyncio.wait_for(
+                        entry.item.start(),
+                        timeout=float(self.config.limits.task_timeout_seconds),
+                    )
+                except Exception as exc:  # noqa: BLE001 - isolate one bad plugin
+                    self.log.warning(
+                        "extension '%s' failed to start and was isolated: %s",
+                        entry.id,
+                        exc,
+                    )
+                    await self._stop_extension(entry.id, entry.item)
+                    self.extensions.registry(entry.item.kind).unregister(entry.id)
+                else:
+                    self._started_extensions.append((entry.id, entry.item))
+                starting = None
+            self._wire_runtime_services()
+            await self._dispatch_hooks(
+                "runtime_start",
+                {
+                    "root_path": str(self.root_path),
+                    "workspace_path": str(self.workspace_path),
+                },
+            )
+            self._running = True
+            self._started_at = datetime.now(timezone.utc)
+            await self.record_observation(
+                TraceStage.SESSION_ACQUIRED,
+                correlation_id=f"runtime-{self._started_at.isoformat()}",
+                metadata={"event": "runtime_start", "mode": self.config.agent.mode},
+            )
+            self.log.debug("runtime started: %s", self.extensions.active_by_kind())
+        except BaseException:
+            # Cancellation and host-level startup failures are transactional.
+            # The item whose start() was interrupted is not in the started list.
+            if starting is not None:
+                await self._stop_extension(*starting)
+            await self.stop()
+            self.extensions.clear()
+            self._running = False
+            self._started_at = None
+            raise
 
     async def stop(self) -> None:
-        if not self._running:
+        if not self._running and not self._started_extensions:
             return
-        await self.record_observation(
-            TraceStage.RESULT_PUBLISHED,
-            correlation_id=f"runtime-{datetime.now(timezone.utc).isoformat()}",
-            metadata={"event": "runtime_stop"},
-        )
-        await self._dispatch_hooks("runtime_stop", {"root_path": str(self.root_path)})
-        for entry in reversed(list(self.extensions)):
-            try:
-                await entry.item.stop()
-            except Exception as exc:  # noqa: BLE001
-                self.log.warning("failed stopping extension '%s': %s", entry.id, exc)
+        if self._running:
+            await self.record_observation(
+                TraceStage.RESULT_PUBLISHED,
+                correlation_id=f"runtime-{datetime.now(timezone.utc).isoformat()}",
+                metadata={"event": "runtime_stop"},
+            )
+            await self._dispatch_hooks("runtime_stop", {"root_path": str(self.root_path)})
+        for extension_id, item in reversed(self._started_extensions):
+            await self._stop_extension(extension_id, item)
+        self._started_extensions.clear()
         self.extensions.clear()
         self._running = False
         self._started_at = None
 
     async def reload_config(self, config: AgentConfig | None = None) -> None:
-        was_running = self._running
+        candidate = config or self.config
+        errors = validate_config(candidate)
+        if errors:
+            raise ValueError("invalid Corax config:\n- " + "\n- ".join(errors))
+
+        was_running = self._running or bool(self._started_extensions)
+        previous = self.config
         await self.stop()
-        if config is not None:
-            self.config = config
-            self.core.config = config
-        if was_running:
-            await self.start()
+        self._install_config(candidate)
+        try:
+            if was_running:
+                await self.start()
+        except BaseException:
+            # Keep the last known-good composition usable if activation of the
+            # candidate fails or is cancelled.
+            try:
+                await self.stop()
+            except BaseException as exc:  # noqa: BLE001 - preserve reload error
+                self.log.warning("failed cleaning up rejected config: %s", exc)
+            self._install_config(previous)
+            if was_running:
+                try:
+                    await self.start()
+                except BaseException as exc:  # noqa: BLE001 - preserve reload error
+                    self.log.error("failed restoring previous config: %s", exc)
+            raise
+
+    async def _stop_extension(self, extension_id: str, item: Any) -> None:
+        task = asyncio.current_task()
+        cancellation_count = task.cancelling() if task is not None else 0
+        try:
+            await asyncio.wait_for(
+                item.stop(),
+                timeout=float(self.config.limits.task_timeout_seconds),
+            )
+        except asyncio.CancelledError as exc:
+            # Propagate a new cancellation, but do not let an extension that
+            # cancels its own stop() abort the rest of an existing rollback.
+            if task is not None and task.cancelling() > cancellation_count:
+                raise
+            self.log.warning(
+                "extension '%s' cancelled while stopping: %s",
+                extension_id,
+                exc,
+            )
+        except Exception as exc:  # noqa: BLE001 - cleanup must stay fail-soft
+            self.log.warning("failed stopping extension '%s': %s", extension_id, exc)
+
+    def _install_config(self, config: AgentConfig) -> None:
+        self.config = config
+        self.core.config = config
+        self.workspace_path = (
+            self.root_path / config.runtime.workspace_path
+        ).resolve()
+        self.data_path = (self.root_path / config.runtime.data_path).resolve()
+        self.extension_loader.workspace_path = self.workspace_path
 
     async def status(self) -> RuntimeStatus:
         return self.snapshot()
@@ -408,6 +492,19 @@ class CoraxRuntime:
         if router_id and self.models.has(router_id):
             return self.models.get(router_id)
         return None
+
+    def active_generation_model_id(self) -> str:
+        """Return the bound generator, or the first healthy local fallback."""
+
+        configured = self.config.extensions.bindings.get("primary_model", "")
+        if configured and self.models.has(configured):
+            provider = self.models.get(configured)
+            if callable(getattr(provider, "generate", None)):
+                return configured
+        for entry in self.models.list_all():
+            if callable(getattr(entry.item, "generate", None)):
+                return entry.id
+        return ""
 
     def active_observability(self) -> Any | None:
         """Return the selected host-only trace/audit sink."""
@@ -842,13 +939,17 @@ class CoraxRuntime:
         loop = self.active_memory_loop()
         if loop is None:
             return {"context": "", "records": [], "provider": ""}
-        result = await loop.handle(
-            ExtensionRequest(
-                operation="before_turn",
-                payload={"text": text, "scope": dict(scope or {})},
-                session_id=session_id,
+        try:
+            result = await loop.handle(
+                ExtensionRequest(
+                    operation="before_turn",
+                    payload={"text": text, "scope": dict(scope or {})},
+                    session_id=session_id,
+                )
             )
-        )
+        except Exception as exc:  # noqa: BLE001 - optional memory is fail-soft
+            self.log.warning("memory before_turn failed: %s", exc)
+            return {"context": "", "records": [], "provider": "", "degraded": True}
         if getattr(result, "is_success", False):
             return dict(result.payload or {})
         return {"context": "", "records": [], "provider": "", "degraded": True}
@@ -865,18 +966,22 @@ class CoraxRuntime:
         loop = self.active_memory_loop()
         if loop is None:
             return {"stored": False, "reason": "memory loop unavailable"}
-        result = await loop.handle(
-            ExtensionRequest(
-                operation="after_turn",
-                payload={
-                    "user_text": user_text,
-                    "assistant_text": assistant_text,
-                    "scope": dict(scope or {}),
-                    "explicit": explicit,
-                },
-                session_id=session_id,
+        try:
+            result = await loop.handle(
+                ExtensionRequest(
+                    operation="after_turn",
+                    payload={
+                        "user_text": user_text,
+                        "assistant_text": assistant_text,
+                        "scope": dict(scope or {}),
+                        "explicit": explicit,
+                    },
+                    session_id=session_id,
+                )
             )
-        )
+        except Exception as exc:  # noqa: BLE001 - optional memory is fail-soft
+            self.log.warning("memory after_turn failed: %s", exc)
+            return {"stored": False, "reason": "memory loop unavailable"}
         if getattr(result, "is_success", False):
             return dict(result.payload or {})
         return {"stored": False, "reason": "memory provider rejected write"}
@@ -891,50 +996,65 @@ class CoraxRuntime:
 
         loop = self.active_memory_loop()
         if loop is not None and hasattr(loop, "bind"):
-            loop.bind(self.active_memory())
+            try:
+                loop.bind(self.active_memory())
+            except Exception as exc:  # noqa: BLE001 - optional integration
+                self.log.warning("failed wiring memory loop: %s", exc)
         router = self.active_model_router()
         if router is not None and hasattr(router, "bind"):
-            router.bind(
-                {
-                    entry.id: entry.item
-                    for entry in self.models.list_enabled()
-                    if entry.id != getattr(router, "id", "")
-                }
-            )
+            try:
+                router.bind(
+                    {
+                        entry.id: entry.item
+                        for entry in self.models.list_all()
+                        if entry.id != getattr(router, "id", "")
+                    }
+                )
+            except Exception as exc:  # noqa: BLE001 - optional integration
+                self.log.warning("failed wiring model router: %s", exc)
         manager = self.active_mcp_manager()
         if manager is not None and hasattr(manager, "tool_proxies"):
-            for proxy in manager.tool_proxies():
-                if self.extensions.has(proxy.id):
-                    self.log.warning("MCP tool id collision: %s", proxy.id)
-                    continue
-                self.tools.register(proxy.id, proxy)
+            try:
+                for proxy in manager.tool_proxies():
+                    if self.extensions.has(proxy.id):
+                        self.log.warning("MCP tool id collision: %s", proxy.id)
+                        continue
+                    self.tools.register(proxy.id, proxy)
+            except Exception as exc:  # noqa: BLE001 - optional integration
+                self.log.warning("failed wiring MCP tools: %s", exc)
         orchestrator = self.active_subagent_orchestrator()
         if orchestrator is not None:
-            if hasattr(orchestrator, "bind"):
-                orchestrator.bind(self._run_subagent_model)
-            if hasattr(orchestrator, "tool_proxy"):
-                proxy = orchestrator.tool_proxy()
-                if self.extensions.has(proxy.id):
-                    self.log.warning("subagent tool id collision: %s", proxy.id)
-                else:
-                    self.tools.register(proxy.id, proxy)
+            try:
+                if hasattr(orchestrator, "bind"):
+                    orchestrator.bind(self._run_subagent_model)
+                if hasattr(orchestrator, "tool_proxy"):
+                    proxy = orchestrator.tool_proxy()
+                    if self.extensions.has(proxy.id):
+                        self.log.warning("subagent tool id collision: %s", proxy.id)
+                    else:
+                        self.tools.register(proxy.id, proxy)
+            except Exception as exc:  # noqa: BLE001 - optional integration
+                self.log.warning("failed wiring subagents: %s", exc)
         sandbox = self.active_sandbox_executor()
         if self.tools.has("shell") and hasattr(
             self.tools.get("shell"), "bind_executor"
         ):
-            self.tools.get("shell").bind_executor(sandbox)
+            try:
+                self.tools.get("shell").bind_executor(sandbox)
+            except Exception as exc:  # noqa: BLE001 - shell remains fail-closed
+                self.log.warning("failed wiring shell sandbox: %s", exc)
         hooks = self.active_hooks_runtime()
-        if (
-            hooks is not None
-            and hasattr(hooks, "wrap_tool")
-            and (
-                not hasattr(hooks, "has_event")
-                or hooks.has_event("pre_tool_call")
-                or hooks.has_event("post_tool_call")
-            )
-        ):
-            for entry in self.tools.list_all():
-                entry.item = hooks.wrap_tool(entry.item)
+        if hooks is not None and hasattr(hooks, "wrap_tool"):
+            try:
+                if (
+                    not hasattr(hooks, "has_event")
+                    or hooks.has_event("pre_tool_call")
+                    or hooks.has_event("post_tool_call")
+                ):
+                    for entry in self.tools.list_all():
+                        entry.item = hooks.wrap_tool(entry.item)
+            except Exception as exc:  # noqa: BLE001 - optional integration
+                self.log.warning("failed wiring tool hooks: %s", exc)
 
     async def _run_subagent_model(
         self,
@@ -942,8 +1062,8 @@ class CoraxRuntime:
         *,
         session_id: str,
     ) -> Any:
-        model_id = self.config.extensions.bindings.get("primary_model", "")
-        if not model_id or not self.models.has(model_id):
+        model_id = self.active_generation_model_id()
+        if not model_id:
             raise RuntimeError("primary model provider is unavailable")
         return await self.invoke_extension(
             model_id,
@@ -1326,30 +1446,39 @@ class CoraxRuntime:
                 os.environ.pop(env_name, None)
 
     def _apply_gateway_environment(self) -> None:
-        os.environ.setdefault(
+        self._set_default_environment(
             "CORAX_GATEWAY_STATE_PATH",
             str(self.data_path / "gateway-state.json"),
         )
 
     def _apply_state_environment(self) -> None:
-        os.environ.setdefault(
+        self._set_default_environment(
             "CORAX_STATE_PATH",
             str(self.data_path / "state"),
         )
 
     def _apply_security_environment(self) -> None:
-        os.environ.setdefault("CORAX_SECURITY_MODE", self.config.security.mode)
-        os.environ.setdefault(
+        self._set_default_environment("CORAX_SECURITY_MODE", self.config.security.mode)
+        self._set_default_environment(
             "CORAX_SECURITY_STATE_PATH",
             str(self.data_path / "security-policy.json"),
         )
-        os.environ.setdefault(
+        self._set_default_environment(
             "CORAX_SECURITY_AUDIT_PATH",
             str(self.data_path / "security-policy.audit.jsonl"),
         )
+        blocked_paths = ",".join(
+            path.strip()
+            for path in self.config.security.blocked_paths
+            if isinstance(path, str) and path.strip()
+        )
+        if blocked_paths:
+            os.environ["CORAX_SECURITY_BLOCKED_PATHS"] = blocked_paths
+        else:
+            os.environ.pop("CORAX_SECURITY_BLOCKED_PATHS", None)
 
     def _apply_skills_environment(self) -> None:
-        os.environ.setdefault(
+        self._set_default_environment(
             "CORAX_SKILLS_PATHS",
             os.pathsep.join(
                 (
@@ -1364,7 +1493,18 @@ class CoraxRuntime:
         os.environ["CORAX_SANDBOX_WORKSPACE"] = str(self.workspace_path)
 
     def _apply_observability_environment(self) -> None:
-        os.environ.setdefault(
+        self._set_default_environment(
             "CORAX_OBSERVABILITY_PATH",
             str(self.data_path / "observability" / "traces.jsonl"),
         )
+
+    def _set_default_environment(self, name: str, value: str) -> None:
+        """Update runtime-owned defaults without replacing operator overrides."""
+
+        previous = self._managed_environment.get(name)
+        current = os.environ.get(name)
+        if current is None or current == previous:
+            os.environ[name] = value
+            self._managed_environment[name] = value
+        else:
+            self._managed_environment.pop(name, None)

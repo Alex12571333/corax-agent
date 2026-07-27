@@ -169,6 +169,9 @@ call sites are unaffected.
 
 `security.policy` owns ask/auto/full authorization decisions and operator
 commands. Agent Core owns the generic policy checkpoint and one-time
-confirmation protocol. Concrete filesystem, shell, network, and connector
-packages still enforce their own technical boundaries. `BLOCKED` and
-administrator deny rules are not bypassed by full mode.
+confirmation protocol, including digest-bound turn/session leases. Concrete
+filesystem, shell, network, and connector packages still enforce their own
+technical boundaries. `BLOCKED` and administrator deny rules are not bypassed
+by full mode. Telegram document delivery remains host-controlled; the model
+catalogue does not expose a direct connector pseudo-tool until it can be
+represented as a typed kernel ToolCapability.

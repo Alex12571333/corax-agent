@@ -16,18 +16,12 @@ from __future__ import annotations
 from dataclasses import fields, is_dataclass
 from typing import Any
 
-from .config import AgentConfig, ExtensionSpec, ProviderSpec
+from .config import AgentConfig, ExtensionSpec
 
 # Sections whose ``active`` is a single id vs. a list of ids.
 _SCALAR_ACTIVE = {"planner", "memory"}
 _LIST_ACTIVE = {"connectors": "active", "capabilities": "enabled"}
-# Where each section keeps its provider catalogue.
-_PROVIDER_FIELD = {
-    "planner": "providers",
-    "memory": "providers",
-    "connectors": "providers",
-    "capabilities": "available",
-}
+_PROVIDER_SECTIONS = {"planner", "memory", "connectors", "capabilities"}
 
 
 class SettingError(KeyError):
@@ -38,7 +32,7 @@ class SettingError(KeyError):
 # Generic get / set by dotted path
 # --------------------------------------------------------------------------- #
 def get_setting(config: AgentConfig, key_path: str) -> Any:
-    """Read a value by dotted path, e.g. ``"security.allow_shell"``."""
+    """Read a value by dotted path, e.g. ``"runtime.autostart"``."""
     node: Any = config
     for part in key_path.split("."):
         node = _get_child(node, part, key_path)
@@ -106,12 +100,6 @@ def _to_bool(value: Any) -> bool:
 # --------------------------------------------------------------------------- #
 # Provider management
 # --------------------------------------------------------------------------- #
-def _provider_catalogue(config: AgentConfig, section: str) -> dict[str, ProviderSpec]:
-    if section not in _PROVIDER_FIELD:
-        raise SettingError(f"unknown provider section '{section}'")
-    return getattr(getattr(config, section), _PROVIDER_FIELD[section])
-
-
 def _canonical_id(section: str, provider_id: str) -> str:
     if section == "memory" and provider_id == "none":
         return "memory.none"
@@ -132,7 +120,7 @@ def _extension_spec(
     section: str,
     provider_id: str,
 ) -> tuple[str, ExtensionSpec]:
-    if section not in _PROVIDER_FIELD:
+    if section not in _PROVIDER_SECTIONS:
         raise SettingError(f"unknown provider section '{section}'")
     extension_id = _canonical_id(section, provider_id)
     try:
@@ -161,10 +149,9 @@ def toggle_provider(
         active = config.extensions.active.setdefault(spec.kind, [])
         if extension_id in active:
             active.remove(extension_id)
-        binding = "memory" if section == "memory" else "planner"
-        if section in _SCALAR_ACTIVE and config.extensions.bindings.get(binding) == extension_id:
-            config.extensions.bindings[binding] = ""
-    config.refresh_legacy_views()
+        for role, bound_id in config.extensions.bindings.items():
+            if bound_id == extension_id:
+                config.extensions.bindings[role] = ""
     return config
 
 
@@ -191,7 +178,6 @@ def set_active_provider(config: AgentConfig, section: str, provider_id: str) -> 
             active.append(extension_id)
     else:
         raise SettingError(f"section '{section}' has no active selection")
-    config.refresh_legacy_views()
     return config
 
 
@@ -203,5 +189,4 @@ def deactivate_provider(config: AgentConfig, section: str, provider_id: str) -> 
     active = config.extensions.active.setdefault(spec.kind, [])
     if extension_id in active:
         active.remove(extension_id)
-    config.refresh_legacy_views()
     return config

@@ -17,6 +17,8 @@ Corax is distributed as a source composition pinned to immutable Git commits.
 The installer creates an isolated Python environment, checks out every
 component at the release lock, and writes one `corax` launcher. It does not
 modify the global Python installation or overwrite an existing deployment.
+The base `corax-agent` package depends only on `agent-core`, `agent-sdk`, and
+`corax-ui`; every other component is optional and comes from that release lock.
 
 Current runtime requirements:
 
@@ -94,17 +96,18 @@ Inside terminal chat, use:
 /security mode auto
 /security mode full
 /security mode full <challenge>
-/security approve <task-id>
-/security deny <task-id>
+/security approve <task-id> once|turn|session
+/security deny <task-id> once|rule
 /memory status
 /memory search <query>
 /memory remember <text>
 /exit
 ```
 
-`/approve` and `/deny` resolve the current pending tool request without asking
-you to copy its task ID. The explicit `/security approve <task-id>` and
-`/security deny <task-id>` forms remain available.
+`/approve` and `/deny` keep the safe one-shot default and resolve the current
+pending tool request without asking you to copy its task ID. Explicit security
+commands may allow the exact operation once, for the current turn, or for the
+current session; a denial may be one-shot or create a narrow deny rule.
 
 ## Interface
 
@@ -155,9 +158,16 @@ tool name, safe argument summary, approval state, and completion or failure;
 Telegram sends the same start, approval, and outcome activity as separate
 messages. Raw tool payloads and secret-like arguments are not rendered.
 Tool calls are not cached or suppressed: repeated and changed calls remain
-available for real multi-step work. In `ask` mode every protected call gets
-its own approval; `auto` reviews routine calls automatically, while `full`
-still respects immutable denials and sandbox boundaries.
+available for real multi-step work. In `ask` mode protected calls not covered
+by a valid turn/session lease get their own approval; `auto` reviews routine
+calls automatically, while `full` still respects immutable denials and
+sandbox boundaries.
+
+Telegram document delivery is currently host-controlled. The direct
+`telegram_send_document` pseudo-tool is deliberately absent from the model
+catalogue until a typed ToolCapability proxy can route it through Agent Core,
+Policy, and the connector boundary. Requested workspace artifacts can still be
+attached by the gateway's validated host delivery path.
 
 For current or latest outside-world facts, the host adds its trusted local
 date, time, and timezone to every model request. `web.search` rewrites stale

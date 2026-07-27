@@ -6,10 +6,12 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 import io
 import logging
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 try:  # agent-core is only needed for the live capability integration test.
     from agent_core import CapabilityRequest, ResultStatus
@@ -201,10 +203,64 @@ class TestRuntime(unittest.TestCase):
         asyncio.run(self.runtime.start())
         new_config = cfg.default_config()
         new_config.extensions.active["channel_connector"] = []
-        new_config.refresh_legacy_views()
         asyncio.run(self.runtime.reload_config(new_config))
         self.assertTrue(self.runtime.running)
         self.assertEqual(len(self.runtime.connectors), 0)
+
+    def test_invalid_reload_leaves_running_composition_untouched(self) -> None:
+        asyncio.run(self.runtime.start())
+        previous_config = self.runtime.config
+        previous_echo = self.runtime.tools.get("echo")
+        invalid = cfg.default_config()
+        invalid.extensions.active["tool"].append("echo")
+
+        with self.assertRaisesRegex(ValueError, "active in multiple roles"):
+            asyncio.run(self.runtime.reload_config(invalid))
+
+        self.assertTrue(self.runtime.running)
+        self.assertIs(self.runtime.config, previous_config)
+        self.assertIs(self.runtime.tools.get("echo"), previous_echo)
+
+    def test_failed_reload_restores_last_running_config(self) -> None:
+        config = cfg.default_config()
+        for kind in config.extensions.active:
+            config.extensions.active[kind] = []
+        config.extensions.active["tool"] = ["echo"]
+        config.extensions.bindings = {
+            role: "" for role in config.extensions.bindings
+        }
+        runtime = CoraxRuntime(config)
+        asyncio.run(runtime.start())
+        previous_echo = runtime.tools.get("echo")
+        candidate = cfg.default_config()
+        for kind in candidate.extensions.active:
+            candidate.extensions.active[kind] = []
+        candidate.extensions.active["tool"] = ["echo"]
+        candidate.extensions.bindings = {
+            role: "" for role in candidate.extensions.bindings
+        }
+        candidate.agent.name = "rejected"
+        original_wire = runtime._wire_runtime_services
+
+        def wire_runtime_services() -> None:
+            if runtime.config is candidate:
+                raise RuntimeError("candidate wiring failed")
+            original_wire()
+
+        try:
+            with mock.patch.object(
+                runtime,
+                "_wire_runtime_services",
+                side_effect=wire_runtime_services,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "candidate wiring failed"):
+                    asyncio.run(runtime.reload_config(candidate))
+            self.assertTrue(runtime.running)
+            self.assertIs(runtime.config, config)
+            self.assertIsNot(runtime.tools.get("echo"), previous_echo)
+            self.assertEqual(runtime.config.agent.name, config.agent.name)
+        finally:
+            asyncio.run(runtime.stop())
 
     def test_unknown_provider_is_skipped(self) -> None:
         self.config.extensions.active["model_provider"] = ["openai"]
@@ -212,6 +268,265 @@ class TestRuntime(unittest.TestCase):
         asyncio.run(self.runtime.start())
         self.assertFalse(self.runtime.providers.has("openai"))
         self.assertEqual(len(self.runtime.providers), 0)
+
+    def test_broken_extension_is_isolated_and_cleaned_up(self) -> None:
+        from agent_core import ExtensionKind
+        import corax.runtime as runtime_module
+
+        events: list[str] = []
+
+        class Broken:
+            id = "broken"
+            kind = ExtensionKind.TOOL
+
+            async def start(self):
+                events.append("start")
+                raise RuntimeError("boom")
+
+            async def stop(self):
+                events.append("stop")
+
+        config = cfg.default_config()
+        for kind in config.extensions.active:
+            config.extensions.active[kind] = []
+        config.extensions.available["broken"] = cfg.ExtensionSpec(kind="tool")
+        config.extensions.active["tool"] = ["broken", "echo"]
+        with mock.patch.dict(runtime_module._BUILTIN_FACTORIES, {"broken": Broken}):
+            runtime = CoraxRuntime(config)
+            asyncio.run(runtime.start())
+            try:
+                self.assertTrue(runtime.running)
+                self.assertFalse(runtime.tools.has("broken"))
+                self.assertTrue(runtime.tools.has("echo"))
+                self.assertEqual(events, ["start", "stop"])
+            finally:
+                asyncio.run(runtime.stop())
+
+    def test_hung_extension_start_times_out_without_blocking_host(self) -> None:
+        from agent_core import ExtensionKind
+        import corax.runtime as runtime_module
+
+        events: list[str] = []
+
+        class Hung:
+            id = "hung"
+            kind = ExtensionKind.TOOL
+
+            async def start(self):
+                events.append("start")
+                await asyncio.Event().wait()
+
+            async def stop(self):
+                events.append("stop")
+
+        config = cfg.default_config()
+        for kind in config.extensions.active:
+            config.extensions.active[kind] = []
+        config.extensions.available["hung"] = cfg.ExtensionSpec(kind="tool")
+        config.extensions.active["tool"] = ["hung", "echo"]
+        config.limits.task_timeout_seconds = 0.01
+        with mock.patch.dict(runtime_module._BUILTIN_FACTORIES, {"hung": Hung}):
+            runtime = CoraxRuntime(config)
+            asyncio.run(runtime.start())
+            try:
+                self.assertTrue(runtime.running)
+                self.assertFalse(runtime.tools.has("hung"))
+                self.assertTrue(runtime.tools.has("echo"))
+                self.assertEqual(events, ["start", "stop"])
+            finally:
+                asyncio.run(runtime.stop())
+
+    def test_cancelled_start_stops_current_and_prior_extensions(self) -> None:
+        from agent_core import ExtensionKind
+        import corax.runtime as runtime_module
+
+        events: list[str] = []
+        entered = asyncio.Event()
+
+        class Fast:
+            id = "fast"
+            kind = ExtensionKind.TOOL
+
+            async def start(self):
+                events.append("start fast")
+
+            async def stop(self):
+                events.append("stop fast")
+
+        class Hanging:
+            id = "hanging"
+            kind = ExtensionKind.TOOL
+
+            async def start(self):
+                events.append("start hanging")
+                entered.set()
+                await asyncio.Event().wait()
+
+            async def stop(self):
+                events.append("stop hanging")
+
+        config = cfg.default_config()
+        for kind in config.extensions.active:
+            config.extensions.active[kind] = []
+        config.extensions.available["fast"] = cfg.ExtensionSpec(kind="tool")
+        config.extensions.available["hanging"] = cfg.ExtensionSpec(kind="tool")
+        config.extensions.active["tool"] = ["fast", "hanging"]
+        config.extensions.bindings = {
+            role: "" for role in config.extensions.bindings
+        }
+        runtime = CoraxRuntime(config)
+
+        async def cancel_during_start() -> None:
+            task = asyncio.create_task(runtime.start())
+            await entered.wait()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        with mock.patch.dict(
+            runtime_module._BUILTIN_FACTORIES,
+            {"fast": Fast, "hanging": Hanging},
+        ):
+            asyncio.run(cancel_during_start())
+
+        self.assertEqual(
+            events,
+            ["start fast", "start hanging", "stop hanging", "stop fast"],
+        )
+        self.assertFalse(runtime.running)
+        self.assertEqual(len(runtime.extensions), 0)
+        self.assertEqual(runtime._started_extensions, [])
+
+    def test_half_disabled_matrix_keeps_builtin_agent_operational(self) -> None:
+        from agent_core import TaskStatus
+
+        for parity in (0, 1):
+            with self.subTest(parity=parity), tempfile.TemporaryDirectory() as tmp:
+                config = cfg.default_config()
+                for kind, extension_ids in config.extensions.active.items():
+                    config.extensions.active[kind] = extension_ids[parity::2]
+                for kind, extension_id in (
+                    ("tool", "echo"),
+                    ("model_provider", "stub"),
+                    ("memory_provider", "memory.none"),
+                ):
+                    if extension_id not in config.extensions.active[kind]:
+                        config.extensions.active[kind].append(extension_id)
+                active_ids = {
+                    extension_id
+                    for extension_ids in config.extensions.active.values()
+                    for extension_id in extension_ids
+                }
+                for role, extension_id in config.extensions.bindings.items():
+                    if extension_id not in active_ids:
+                        config.extensions.bindings[role] = ""
+                for extension_id, spec in config.extensions.available.items():
+                    if spec.path:
+                        spec.path = str(Path(tmp) / "missing" / extension_id)
+
+                runtime = CoraxRuntime(config, root_path=tmp)
+                with mock.patch.dict(os.environ, {}, clear=True):
+                    asyncio.run(runtime.start())
+                    try:
+                        plan = asyncio.run(
+                            runtime.invoke_extension(
+                                "stub",
+                                {"operation": "plan", "prompt": "ping"},
+                            )
+                        )
+                        task = asyncio.run(
+                            runtime.execute(
+                                "echo",
+                                input={"text": "ping"},
+                            )
+                        )
+                        self.assertTrue(runtime.running)
+                        self.assertEqual(plan["tasks"][0]["capability"], "echo")
+                        self.assertIs(task.status, TaskStatus.COMPLETED)
+                    finally:
+                        asyncio.run(runtime.stop())
+
+    def test_generation_model_falls_back_from_non_generator_binding(self) -> None:
+        from agent_core import ExtensionKind
+
+        class Generator:
+            id = "generate.test"
+            kind = ExtensionKind.MODEL_PROVIDER
+
+            async def generate(self, request):
+                return None
+
+        self.runtime.models.register("stub", StubPlanner())
+        self.runtime.models.register("generate.test", Generator())
+        self.config.extensions.bindings["primary_model"] = "stub"
+        self.assertEqual(
+            self.runtime.active_generation_model_id(),
+            "generate.test",
+        )
+
+    def test_reload_recomputes_paths_and_runtime_owned_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = cfg.default_config()
+            for kind in config.extensions.active:
+                config.extensions.active[kind] = []
+            config.extensions.active["tool"] = ["echo"]
+            config.runtime.workspace_path = "old-work"
+            config.runtime.data_path = "old-data"
+            runtime = CoraxRuntime(config, root_path=tmp)
+
+            updated = cfg.default_config()
+            for kind in updated.extensions.active:
+                updated.extensions.active[kind] = []
+            updated.extensions.active["tool"] = ["echo"]
+            updated.extensions.bindings = {
+                role: "" for role in updated.extensions.bindings
+            }
+            updated.runtime.workspace_path = "new-work"
+            updated.runtime.data_path = "new-data"
+
+            with mock.patch.dict(os.environ, {}, clear=True):
+                asyncio.run(runtime.start())
+                asyncio.run(runtime.reload_config(updated))
+                try:
+                    self.assertEqual(
+                        runtime.workspace_path,
+                        (Path(tmp) / "new-work").resolve(),
+                    )
+                    self.assertEqual(
+                        runtime.data_path,
+                        (Path(tmp) / "new-data").resolve(),
+                    )
+                    self.assertEqual(
+                        runtime.extension_loader.workspace_path,
+                        runtime.workspace_path,
+                    )
+                    self.assertEqual(
+                        os.environ["CORAX_STATE_PATH"],
+                        str((Path(tmp) / "new-data" / "state").resolve()),
+                    )
+                finally:
+                    asyncio.run(runtime.stop())
+
+    def test_memory_service_failure_degrades_without_breaking_turn(self) -> None:
+        from agent_core import ExtensionKind
+
+        class BrokenMemoryLoop:
+            id = "memory.broken"
+            kind = ExtensionKind.RUNTIME_SERVICE
+
+            async def handle(self, request):
+                raise RuntimeError("memory unavailable")
+
+        self.runtime.services.register("memory.broken", BrokenMemoryLoop())
+        self.config.extensions.bindings["memory_loop"] = "memory.broken"
+        before = asyncio.run(
+            self.runtime.memory_before_turn("hello", session_id="s")
+        )
+        after = asyncio.run(
+            self.runtime.memory_after_turn("hello", "world", session_id="s")
+        )
+        self.assertTrue(before["degraded"])
+        self.assertFalse(after["stored"])
 
     def test_start_exports_llm_environment(self) -> None:
         import os
@@ -265,6 +580,26 @@ class TestRuntime(unittest.TestCase):
         finally:
             asyncio.run(runtime.stop())
             os.environ.pop("CORAX_WEBSEARCH_SAFESEARCH", None)
+
+    def test_start_exports_security_blocked_paths(self) -> None:
+        import os
+
+        old_value = os.environ.get("CORAX_SECURITY_BLOCKED_PATHS")
+        config = cfg.default_config()
+        config.security.blocked_paths = ["~/.ssh", ".env"]
+        runtime = CoraxRuntime(config)
+        asyncio.run(runtime.start())
+        try:
+            self.assertEqual(
+                os.environ["CORAX_SECURITY_BLOCKED_PATHS"],
+                "~/.ssh,.env",
+            )
+        finally:
+            asyncio.run(runtime.stop())
+            if old_value is None:
+                os.environ.pop("CORAX_SECURITY_BLOCKED_PATHS", None)
+            else:
+                os.environ["CORAX_SECURITY_BLOCKED_PATHS"] = old_value
 
     def test_start_exports_gateway_state_path(self) -> None:
         import os

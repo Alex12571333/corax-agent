@@ -173,6 +173,10 @@ class TestCoreEngine(unittest.TestCase):
             async with self.engine.session([("writer", writer)]) as kernel:
                 with self.assertRaises(ConfirmationRequired) as raised:
                     await kernel.invoke("writer", {"path": "notes.txt"})
+                self.assertEqual(
+                    raised.exception.choices,
+                    ("allow_once", "deny_once"),
+                )
                 return await kernel.resolve_confirmation(
                     raised.exception.task_id,
                     approved=True,
@@ -181,8 +185,49 @@ class TestCoreEngine(unittest.TestCase):
 
         result = asyncio.run(go())
         self.assertTrue(result["ok"])
+        self.assertEqual(result["resolution"], "allow_once")
         self.assertEqual(result["result"], {"written": True})
         self.assertEqual(writer.calls, 1)
+
+    def test_invoke_passes_policy_metadata_to_policy_context(self) -> None:
+        from agent_core import DecisionType, PolicyDecision, PolicyEngine
+
+        seen: list[dict] = []
+
+        class _RecordingPolicy(PolicyEngine):
+            async def evaluate(self, task, capability, context):
+                seen.append(dict(context.metadata))
+                return PolicyDecision(DecisionType.ALLOW, "recorded")
+
+        async def go():
+            async with self.engine.session(
+                [("adder", _make_adder())],
+                policy=_RecordingPolicy(),
+            ) as kernel:
+                return await kernel.invoke(
+                    "adder",
+                    {"a": 2, "b": 4},
+                    session_id="session-policy",
+                    policy_metadata={
+                        "actor": "local-console",
+                        "transport": "local",
+                        "workspace": "/project",
+                        "environment": "local",
+                        "turn_id": "turn-11",
+                    },
+                )
+
+        self.assertEqual(asyncio.run(go()), {"sum": 6})
+        self.assertEqual(
+            seen,
+            [{
+                "actor": "local-console",
+                "transport": "local",
+                "workspace": "/project",
+                "environment": "local",
+                "turn_id": "turn-11",
+            }],
+        )
 
     def test_session_unavailable_raises_when_core_absent(self) -> None:
         engine = CoreEngine(cfg.default_config())

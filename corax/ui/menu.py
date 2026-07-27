@@ -109,8 +109,8 @@ class Menu:
         self._provider_section(
             section="planner",
             title="Planner",
-            providers=self.config.planner.providers,
-            active=[self.config.planner.active],
+            providers=self._providers("model_provider"),
+            active=[self.config.extensions.bindings.get("planner", "")],
             list_based=False,
         )
 
@@ -118,8 +118,8 @@ class Menu:
         self._provider_section(
             section="memory",
             title="Memory",
-            providers=self.config.memory.providers,
-            active=[self.config.memory.active],
+            providers=self._providers("memory_provider"),
+            active=[self.config.extensions.bindings.get("memory", "")],
             list_based=False,
         )
 
@@ -127,8 +127,8 @@ class Menu:
         self._provider_section(
             section="connectors",
             title="Connectors",
-            providers=self.config.connectors.providers,
-            active=self.config.connectors.active,
+            providers=self._providers("channel_connector"),
+            active=self.config.extensions.active_for("channel_connector"),
             list_based=True,
         )
 
@@ -136,8 +136,8 @@ class Menu:
         self._provider_section(
             section="capabilities",
             title="Capabilities",
-            providers=self.config.capabilities.available,
-            active=self.config.capabilities.enabled,
+            providers=self._providers("tool"),
+            active=self.config.extensions.active_for("tool"),
             list_based=True,
         )
 
@@ -149,13 +149,7 @@ class Menu:
             if not choice:
                 return
             if choice == "1":
-                self._edit_scalar("security.mode", "security mode")
-            elif choice == "2":
-                self._toggle("security.core_readonly")
-            elif choice == "3":
-                self._toggle("security.allow_shell")
-            elif choice == "4":
-                self._toggle("security.allow_file_write")
+                self._edit_scalar("security.mode", "initial security mode")
             else:
                 self.term.write(f"  unknown field: {choice!r}")
 
@@ -273,14 +267,21 @@ class Menu:
 
     def _refresh_active(self, section: str) -> list[str]:
         if section == "planner":
-            return [self.config.planner.active]
+            return [self.config.extensions.bindings.get("planner", "")]
         if section == "memory":
-            return [self.config.memory.active]
+            return [self.config.extensions.bindings.get("memory", "")]
         if section == "connectors":
-            return self.config.connectors.active
+            return self.config.extensions.active_for("channel_connector")
         if section == "capabilities":
-            return self.config.capabilities.enabled
+            return self.config.extensions.active_for("tool")
         return []
+
+    def _providers(self, kind: str):
+        return {
+            extension_id: spec
+            for extension_id, spec in self.config.extensions.available.items()
+            if spec.kind == kind
+        }
 
     # -- editing helpers ------------------------------------------------- #
     def _edit_scalar(self, key_path: str, label: str) -> None:

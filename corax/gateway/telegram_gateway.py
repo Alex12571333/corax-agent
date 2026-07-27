@@ -7,7 +7,8 @@ future one), each executed **through the agent-core kernel**, with the result
 fed back to the model until it produces a final answer.
 
 The loop logic is pure: every side effect goes through one injected async
-callable ``run_capability(cap_id, payload, *, session_id=None) -> dict`` (a
+callable ``run_capability(cap_id, payload, *, session_id=None,
+policy_metadata=None) -> dict`` (a
 kernel ``invoke``), so it unit-tests without a kernel or network. Capabilities
 exposed as tools are built from the injected ``capabilities`` list — so new
 capabilities become available automatically, with no per-tool wiring.
@@ -33,10 +34,9 @@ _DEFAULT_SYSTEM_PROMPT = (
     "the arguments, inspect the environment, or try a different available tool. "
     "Ask the user only when the next step requires information or permission "
     "that is not available from the current context. "
-    "Only when the user explicitly asks you to send, attach, share, or upload a "
-    "local file, use the telegram_send_document tool. Do not send files just "
-    "because you created them. If the user asks for the file you just created "
-    "or discussed, use the recent local files context to choose the matching path."
+    "Do not invoke the Telegram connector directly. If the user asks for a file, "
+    "create or locate it with an ordinary kernel tool and mention its path; the "
+    "host-controlled delivery path will attach an eligible workspace artifact."
 )
 
 RunCapability = Callable[..., Awaitable[dict]]
@@ -209,15 +209,13 @@ class CoraxTelegramGateway:
         self._tool_specs: list[dict] = []
         self._tool_to_cap: dict[str, str] = {}
         self._cap_to_tool: dict[str, str] = {}
-        self._send_document_spec: dict[str, Any] | None = None
+        # ``telegram_available`` remains a constructor compatibility hint, but
+        # never adds a connector operation to the model's tool catalogue.
+        _ = telegram_available
         capability_list = list(capabilities)
         discovered_gateway = any(cap.get("id") == gateway_id for cap in capability_list)
-        discovered_telegram = any(cap.get("id") == telegram_id for cap in capability_list)
         self._has_gateway_capability = (
             discovered_gateway if gateway_available is None else gateway_available
-        )
-        has_telegram_connector = (
-            discovered_telegram if telegram_available is None else telegram_available
         )
         for cap in capability_list:
             cap_id = cap.get("id")
@@ -239,27 +237,6 @@ class CoraxTelegramGateway:
                     },
                 }
             )
-        if has_telegram_connector:
-            self._send_document_spec = {
-                "type": "function",
-                "function": {
-                    "name": _SEND_DOCUMENT_TOOL,
-                    "description": (
-                        "Send a local file to the current Telegram chat. Use only after "
-                        "the user explicitly asks to send, attach, share, or upload a file."
-                    ),
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "path": {"type": "string"},
-                            "caption": {"type": "string"},
-                        },
-                        "required": ["path"],
-                    },
-                },
-            }
-            self._tool_specs.append(self._send_document_spec)
-
         self._sessions: dict[Any, str] = {}
         self._history: dict[str, list[dict[str, Any]]] = {}
         self._recent_files: dict[str, list[str]] = {}
@@ -335,32 +312,49 @@ class CoraxTelegramGateway:
             return
         text = update.get("text")
         if isinstance(text, str) and text.strip():
-            await self._handle_chat(chat_id, text, chat_type=update.get("chat_type"))
+            update_id = update.get("update_id", update.get("message_id"))
+            turn_id = (
+                f"telegram:{chat_id}:{update_id}"
+                if update_id is not None
+                else f"telegram:{chat_id}:{uuid.uuid4().hex}"
+            )
+            await self._handle_chat(
+                chat_id,
+                text,
+                chat_type=update.get("chat_type"),
+                turn_id=turn_id,
+            )
 
     # -- dispatch -------------------------------------------------------- #
     async def _handle_command(self, chat_id: Any, command: dict) -> None:
         name = command.get("command")
         if name == "new_session":
             old_session_id = self._sessions.get(self._session_key(chat_id))
-            session_id = self._new_session()
-            self._sessions[self._session_key(chat_id)] = session_id
-            if old_session_id:
-                self._last_assistant_by_session.pop(old_session_id, None)
-            if not self._has_gateway_capability:
-                self._save_fallback_state()
+            session_id: str | None = None
             if self._has_gateway_capability:
                 try:
-                    await self._run(
+                    result = await self._run(
                         self.gateway_id,
                         {
                             "operation": "new_session",
                             "channel": "telegram",
                             "conversation_id": chat_id,
-                            "session_id": session_id,
                         },
                     )
+                    returned_session_id = (
+                        result.get("session_id") if isinstance(result, dict) else None
+                    )
+                    if isinstance(returned_session_id, str) and returned_session_id.strip():
+                        session_id = returned_session_id.strip()
                 except Exception as exc:  # noqa: BLE001 - command reply should still work
                     self.log.debug("gateway new_session failed: %s", exc)
+            if session_id is None:
+                session_id = self._new_session()
+            self._sessions[self._session_key(chat_id)] = session_id
+            if old_session_id:
+                self._last_assistant_by_session.pop(old_session_id, None)
+            if not self._has_gateway_capability:
+                self._save_fallback_state()
             await self._send(chat_id, command.get("reply") or "🆕 New session started.")
         elif name == "reload_agent":
             await self._send(chat_id, command.get("reply") or "♻️ Reloading the agent…")
@@ -394,8 +388,15 @@ class CoraxTelegramGateway:
         if name in {"approve", "deny"}:
             action = name
             explicit_ids = args.split()
-            if len(explicit_ids) > 1:
-                await self._send(chat_id, f"Usage: /{name} [task-id]")
+            if len(explicit_ids) > 2:
+                await self._send(
+                    chat_id,
+                    (
+                        f"Usage: /{name} [task-id] [once|turn|session]"
+                        if name == "approve"
+                        else f"Usage: /{name} [task-id] [once|rule]"
+                    ),
+                )
                 return
             if explicit_ids:
                 task_id = explicit_ids[0]
@@ -416,10 +417,25 @@ class CoraxTelegramGateway:
                     )
                     return
                 task_id = next(iter(pending))
-            command = f"{action} {task_id}"
+            scope = explicit_ids[1] if len(explicit_ids) == 2 else "once"
+            valid_scopes = (
+                {"once", "turn", "session"}
+                if action == "approve"
+                else {"once", "rule"}
+            )
+            if scope not in valid_scopes:
+                await self._send(
+                    chat_id,
+                    (
+                        f"Usage: /{name} [task-id] "
+                        f"[{'|'.join(sorted(valid_scopes))}]"
+                    ),
+                )
+                return
+            command = f"{action} {task_id} {scope}"
         elif action in {"approve", "deny"}:
             parts = command.split()
-            if len(parts) == 2:
+            if len(parts) in {2, 3}:
                 task_id = parts[1]
 
         pending = self._pending_approvals.get(self._session_key(chat_id), {})
@@ -461,7 +477,14 @@ class CoraxTelegramGateway:
             str(message) if isinstance(message, str) and message else fallback,
         )
 
-    async def _handle_chat(self, chat_id: Any, text: str, *, chat_type: Any = None) -> None:
+    async def _handle_chat(
+        self,
+        chat_id: Any,
+        text: str,
+        *,
+        chat_type: Any = None,
+        turn_id: str = "",
+    ) -> None:
         prepared = await self._prepare_turn(chat_id, text)
         session_id = prepared["session_id"]
         allow_media = bool(prepared["allow_outbound_file"])
@@ -502,7 +525,13 @@ class CoraxTelegramGateway:
                 ):
                     recovery_prompts += 1
                     self.log.info("tool recovery prompt inserted after failed step")
-                    messages.append({"role": "system", "content": recovery_prompt or self._tool_recovery_prompt()})
+                    messages.append(
+                        {
+                            "role": "system",
+                            "content": recovery_prompt
+                            or self._fallback_recovery_prompt(),
+                        }
+                    )
                     continue
                 final_text = response.get("text") or ""
                 if response.get("_streamed"):
@@ -524,8 +553,7 @@ class CoraxTelegramGateway:
                     tool_call,
                     chat_id=chat_id,
                     session_id=session_id,
-                    allow_media=allow_media,
-                    user_text=text,
+                    turn_id=turn_id,
                 )
                 artifact_path = tool_outcome.get("artifact_path")
                 if isinstance(artifact_path, str) and artifact_path:
@@ -776,8 +804,7 @@ class CoraxTelegramGateway:
         *,
         chat_id: Any,
         session_id: str,
-        allow_media: bool,
-        user_text: str,
+        turn_id: str,
     ) -> dict[str, Any]:
         function = tool_call.get("function") or {}
         name = function.get("name")
@@ -795,15 +822,14 @@ class CoraxTelegramGateway:
         await self._send_tool_activity(chat_id, f"🔧 TOOL · {activity}")
 
         if name == _SEND_DOCUMENT_TOOL:
-            result = await self._run_send_document_tool(
-                chat_id,
-                args,
-                session_id=session_id,
-                user_text=user_text,
-                allow_media=allow_media,
-            )
-            artifact_path = result.get("path") if result.get("ok") is True else None
-            document_sent = result.get("ok") is True
+            result = {
+                "error": (
+                    "telegram_send_document is host-controlled and is not "
+                    "available to the model"
+                )
+            }
+            artifact_path = None
+            document_sent = False
         elif cap_id is None:
             result: dict[str, Any] = {"error": f"unknown tool {name!r}"}
             artifact_path = None
@@ -812,15 +838,36 @@ class CoraxTelegramGateway:
             self.log.info("tool %-20s %s", cap_id, self._format_tool_args_for_log(cap_id, args))
             self.log.debug("tool payload: %s(%s)", cap_id, args)
             try:
-                result = await self._run(cap_id, args)
+                result = await self._run(
+                    cap_id,
+                    args,
+                    session_id=session_id,
+                    policy_metadata={
+                        "actor": str(chat_id),
+                        "transport": "telegram",
+                        "workspace": str(self.workspace_path),
+                        "environment": "telegram",
+                        "turn_id": turn_id,
+                    },
+                )
             except Exception as exc:  # noqa: BLE001 - a failed tool feeds the error back
                 result = {"error": str(exc)}
                 task_id = getattr(exc, "task_id", None)
                 if isinstance(task_id, str) and task_id:
+                    approval = getattr(exc, "approval", {})
+                    choices = getattr(exc, "choices", ())
                     result.update(
                         {
                             "confirmation_required": True,
                             "task_id": task_id,
+                            "approval": (
+                                approval if isinstance(approval, dict) else {}
+                            ),
+                            "choices": [
+                                choice
+                                for choice in choices
+                                if isinstance(choice, str)
+                            ],
                             "approve_command": f"/security approve {task_id}",
                             "deny_command": f"/security deny {task_id}",
                         }
@@ -851,7 +898,10 @@ class CoraxTelegramGateway:
                 self.log.warning(
                     "tool %-20s failed: %s",
                     cap_id,
-                    self._compact_log_value(self._tool_error_text(result), limit=100),
+                    self._compact_log_value(
+                        self._tool_error_summary(result),
+                        limit=100,
+                    ),
                 )
             model_result = recovery_plan.get("tool_result")
             if not isinstance(model_result, dict):
@@ -869,7 +919,10 @@ class CoraxTelegramGateway:
                 self.log.warning(
                     "tool %-20s failed: %s",
                     cap_id,
-                    self._compact_log_value(self._tool_error_text(result), limit=100),
+                    self._compact_log_value(
+                        self._tool_error_summary(result),
+                        limit=100,
+                    ),
                 )
             model_result = recovery_plan.get("tool_result")
             if not isinstance(model_result, dict):
@@ -883,10 +936,11 @@ class CoraxTelegramGateway:
                 ] = activity
                 await self._send_tool_activity(
                     chat_id,
-                    (
-                        f"⏸ APPROVAL · {activity}\n"
-                        f"/approve or /deny\n"
-                        f"/security approve {task_id} · /security deny {task_id}"
+                    self._approval_prompt(
+                        activity,
+                        task_id,
+                        result.get("approval"),
+                        result.get("choices"),
                     ),
                 )
         elif tool_failed:
@@ -937,9 +991,6 @@ class CoraxTelegramGateway:
         if self.tool_router is not None or self.tool_selector is not None:
             selected_specs = selected_specs[: self.max_active_tools]
 
-        if allow_media and self._send_document_spec is not None:
-            selected_specs = [*selected_specs, self._send_document_spec]
-
         if selected_specs:
             self.log.debug(
                 "active tools: %s",
@@ -982,6 +1033,81 @@ class CoraxTelegramGateway:
             await self._send(chat_id, text)
         except Exception as exc:  # noqa: BLE001 - status must not block the tool itself
             self.log.debug("tool activity delivery failed: %s", exc)
+
+    @staticmethod
+    def _approval_prompt(
+        activity: str,
+        task_id: str,
+        approval: object,
+        raw_choices: object,
+    ) -> str:
+        descriptor = approval if isinstance(approval, dict) else {}
+        lines = [f"⏸ APPROVAL · {activity}"]
+        labels = (
+            ("summary", "Action"),
+            ("operation", "Operation"),
+            ("resource", "Resource"),
+            ("workspace", "Workspace"),
+            ("risk", "Risk"),
+        )
+        for key, label in labels:
+            value = descriptor.get(key)
+            if isinstance(value, str) and value.strip():
+                lines.append(f"{label}: {value[:512]}")
+
+        network = descriptor.get("network")
+        if isinstance(network, dict):
+            domains = network.get("domains")
+            safe_domains = (
+                [item[:160] for item in domains[:16] if isinstance(item, str)]
+                if isinstance(domains, list)
+                else []
+            )
+            details = []
+            for key in ("method", "scope"):
+                value = network.get(key)
+                if isinstance(value, str) and value:
+                    details.append(value[:40])
+            if safe_domains:
+                details.append(", ".join(safe_domains))
+            if details:
+                lines.append(f"Network: {' · '.join(details)}")
+
+        credentials = descriptor.get("credentials")
+        if isinstance(credentials, list):
+            safe_names = [
+                item[:160] for item in credentials[:16] if isinstance(item, str)
+            ]
+            if safe_names:
+                lines.append(f"Credentials: {', '.join(safe_names)}")
+
+        known_choices = {
+            "allow_once",
+            "allow_turn",
+            "allow_session",
+            "deny_once",
+            "deny_rule",
+        }
+        choices = (
+            [
+                choice
+                for choice in raw_choices
+                if isinstance(choice, str) and choice in known_choices
+            ]
+            if isinstance(raw_choices, (list, tuple))
+            else []
+        )
+        if not choices:
+            choices = ["allow_once", "deny_once"]
+        commands = {
+            "allow_once": f"/security approve {task_id} once",
+            "allow_turn": f"/security approve {task_id} turn",
+            "allow_session": f"/security approve {task_id} session",
+            "deny_once": f"/security deny {task_id} once",
+            "deny_rule": f"/security deny {task_id} rule",
+        }
+        lines.extend(commands[choice] for choice in choices)
+        return "\n".join(lines)
 
     async def _deliver_final(self, chat_id: Any, text: str, *, allow_media: bool = True) -> str:
         clean_text, media_paths = self._extract_media_paths(self._sanitize_model_text(text))
@@ -1213,87 +1339,29 @@ class CoraxTelegramGateway:
             except Exception as exc:  # noqa: BLE001
                 self.log.debug("gateway plan_tool_recovery failed: %s", exc)
 
+        failed = result.get("ok") is False or any(
+            key in result for key in ("error", "errors", "exception")
+        )
+        model_result = dict(result)
+        if failed:
+            model_result.setdefault("ok", False)
+            model_result.setdefault(
+                "recovery_hint",
+                (
+                    "The recovery service is unavailable. Inspect the error, "
+                    "correct the tool arguments, or try another available tool "
+                    "before asking the user."
+                ),
+            )
         return {
             "operation": "plan_tool_recovery",
             "ok": True,
-            "tool_failed": self._tool_result_failed(result),
-            "tool_result": json.loads(self._format_tool_result_for_model(result)),
-            "recovery_prompt": self._tool_recovery_prompt() if self._tool_result_failed(result) else "",
+            "tool_failed": failed,
+            "tool_result": model_result,
+            "recovery_prompt": (
+                self._fallback_recovery_prompt() if failed else ""
+            ),
         }
-
-    async def _plan_file_delivery(
-        self,
-        session_id: str,
-        user_text: str,
-        args: dict[str, Any],
-        *,
-        allow_media: bool,
-    ) -> dict[str, Any]:
-        if self._has_gateway_capability:
-            payload: dict[str, Any] = {
-                "operation": "plan_file_delivery",
-                "session_id": session_id,
-                "text": user_text,
-                "workspace_root": str(self.workspace_path),
-                "connector_id": self.telegram_id,
-            }
-            raw_path = args.get("path")
-            if isinstance(raw_path, str) and raw_path.strip():
-                payload["path"] = raw_path
-            caption = args.get("caption")
-            if isinstance(caption, str) and caption.strip():
-                payload["caption"] = caption
-            try:
-                planned = await self._run(self.gateway_id, payload)
-                delivery = planned.get("delivery") if isinstance(planned, dict) else None
-                if isinstance(delivery, dict):
-                    return delivery
-            except Exception as exc:  # noqa: BLE001
-                self.log.debug("gateway plan_file_delivery failed: %s", exc)
-
-        if not allow_media:
-            return {"allowed": False, "reason": "file delivery was not requested by the user"}
-        raw_path = args.get("path")
-        if not isinstance(raw_path, str) or not raw_path.strip():
-            return {"allowed": False, "reason": "path must be a non-empty string"}
-        return {"allowed": True, "path": str(self._resolve_media_path(raw_path))}
-
-    async def _run_send_document_tool(
-        self,
-        chat_id: Any,
-        args: dict[str, Any],
-        *,
-        session_id: str,
-        user_text: str,
-        allow_media: bool,
-    ) -> dict[str, Any]:
-        delivery_plan = await self._plan_file_delivery(session_id, user_text, args, allow_media=allow_media)
-        if not delivery_plan.get("allowed"):
-            return {
-                "ok": False,
-                "error": delivery_plan.get("reason") or "file delivery was not allowed",
-            }
-        raw_path = args.get("path")
-        if not isinstance(raw_path, str) or not raw_path.strip():
-            raw_path = delivery_plan.get("path")
-        if not isinstance(raw_path, str) or not raw_path.strip():
-            return {"ok": False, "error": "path must be a non-empty string"}
-        path = Path(delivery_plan["path"]) if delivery_plan.get("path") else self._resolve_media_path(raw_path)
-        payload: dict[str, Any] = {
-            "operation": "send_document",
-            "chat_id": chat_id,
-            "path": str(path),
-        }
-        caption = args.get("caption")
-        if isinstance(caption, str) and caption.strip():
-            payload["caption"] = caption
-        else:
-            payload["caption"] = f"Файл: {path.name}"
-        try:
-            result = await self._run(self.telegram_id, payload)
-        except Exception as exc:  # noqa: BLE001 - tool result feeds the error back
-            return {"ok": False, "error": str(exc)}
-        return {"ok": True, "path": str(path), "result": result}
 
     def _timestamped_user_message(self, text: str) -> str:
         now = datetime.datetime.now().astimezone()
@@ -1349,114 +1417,21 @@ class CoraxTelegramGateway:
             return f"{name} · {detail}"
         return name
 
-    def _format_tool_result_for_model(self, result: dict[str, Any]) -> str:
-        if not self._tool_result_failed(result):
-            return json.dumps(result)
-        payload = dict(result)
-        payload.setdefault("ok", False)
-        error_text = self._tool_error_text(result)
-        error_kind = self._classify_tool_error(error_text)
-        payload["error_kind"] = error_kind
-        payload["recovery_steps"] = self._recovery_steps_for_error(error_kind)
-        payload["recovery_hint"] = (
-            "The tool call failed. Diagnose the error and continue autonomously: "
-            "fix the arguments, inspect the environment, or try another available "
-            "tool before asking the user. Ask the user only if required information "
-            "or permission is genuinely missing."
-        )
-        return json.dumps(payload)
-
-    def _tool_recovery_prompt(self) -> str:
+    def _fallback_recovery_prompt(self) -> str:
         return (
-            "A tool failed on the previous step and no recovery attempt has been "
-            "made yet. Continue the task autonomously: call an available tool to "
-            "inspect the environment, verify assumptions, retry with corrected "
-            "arguments, or choose a safer alternate route. Do not ask the user to "
-            "choose an option unless required information or permission is missing."
+            "The optional recovery service is unavailable and a tool failed. "
+            "Inspect the error, retry with corrected arguments, or choose another "
+            "available tool before asking the user."
         )
 
-    def _tool_result_failed(self, result: dict[str, Any]) -> bool:
-        if result.get("ok") is False:
-            return True
-        return any(key in result for key in ("error", "errors", "exception"))
-
-    def _tool_error_text(self, result: dict[str, Any]) -> str:
-        for key in ("error", "exception", "message"):
-            value = result.get(key)
-            if isinstance(value, str) and value.strip():
-                return value
-        errors = result.get("errors")
-        if isinstance(errors, list) and errors:
-            return "; ".join(str(error) for error in errors[:3])
-        return "unknown error"
-
-    def _classify_tool_error(self, error_text: str) -> str:
-        text = error_text.lower()
-        if any(marker in text for marker in ("file not found", "no such file", "not found")):
-            return "missing_file_or_resource"
-        if any(marker in text for marker in ("permission denied", "not permitted", "forbidden", "unauthorized")):
-            return "permission_denied"
-        if any(
-            marker in text
-            for marker in ("module not found", "modulenotfounderror", "no module named", "importerror")
-        ):
-            return "missing_dependency"
-        if any(marker in text for marker in ("command not found", "not recognized", "executable not found")):
-            return "missing_command"
-        if any(marker in text for marker in ("timed out", "timeout", "deadline")):
-            return "timeout"
-        if any(marker in text for marker in ("connection", "dns", "network", "ssl", "http")):
-            return "network_or_remote"
-        if any(marker in text for marker in ("invalid", "schema", "argument", "required")):
-            return "bad_arguments"
-        return "unknown"
-
-    def _recovery_steps_for_error(self, error_kind: str) -> list[str]:
-        recipes = {
-            "missing_file_or_resource": [
-                "list or search nearby paths",
-                "check recent local files context",
-                "retry with the corrected path or explain if absent",
-            ],
-            "permission_denied": [
-                "try a read-only inspection command",
-                "avoid destructive escalation",
-                "ask the user only if permission is required",
-            ],
-            "missing_dependency": [
-                "check whether an alternate installed tool or stdlib path exists",
-                "inspect the environment",
-                "install only if the available policy/tooling permits it",
-            ],
-            "missing_command": [
-                "check command availability",
-                "use an alternate command or capability",
-                "retry with the available tool",
-            ],
-            "timeout": [
-                "retry with a narrower query or smaller workload",
-                "inspect partial state if available",
-                "use an alternate route",
-            ],
-            "network_or_remote": [
-                "retry with headers or a simpler request",
-                "try an alternate endpoint/source if available",
-                "summarize uncertainty if remote access is blocked",
-            ],
-            "bad_arguments": [
-                "compare the payload with the tool schema",
-                "remove unsupported fields or add required fields",
-                "retry with corrected arguments",
-            ],
-        }
-        return recipes.get(
-            error_kind,
-            [
-                "inspect the error and current context",
-                "try a smaller or safer tool call",
-                "ask the user only if blocked by missing information",
-            ],
+    def _tool_error_summary(self, result: dict[str, Any]) -> str:
+        value = (
+            result.get("error")
+            or result.get("exception")
+            or result.get("errors")
+            or result.get("message")
         )
+        return str(value) if value else "unknown error"
 
     def _compact_log_value(self, value: str, *, limit: int = _LOG_VALUE_LIMIT) -> str:
         cleaned = " ".join(value.split())
@@ -1486,8 +1461,8 @@ class CoraxTelegramGateway:
                     "(newest first):\n"
                     f"{file_list}\n"
                     "When the user asks for the file just created, discussed, "
-                    "or requested earlier, use telegram_send_document with the "
-                    "matching path."
+                    "or requested earlier, inspect the matching path with an "
+                    "ordinary kernel tool. The host controls Telegram delivery."
                 ),
             }
         ]
@@ -1505,8 +1480,7 @@ class CoraxTelegramGateway:
             files.remove(path)
         files.insert(0, path)
         del files[self.max_recent_files :]
-        if not self._has_gateway_capability:
-            self._save_fallback_state()
+        self._save_fallback_state()
 
     def _artifact_path_from_tool(
         self, cap_id: str, args: dict[str, Any], result: dict[str, Any]
@@ -1621,8 +1595,7 @@ class CoraxTelegramGateway:
         overflow = len(history) - self.max_history_messages
         if overflow > 0:
             del history[:overflow]
-        if not self._has_gateway_capability:
-            self._save_fallback_state()
+        self._save_fallback_state()
 
     def _session_for(self, chat_id: Any) -> str:
         key = self._session_key(chat_id)
@@ -1630,8 +1603,7 @@ class CoraxTelegramGateway:
         if session is None:
             session = self._new_session()
             self._sessions[key] = session
-            if not self._has_gateway_capability:
-                self._save_fallback_state()
+            self._save_fallback_state()
         return session
 
     def _session_key(self, chat_id: Any) -> str:
@@ -1649,8 +1621,6 @@ class CoraxTelegramGateway:
         offset = data.get("offset")
         if isinstance(offset, int):
             self._offset = offset
-        if self._has_gateway_capability:
-            return
         self._sessions = {
             str(key): value
             for key, value in (data.get("sessions") or {}).items()
