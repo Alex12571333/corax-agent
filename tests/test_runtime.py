@@ -43,6 +43,7 @@ CAPABILITY_ROOTS = {
     "web.fetch": REPO_ROOT.parent / "corax-web-search-capability" / "web_fetch",
     "gateway": REPO_ROOT.parent / "corax-gateway-capability",
     "security.policy": REPO_ROOT.parent / "corax-security-policy",
+    "prompts.runtime": REPO_ROOT.parent / "corax-prompt-runtime",
     "memory.loop": REPO_ROOT.parent / "corax-memory-loop",
     "console.connector": REPO_ROOT.parent / "corax-console",
     "state.file": REPO_ROOT.parent / "corax-state-store",
@@ -64,6 +65,448 @@ class TestRuntime(unittest.TestCase):
 
     def tearDown(self) -> None:
         asyncio.run(self.runtime.stop())
+
+    def test_model_tool_prefix_is_fixed_and_selected_schemas_are_context(self) -> None:
+        class OfflineEmbeddings:
+            async def embed(self, _texts, *, input_type):
+                raise OSError("offline")
+
+        self.runtime.tools.register("echo", EchoCapability())
+        self.runtime.tool_routing.router.client = OfflineEmbeddings()
+
+        with mock.patch.object(
+            self.runtime,
+            "active_prompt_runtime",
+            return_value=SimpleNamespace(enabled=True),
+        ):
+            prepared = asyncio.run(
+                self.runtime.prepare_tool_model_request(
+                    {
+                        "messages": [{"role": "user", "content": "echo this"}],
+                        "_corax_recent_files": ["report.txt"],
+                    },
+                    session_id="s1",
+                    turn_id="t1",
+                    channel="console",
+                )
+            )
+
+        self.assertEqual(
+            [item["function"]["name"] for item in prepared["tools"]],
+            ["tool_search", "tool_call"],
+        )
+        self.assertEqual(
+            [
+                item["id"]
+                for item in prepared["_corax_prompt_context"][
+                    "tool_descriptors"
+                ]
+            ],
+            ["echo"],
+        )
+        self.assertEqual(
+            prepared["_corax_prompt_context"]["recent_files"],
+            ["report.txt"],
+        )
+        self.assertNotIn("_corax_recent_files", prepared)
+
+    def test_disabled_prompt_runtime_uses_selected_legacy_tool_schemas(self) -> None:
+        class OfflineEmbeddings:
+            async def embed(self, _texts, *, input_type):
+                raise OSError("offline")
+
+        self.runtime.config.prompts.enabled = False
+        self.runtime.tools.register("echo", EchoCapability())
+        self.runtime.sync_tool_catalog()
+        self.runtime.tool_routing.router.client = OfflineEmbeddings()
+
+        prepared = asyncio.run(
+            self.runtime.prepare_tool_model_request(
+                {"messages": [{"role": "user", "content": "echo this"}]},
+                session_id="legacy",
+                turn_id="legacy-1",
+                channel="console",
+            )
+        )
+
+        self.assertIn(
+            "echo",
+            [item["function"]["name"] for item in prepared["tools"]],
+        )
+        self.assertNotIn("_corax_prompt_context", prepared)
+
+    def test_new_turn_extends_provider_prefix_without_changing_meta_tools(self) -> None:
+        from agent_core import ExtensionKind
+
+        class OfflineEmbeddings:
+            async def embed(self, _texts, *, input_type):
+                raise OSError("offline")
+
+        class Model:
+            id = "prefix.test"
+            kind = ExtensionKind.MODEL_PROVIDER
+
+            def __init__(self) -> None:
+                self.requests = []
+
+            async def generate(self, request):
+                self.requests.append(request)
+                return SimpleNamespace(
+                    is_success=True,
+                    payload={"text": "ok", "cached_tokens": 0},
+                    status=None,
+                )
+
+        async def run() -> None:
+            await self.runtime.start()
+            model = Model()
+            self.runtime.models.register(model.id, model)
+            self.runtime.tool_routing.router.client = OfflineEmbeddings()
+            session_id = "cache-prefix"
+
+            first_user = {"role": "user", "content": "Inspect report.txt"}
+            first = await self.runtime.prepare_tool_model_request(
+                {"messages": [first_user]},
+                session_id=session_id,
+                turn_id="turn-1",
+                channel="console",
+            )
+            await self.runtime.invoke_extension(
+                model.id,
+                first,
+                session_id=session_id,
+            )
+            await self.runtime.memory_after_turn(
+                first_user["content"],
+                "The report is ready.",
+                session_id=session_id,
+                scope={"channel": "console"},
+            )
+            self.runtime.tool_routing.end_turn(
+                session_id=session_id,
+                channel="console",
+            )
+
+            second_user = {"role": "user", "content": "Summarize it"}
+            second = await self.runtime.prepare_tool_model_request(
+                {
+                    "messages": [
+                        first_user,
+                        {"role": "assistant", "content": "The report is ready."},
+                        second_user,
+                    ]
+                },
+                session_id=session_id,
+                turn_id="turn-2",
+                channel="console",
+            )
+            await self.runtime.invoke_extension(
+                model.id,
+                second,
+                session_id=session_id,
+            )
+
+            first_request, second_request = model.requests
+            self.assertEqual(
+                list(second_request.messages[: len(first_request.messages)]),
+                list(first_request.messages),
+            )
+            self.assertEqual(
+                first_request.parameters["tools"],
+                second_request.parameters["tools"],
+            )
+            self.assertNotIn("_corax_prompt_context", second_request.parameters)
+
+        asyncio.run(run())
+
+    def test_compacted_provider_epoch_is_replayed_on_next_turn(self) -> None:
+        from agent_core import ExtensionKind
+
+        class OfflineEmbeddings:
+            async def embed(self, _texts, *, input_type):
+                raise OSError("offline")
+
+        class CompactOnce:
+            id = "context.compact-once"
+            kind = ExtensionKind.RUNTIME_SERVICE
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def handle(self, request):
+                messages = list(request.payload["messages"])
+                self.calls += 1
+                if self.calls == 1:
+                    messages = [
+                        messages[0],
+                        {
+                            "role": "user",
+                            "content": (
+                                '<turn-envelope visibility="model-only" '
+                                'persistence="ram" kind="compaction-notice" '
+                                'trust="runtime-data">compacted</turn-envelope>'
+                            ),
+                        },
+                        *messages[-2:],
+                    ]
+                return SimpleNamespace(
+                    is_success=True,
+                    payload={"messages": messages, "overflow": False},
+                )
+
+        class Model:
+            id = "compaction.model"
+            kind = ExtensionKind.MODEL_PROVIDER
+
+            def __init__(self) -> None:
+                self.requests = []
+
+            async def generate(self, request):
+                self.requests.append(request)
+                return SimpleNamespace(
+                    is_success=True,
+                    payload={"text": "ok", "cached_tokens": 0},
+                    status=None,
+                )
+
+        async def run() -> None:
+            await self.runtime.start()
+            manager = CompactOnce()
+            model = Model()
+            self.runtime.services.register(manager.id, manager)
+            self.config.extensions.bindings["context"] = manager.id
+            self.runtime.models.register(model.id, model)
+            self.runtime.tool_routing.router.client = OfflineEmbeddings()
+            session_id = "compaction-prefix"
+            old_history = [
+                {"role": "user", "content": "old-0"},
+                {"role": "assistant", "content": "old-answer"},
+            ]
+            current = {"role": "user", "content": "current?"}
+
+            first = await self.runtime.prepare_tool_model_request(
+                {"messages": [*old_history, current]},
+                session_id=session_id,
+                turn_id="turn-1",
+                channel="console",
+            )
+            await self.runtime.invoke_extension(
+                model.id,
+                first,
+                session_id=session_id,
+            )
+            await self.runtime.memory_after_turn(
+                current["content"],
+                "done",
+                session_id=session_id,
+                scope={"channel": "console"},
+            )
+            self.runtime.tool_routing.end_turn(
+                session_id=session_id,
+                channel="console",
+            )
+
+            second = await self.runtime.prepare_tool_model_request(
+                {
+                    "messages": [
+                        *old_history,
+                        current,
+                        {"role": "assistant", "content": "done"},
+                        {"role": "user", "content": "next?"},
+                    ]
+                },
+                session_id=session_id,
+                turn_id="turn-2",
+                channel="console",
+            )
+            await self.runtime.invoke_extension(
+                model.id,
+                second,
+                session_id=session_id,
+            )
+
+            first_request, second_request = model.requests
+            self.assertEqual(
+                list(second_request.messages[: len(first_request.messages)]),
+                list(first_request.messages),
+            )
+            self.assertNotIn(
+                "old-0",
+                "\n".join(
+                    str(message.get("content") or "")
+                    for message in second_request.messages
+                ),
+            )
+
+        asyncio.run(run())
+
+    def test_disabled_prompt_runtime_uses_legacy_assembly(self) -> None:
+        skill_messages = [{"role": "user", "content": "legacy"}]
+        with (
+            mock.patch.object(
+                self.runtime,
+                "active_prompt_runtime",
+                return_value=SimpleNamespace(enabled=False),
+            ),
+            mock.patch.object(
+                self.runtime,
+                "augment_with_skills",
+                new=mock.AsyncMock(return_value=skill_messages),
+            ) as skills,
+            mock.patch.object(
+                self.runtime,
+                "augment_with_hooks",
+                new=mock.AsyncMock(return_value=skill_messages),
+            ) as hooks,
+        ):
+            messages, metadata = asyncio.run(
+                self.runtime._assemble_model_messages(
+                    [{"role": "user", "content": "hello"}],
+                    prompt="hello",
+                    data={"_corax_prompt_context": {"turn_id": "t1"}},
+                    session_id="s1",
+                )
+            )
+
+        self.assertEqual(metadata, {})
+        self.assertEqual(messages[-1], skill_messages[-1])
+        self.assertEqual(messages[0]["role"], "system")
+        skills.assert_awaited_once()
+        hooks.assert_awaited_once()
+
+    def test_abort_turn_discards_all_host_turn_state(self) -> None:
+        end_turn = mock.AsyncMock(return_value={"committed": False})
+        prompt_service = SimpleNamespace(enabled=True, end_turn=end_turn)
+        routing_turn = SimpleNamespace(turn_id="t1")
+        key = ("console", "s1", "t1")
+        self.runtime._prompt_turn_inputs[key] = {"value": True}
+        self.runtime._prompt_turn_metadata[key] = {"value": True}
+        self.runtime._prompt_provider_messages[key] = [
+            {"role": "user", "content": "hello"}
+        ]
+
+        with (
+            mock.patch.object(
+                self.runtime,
+                "active_prompt_runtime",
+                return_value=prompt_service,
+            ),
+            mock.patch.object(
+                self.runtime.tool_routing,
+                "current_turn",
+                return_value=routing_turn,
+            ),
+            mock.patch.object(
+                self.runtime.tool_routing,
+                "end_turn",
+            ) as routing_end,
+        ):
+            result = asyncio.run(
+                self.runtime.abort_turn(
+                    session_id="s1",
+                    channel="console",
+                )
+            )
+
+        self.assertTrue(result["aborted"])
+        self.assertNotIn(key, self.runtime._prompt_turn_inputs)
+        self.assertNotIn(key, self.runtime._prompt_turn_metadata)
+        self.assertNotIn(key, self.runtime._prompt_provider_messages)
+        end_turn.assert_awaited_once_with(
+            channel="console",
+            session_id="s1",
+            turn_id="t1",
+            commit=False,
+        )
+        routing_end.assert_called_once_with(
+            session_id="s1",
+            channel="console",
+        )
+
+    def test_failed_prompt_commit_is_aborted_before_bookkeeping_is_dropped(
+        self,
+    ) -> None:
+        calls = []
+
+        class PromptService:
+            enabled = True
+
+            async def end_turn(self, **kwargs):
+                calls.append(kwargs)
+                if kwargs["commit"]:
+                    raise ValueError("commit failed")
+                return {"committed": False}
+
+        key = ("console", "s1", "t1")
+        self.runtime._prompt_turn_inputs[key] = {"value": True}
+        self.runtime._prompt_turn_metadata[key] = {"value": True}
+        self.runtime._prompt_provider_messages[key] = [
+            {"role": "user", "content": "hello"}
+        ]
+
+        with (
+            mock.patch.object(
+                self.runtime,
+                "active_prompt_runtime",
+                return_value=PromptService(),
+            ),
+            mock.patch.object(
+                self.runtime.tool_routing,
+                "current_turn",
+                return_value=SimpleNamespace(turn_id="t1"),
+            ),
+        ):
+            asyncio.run(
+                self.runtime.memory_after_turn(
+                    "hello",
+                    "world",
+                    session_id="s1",
+                    scope={"channel": "console"},
+                )
+            )
+
+        self.assertTrue(calls[0]["commit"])
+        self.assertFalse(calls[1]["commit"])
+        self.assertNotIn(key, self.runtime._prompt_turn_inputs)
+        self.assertNotIn(key, self.runtime._prompt_turn_metadata)
+        self.assertNotIn(key, self.runtime._prompt_provider_messages)
+
+    def test_dynamic_tool_catalog_refreshes_only_between_active_turns(self) -> None:
+        class OfflineEmbeddings:
+            async def embed(self, _texts, *, input_type):
+                raise OSError("offline")
+
+        async def run() -> None:
+            self.runtime.tools.register("echo", EchoCapability())
+            self.runtime.sync_tool_catalog()
+            self.runtime.tool_routing.router.client = OfflineEmbeddings()
+            with mock.patch.object(
+                self.runtime,
+                "refresh_dynamic_tools",
+                new=mock.AsyncMock(),
+            ) as refresh:
+                await self.runtime.prepare_tool_model_request(
+                    {"messages": [{"role": "user", "content": "one"}]},
+                    session_id="s1",
+                    turn_id="t1",
+                    channel="console",
+                )
+                await self.runtime.prepare_tool_model_request(
+                    {"messages": [{"role": "user", "content": "one"}]},
+                    session_id="s1",
+                    turn_id="t1",
+                    channel="console",
+                )
+                await self.runtime.prepare_tool_model_request(
+                    {"messages": [{"role": "user", "content": "two"}]},
+                    session_id="s2",
+                    turn_id="t2",
+                    channel="telegram",
+                )
+
+            refresh.assert_awaited_once()
+
+        asyncio.run(run())
 
     def test_start_populates_registries_with_builtins(self) -> None:
         asyncio.run(self.runtime.start())
@@ -92,6 +535,9 @@ class TestRuntime(unittest.TestCase):
             if CAPABILITY_ROOTS["memory.loop"].is_dir():
                 self.assertTrue(self.runtime.services.has("memory.loop"))
                 self.assertIsNotNone(self.runtime.active_memory_loop())
+            if CAPABILITY_ROOTS["prompts.runtime"].is_dir():
+                self.assertTrue(self.runtime.services.has("prompts.runtime"))
+                self.assertIsNotNone(self.runtime.active_prompt_runtime())
             if CAPABILITY_ROOTS["state.file"].is_dir():
                 self.assertTrue(self.runtime.storage.has("state.file"))
                 self.assertIsNotNone(self.runtime.active_state_store())
@@ -170,6 +616,7 @@ class TestRuntime(unittest.TestCase):
             status.active_by_kind["runtime_service"],
             [
                 "gateway",
+                "prompts.runtime",
                 "memory.loop",
                 "context.manager",
                 "mcp.manager",

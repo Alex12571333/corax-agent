@@ -165,11 +165,13 @@ sandbox boundaries.
 
 The complete tool registry and full schemas stay in the host. Before each user
 turn Corax ranks compact tool metadata with the local Nemotron embedding model
-at `192.168.0.10:8080`, then attaches only the bounded active schemas to the
-model request. Console, TUI, and Telegram share this path. Routing makes no LLM
+at `192.168.0.10:8080`. The provider always sees the same two native schemas,
+`tool_search` and `tool_call`; selected real schemas are appended as bounded
+turn data. This keeps vLLM's prefix cache stable across ordinary new queries.
+Console, TUI, and Telegram share this path. Routing makes no generation-LLM
 call; an embedding outage fails closed to a narrow lexical fallback.
-`tool.search` can activate additional tools within the same turn, while the
-next turn starts with a fresh set.
+`tool.search` can activate additional tools within the same turn, while Agent
+Core still validates the selected real capability and policy before execution.
 
 Telegram document delivery is currently host-controlled. The direct
 `telegram_send_document` pseudo-tool is deliberately absent from the model
@@ -224,6 +226,7 @@ Meaning is always repeated in text or symbols; color is never the only signal.
 | `corax doctor` | Run offline readiness checks. |
 | `corax security status` | Show the active permission mode. |
 | `corax security mode ask\|auto\|full` | Change the permission mode. |
+| `corax prompts status\|reload\|validate` | Inspect, reload, or validate layered Markdown prompts. |
 | `corax mcp status` / `corax mcp tools` | Inspect MCP connections and discovered tools. |
 | `corax skills list` / `corax skills reload` | Inspect or reload trusted Agent Skills. |
 | `corax hooks status` / `corax hooks reload` | Inspect or reload approved hooks. |
@@ -305,6 +308,12 @@ requires authentication. The memory loop bounds recalled context, treats it
 as data rather than instructions, and rejects secret-like facts during
 retention. Console conversation checkpoints are independent of long-term
 memory and are stored by `state.file`.
+
+Prompt identity is separate from semantic recall. Operator-editable
+`data/identity/USER.md` stores a small durable profile,
+`data/identity/MEMORY.md` stores bounded working notes, and recalled backend
+records remain untrusted turn data. Prompt schemas and hidden effective replay
+stay in RAM and are never written to conversation checkpoints.
 
 ## Configuration and secrets
 
@@ -418,6 +427,7 @@ Memory, state, and context:
 | [`mnemonic-vault`](https://github.com/Alex12571333/mnemonic-vault) | File-first memory backend and typed Corax adapter. |
 | [`corax-state-store`](https://github.com/Alex12571333/corax-state-store) | Atomic local checkpoints. |
 | [`corax-context-manager`](https://github.com/Alex12571333/corax-context-manager) | Deterministic compaction driven by the discovered model window with provider-calibrated reporting. |
+| [`corax-prompt-runtime`](https://github.com/Alex12571333/corax-prompt-runtime) | Layered Markdown prompt assembly, validation, hot reload, and cache-stable RAM replay. |
 
 Runtime controls and integrations:
 

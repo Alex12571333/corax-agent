@@ -16,6 +16,7 @@ capabilities become available automatically, with no per-tool wiring.
 
 from __future__ import annotations
 
+import asyncio
 import datetime
 import json
 import logging
@@ -127,6 +128,30 @@ def _clean_profile_note(text: str) -> str:
     return note.replace("\x00", "")
 
 
+def _unwrap_tool_call(arguments: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    unknown = set(arguments) - {"capability", "input"}
+    if unknown:
+        raise ValueError(
+            "tool.call received unknown fields: " + ", ".join(sorted(unknown))
+        )
+    capability = arguments.get("capability")
+    payload = arguments.get("input")
+    if not isinstance(capability, str) or not capability.strip():
+        raise ValueError("tool.call capability must be a non-empty string")
+    if not isinstance(payload, dict):
+        raise ValueError("tool.call input must be an object")
+    return capability.strip(), dict(payload)
+
+
+def _tool_result_failed(result: dict[str, Any]) -> bool:
+    return (
+        result.get("ok") is False
+        or result.get("success") is False
+        or any(result.get(key) for key in ("error", "_error", "errors", "exception"))
+        or str(result.get("status") or "").lower() in {"failed", "error", "denied"}
+    )
+
+
 class GatewayError(RuntimeError):
     """A capability task did not complete successfully through the kernel."""
 
@@ -167,6 +192,8 @@ class CoraxTelegramGateway:
         security_command: SecurityCommand | None = None,
         memory_before_turn: MemoryBeforeTurn | None = None,
         memory_after_turn: MemoryAfterTurn | None = None,
+        abort_turn: MemoryAfterTurn | None = None,
+        host_prompt_assembly: bool = False,
         max_active_tools: int = 8,
         tool_mode: str | None = None,
         log: logging.Logger | None = None,
@@ -200,6 +227,8 @@ class CoraxTelegramGateway:
         self._security_command = security_command
         self._memory_before_turn = memory_before_turn
         self._memory_after_turn = memory_after_turn
+        self._abort_turn = abort_turn
+        self.host_prompt_assembly = host_prompt_assembly
         self.max_active_tools = max(1, max_active_tools)
         self.tool_mode = tool_mode
         self.log = log or logging.getLogger("corax.gateway")
@@ -320,17 +349,25 @@ class CoraxTelegramGateway:
                 if update_id is not None
                 else f"telegram:{chat_id}:{uuid.uuid4().hex}"
             )
-            await self._handle_chat(
-                chat_id,
-                text,
-                chat_type=update.get("chat_type"),
-                turn_id=turn_id,
-            )
+            try:
+                await self._handle_chat(
+                    chat_id,
+                    text,
+                    chat_type=update.get("chat_type"),
+                    turn_id=turn_id,
+                )
+            except asyncio.CancelledError:
+                await self._cleanup_failed_turn(chat_id, turn_id)
+                raise
+            except Exception:
+                await self._cleanup_failed_turn(chat_id, turn_id)
+                raise
 
     # -- dispatch -------------------------------------------------------- #
     async def _handle_command(self, chat_id: Any, command: dict) -> None:
         name = command.get("command")
         if name == "new_session":
+            await self._discard_pending_approvals(chat_id)
             old_session_id = self._sessions.get(self._session_key(chat_id))
             session_id: str | None = None
             if self._has_gateway_capability:
@@ -375,6 +412,7 @@ class CoraxTelegramGateway:
         elif name == "help":
             await self._send(chat_id, command.get("reply") or "Send a message to chat.")
         elif name == "cancel":
+            await self._discard_pending_approvals(chat_id)
             await self._send(chat_id, command.get("reply") or "🛑 Cancelled.")
         else:  # unknown
             await self._send(chat_id, "Unknown command. Send /help.")
@@ -508,7 +546,10 @@ class CoraxTelegramGateway:
                 "tool_choice": "auto",
                 "_corax_turn_id": turn_id,
                 "_corax_user_text": text,
+                "_corax_recent_files": list(prepared.get("recent_files") or []),
             }
+            if recovery_needed:
+                generate["_corax_tool_failure"] = True
             if active_tools:
                 generate["tools"] = active_tools
             if self.model:
@@ -529,13 +570,14 @@ class CoraxTelegramGateway:
                 ):
                     recovery_prompts += 1
                     self.log.info("tool recovery prompt inserted after failed step")
-                    messages.append(
-                        {
-                            "role": "system",
-                            "content": recovery_prompt
-                            or self._fallback_recovery_prompt(),
-                        }
-                    )
+                    if not self.host_prompt_assembly:
+                        messages.append(
+                            {
+                                "role": "system",
+                                "content": recovery_prompt
+                                or self._fallback_recovery_prompt(),
+                            }
+                        )
                     continue
                 final_text = response.get("text") or ""
                 if response.get("_streamed"):
@@ -824,10 +866,20 @@ class CoraxTelegramGateway:
                 args = {}
         except (ValueError, TypeError):
             args = {}
+        meta_error = ""
+        if cap_id == "tool.call":
+            try:
+                cap_id, args = _unwrap_tool_call(args)
+            except ValueError as exc:
+                meta_error = str(exc)
         activity = self._tool_activity_label(cap_id or name or "unknown", args)
         await self._send_tool_activity(chat_id, f"🔧 TOOL · {activity}")
 
-        if name == _SEND_DOCUMENT_TOOL:
+        if meta_error:
+            result = {"error": meta_error}
+            artifact_path = None
+            document_sent = False
+        elif name == _SEND_DOCUMENT_TOOL:
             result = {
                 "error": (
                     "telegram_send_document is host-controlled and is not "
@@ -879,7 +931,8 @@ class CoraxTelegramGateway:
                     )
                 artifact_path = None
             else:
-                await self._record_artifact(session_id, cap_id, args, result)
+                if not _tool_result_failed(result):
+                    await self._record_artifact(session_id, cap_id, args, result)
                 artifact_path = self._artifact_path_from_tool(cap_id, args, result)
             document_sent = False
             if result.get("confirmation_required") is True:
@@ -1172,7 +1225,11 @@ class CoraxTelegramGateway:
             self.log.debug("document send failed: %s", exc)
 
     async def _prepare_turn(self, chat_id: Any, text: str) -> dict[str, Any]:
-        system_prompt = self._system_prompt_with_profile()
+        system_prompt = (
+            self.system_prompt
+            if self.host_prompt_assembly
+            else self._system_prompt_with_profile()
+        )
         prepared: dict[str, Any] | None = None
         if self._has_gateway_capability:
             try:
@@ -1184,6 +1241,7 @@ class CoraxTelegramGateway:
                         "conversation_id": chat_id,
                         "text": text,
                         "system_prompt": system_prompt,
+                        "prompt_runtime": self.host_prompt_assembly,
                     },
                 )
                 if isinstance(candidate, dict) and candidate.get("messages"):
@@ -1195,25 +1253,43 @@ class CoraxTelegramGateway:
             session_id = self._session_for(chat_id)
             user_message = {
                 "role": "user",
-                "content": self._timestamped_user_message(text),
+                "content": (
+                    text
+                    if self.host_prompt_assembly
+                    else self._timestamped_user_message(text)
+                ),
             }
+            prefix = (
+                []
+                if self.host_prompt_assembly
+                else [
+                    {"role": "system", "content": system_prompt},
+                    *self._recent_files_context(session_id),
+                ]
+            )
             prepared = {
                 "session_id": session_id,
                 "allow_outbound_file": self._user_requested_media(text),
                 "user_message": user_message,
+                "recent_files": list(self._recent_files.get(session_id, [])),
                 "messages": [
-                    {"role": "system", "content": system_prompt},
-                    *self._recent_files_context(session_id),
+                    *prefix,
                     *self._history_for(session_id),
                     user_message,
                 ],
             }
-        await self._inject_memory_context(
-            prepared,
-            text,
-            channel="telegram",
-            conversation_id=str(chat_id),
-        )
+        prepared_session_id = prepared.get("session_id")
+        if isinstance(prepared_session_id, str) and prepared_session_id.strip():
+            self._sessions[self._session_key(chat_id)] = (
+                prepared_session_id.strip()
+            )
+        if not self.host_prompt_assembly:
+            await self._inject_memory_context(
+                prepared,
+                text,
+                channel="telegram",
+                conversation_id=str(chat_id),
+            )
         return prepared
 
     async def _record_turn(
@@ -1237,6 +1313,7 @@ class CoraxTelegramGateway:
                         "text": text,
                         "assistant_text": assistant_text,
                         "max_history_messages": self.max_history_messages,
+                        "prompt_runtime": self.host_prompt_assembly,
                     },
                 )
                 recorded_by_gateway = True
@@ -1339,9 +1416,7 @@ class CoraxTelegramGateway:
             except Exception as exc:  # noqa: BLE001
                 self.log.debug("gateway plan_tool_recovery failed: %s", exc)
 
-        failed = result.get("ok") is False or any(
-            key in result for key in ("error", "errors", "exception")
-        )
+        failed = _tool_result_failed(result)
         model_result = dict(result)
         if failed:
             model_result.setdefault("ok", False)
@@ -1485,6 +1560,8 @@ class CoraxTelegramGateway:
     def _artifact_path_from_tool(
         self, cap_id: str, args: dict[str, Any], result: dict[str, Any]
     ) -> str | None:
+        if _tool_result_failed(result):
+            return None
         raw_path = result.get("path") if isinstance(result.get("path"), str) else args.get("path")
         if not isinstance(raw_path, str) or not raw_path.strip():
             return None
@@ -1501,6 +1578,39 @@ class CoraxTelegramGateway:
         else:
             return None
         return raw_path.strip()
+
+    async def _discard_pending_approvals(self, chat_id: Any) -> None:
+        key = self._session_key(chat_id)
+        pending = self._pending_approvals.get(key, {})
+        if self._security_command is None:
+            return
+        for task_id in list(pending):
+            try:
+                result = await self._security_command(
+                    f"deny {task_id} once",
+                    actor=str(chat_id),
+                    transport="telegram",
+                )
+            except Exception as exc:  # noqa: BLE001 - cancellation remains fail-soft
+                self.log.debug("pending approval cancellation failed: %s", exc)
+                continue
+            if isinstance(result, dict) and result.get("ok") is True:
+                pending.pop(task_id, None)
+        if not pending:
+            self._pending_approvals.pop(key, None)
+
+    async def _cleanup_failed_turn(self, chat_id: Any, turn_id: str) -> None:
+        try:
+            await self._discard_pending_approvals(chat_id)
+        finally:
+            if self._abort_turn is not None:
+                try:
+                    await self._abort_turn(
+                        session_id=self._session_for(chat_id),
+                        scope={"channel": "telegram", "turn_id": turn_id},
+                    )
+                except Exception as exc:  # noqa: BLE001 - cleanup is fail-soft
+                    self.log.debug("telegram prompt turn abort failed: %s", exc)
 
     def _history_for(self, session_id: str) -> list[dict[str, Any]]:
         return [dict(message) for message in self._history.get(session_id, [])]
@@ -1652,6 +1762,4 @@ class CoraxTelegramGateway:
 
 
 async def _async_sleep(seconds: float) -> None:
-    import asyncio
-
     await asyncio.sleep(seconds)

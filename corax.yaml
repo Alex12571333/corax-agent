@@ -33,6 +33,7 @@ extensions:
       - security.policy
     runtime_service:
       - gateway
+      - prompts.runtime
       - memory.loop
       - context.manager
       - mcp.manager
@@ -52,6 +53,7 @@ extensions:
     memory_loop: memory.loop
     policy: security.policy
     state: state.file
+    prompts: prompts.runtime
     context: context.manager
     mcp: mcp.manager
     skills: skills.runtime
@@ -83,6 +85,11 @@ extensions:
       enabled: true
       description: "Bounded recall and privacy-aware retention loop"
       path: ../corax-memory-loop
+    prompts.runtime:
+      kind: runtime_service
+      enabled: true
+      description: "Layered Markdown prompt assembly"
+      path: ../corax-prompt-runtime
     context.manager:
       kind: runtime_service
       enabled: true
@@ -217,6 +224,16 @@ llm:
   model: google/gemma-4-12B-it
   enable_image: false
   enable_video: false
+
+prompts:
+  enabled: true
+  root: prompts
+  user_profile: identity/USER.md
+  working_memory: identity/MEMORY.md
+  max_profile_chars: 6000
+  max_working_memory_chars: 8000
+  max_layer_chars: 20000
+  max_total_prompt_chars: 60000
 
 tool_routing:
   # Tool selection uses only the Nemotron embedding service; no routing LLM.

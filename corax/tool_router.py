@@ -17,6 +17,7 @@ from urllib.request import Request, urlopen
 from .config import ToolRoutingConfig
 
 TOOL_SEARCH_ID = "tool.search"
+TOOL_CALL_ID = "tool.call"
 _SAFE_TOOL_NAME = re.compile(r"[^a-zA-Z0-9_-]")
 _WORD_RE = re.compile(r"[^\W_]+", re.UNICODE)
 _TRIVIAL_WORDS = frozenset(
@@ -81,6 +82,30 @@ _SEARCH_SPEC = {
             },
         },
         "required": ["query"],
+        "additionalProperties": False,
+    },
+}
+
+_CALL_SPEC = {
+    "id": TOOL_CALL_ID,
+    "model_name": "tool_call",
+    "description": (
+        "Call one capability activated for this turn. Use the exact capability "
+        "id and input schema from the trusted runtime tool context."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "capability": {
+                "type": "string",
+                "description": "Exact activated capability id",
+            },
+            "input": {
+                "type": "object",
+                "description": "Arguments matching that capability's input schema",
+            },
+        },
+        "required": ["capability", "input"],
         "additionalProperties": False,
     },
 }
@@ -175,7 +200,10 @@ class SchemaStore:
 
     def __init__(self) -> None:
         self._specs: dict[str, dict[str, Any]] = {}
-        self._names: dict[str, str] = {TOOL_SEARCH_ID: "tool_search"}
+        self._names: dict[str, str] = {
+            TOOL_SEARCH_ID: "tool_search",
+            TOOL_CALL_ID: "tool_call",
+        }
 
     def sync(self, tools: Iterable[tuple[str, Any]]) -> None:
         used = set(self._names.values())
@@ -191,6 +219,7 @@ class SchemaStore:
                 "input_schema": dict(getattr(item, "input_schema", {}) or {}),
             }
         current[TOOL_SEARCH_ID] = dict(_SEARCH_SPEC)
+        current[TOOL_CALL_ID] = dict(_CALL_SPEC)
         self._specs = current
 
     def raw(self, extension_id: str) -> dict[str, Any]:
@@ -639,6 +668,14 @@ class ToolRoutingHost:
     def all_specs(self) -> list[dict[str, Any]]:
         return self.schemas.all_raw()
 
+    def model_schemas(self) -> list[dict[str, Any]]:
+        """Return the fixed native tool prefix sent to every model request."""
+
+        return [
+            self.schemas.openai(TOOL_SEARCH_ID),
+            self.schemas.openai(TOOL_CALL_ID),
+        ]
+
     async def begin_turn(
         self,
         user_text: str,
@@ -708,6 +745,37 @@ class ToolRoutingHost:
             if self.schemas.has(extension_id)
         ]
 
+    def active_descriptors(
+        self,
+        *,
+        session_id: str,
+        turn_id: str,
+        channel: str,
+    ) -> list[dict[str, Any]]:
+        """Return selected schemas as prompt data, not top-level model tools."""
+
+        turn = self._turn(session_id=session_id, channel=channel)
+        if turn.turn_id != turn_id:
+            return []
+        result = []
+        for extension_id in turn.active_ids:
+            if extension_id == TOOL_SEARCH_ID or not self.schemas.has(extension_id):
+                continue
+            spec = self.schemas.raw(extension_id)
+            record = self.catalog.get(extension_id)
+            result.append(
+                {
+                    "id": extension_id,
+                    "model_name": spec["model_name"],
+                    "description": spec["description"],
+                    "input_schema": spec["input_schema"],
+                    "risk_level": record.risk_level,
+                    "required_scopes": list(record.required_scopes),
+                    "side_effects": list(record.side_effects),
+                }
+            )
+        return result
+
     def current_turn(
         self,
         *,
@@ -725,6 +793,9 @@ class ToolRoutingHost:
     ) -> bool:
         turn = self.current_turn(session_id=session_id, channel=channel)
         return turn is not None and turn.turn_id == turn_id
+
+    def has_active_turns(self) -> bool:
+        return bool(self._turns)
 
     def require_active(
         self,
@@ -784,6 +855,15 @@ class ToolRoutingHost:
                 for record, score in ranked
             ],
             "activated": activated,
+            "tools": [
+                descriptor
+                for descriptor in self.active_descriptors(
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    channel=channel,
+                )
+                if descriptor["id"] in {record.id for record, _ in ranked}
+            ],
             "active_count": len(turn.active_ids),
             "catalog_version": turn.catalog_version,
         }

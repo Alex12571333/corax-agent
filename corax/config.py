@@ -48,6 +48,7 @@ REQUIRED_SECTIONS = (
     "limits",
     "ui",
     "llm",
+    "prompts",
     "tool_routing",
     "telegram",
     "websearch",
@@ -154,6 +155,20 @@ class LLMConfig:
 
 
 @dataclass
+class PromptsConfig:
+    """Layered prompt assembly and operator-editable identity paths."""
+
+    enabled: bool = True
+    root: str = "prompts"
+    user_profile: str = "identity/USER.md"
+    working_memory: str = "identity/MEMORY.md"
+    max_profile_chars: int = 6_000
+    max_working_memory_chars: int = 8_000
+    max_layer_chars: int = 20_000
+    max_total_prompt_chars: int = 60_000
+
+
+@dataclass
 class ToolRoutingConfig:
     """Embedding-only selection of model-visible tools."""
 
@@ -209,6 +224,7 @@ class AgentConfig:
     limits: LimitsConfig = field(default_factory=LimitsConfig)
     ui: UIConfig = field(default_factory=UIConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
+    prompts: PromptsConfig = field(default_factory=PromptsConfig)
     tool_routing: ToolRoutingConfig = field(default_factory=ToolRoutingConfig)
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
     websearch: WebSearchConfig = field(default_factory=WebSearchConfig)
@@ -250,6 +266,7 @@ def default_config() -> AgentConfig:
                 "policy_provider": ["security.policy"],
                 "runtime_service": [
                     "gateway",
+                    "prompts.runtime",
                     "memory.loop",
                     "context.manager",
                     "mcp.manager",
@@ -269,6 +286,7 @@ def default_config() -> AgentConfig:
                 "memory_loop": "memory.loop",
                 "policy": "security.policy",
                 "state": "state.file",
+                "prompts": "prompts.runtime",
                 "context": "context.manager",
                 "mcp": "mcp.manager",
                 "skills": "skills.runtime",
@@ -302,6 +320,11 @@ def default_config() -> AgentConfig:
                     kind="runtime_service",
                     description="Bounded recall and privacy-aware retention loop",
                     path="../corax-memory-loop",
+                ),
+                "prompts.runtime": ExtensionSpec(
+                    kind="runtime_service",
+                    description="Layered Markdown prompt assembly",
+                    path="../corax-prompt-runtime",
                 ),
                 "context.manager": ExtensionSpec(
                     kind="runtime_service",
@@ -426,6 +449,7 @@ def default_config() -> AgentConfig:
             enable_image=False,
             enable_video=False,
         ),
+        prompts=PromptsConfig(),
         tool_routing=ToolRoutingConfig(),
         telegram=TelegramConfig(
             base_url="https://api.telegram.org",
@@ -588,6 +612,16 @@ def config_to_dict(config: AgentConfig) -> dict[str, Any]:
             "enable_image": config.llm.enable_image,
             "enable_video": config.llm.enable_video,
         },
+        "prompts": {
+            "enabled": config.prompts.enabled,
+            "root": config.prompts.root,
+            "user_profile": config.prompts.user_profile,
+            "working_memory": config.prompts.working_memory,
+            "max_profile_chars": config.prompts.max_profile_chars,
+            "max_working_memory_chars": config.prompts.max_working_memory_chars,
+            "max_layer_chars": config.prompts.max_layer_chars,
+            "max_total_prompt_chars": config.prompts.max_total_prompt_chars,
+        },
         "tool_routing": {
             "base_url": config.tool_routing.base_url,
             "model": config.tool_routing.model,
@@ -624,6 +658,7 @@ def config_from_dict(data: dict[str, Any]) -> AgentConfig:
     limits = data.get("limits", {}) or {}
     ui = data.get("ui", {}) or {}
     llm = data.get("llm", {}) or {}
+    prompts = data.get("prompts", {}) or {}
     tool_routing = data.get("tool_routing", {}) or {}
     telegram = data.get("telegram", {}) or {}
     websearch = data.get("websearch", {}) or {}
@@ -634,6 +669,14 @@ def config_from_dict(data: dict[str, Any]) -> AgentConfig:
             "web.fetch"
         ]
         extensions.active.setdefault("tool", []).append("web.fetch")
+    if "prompts.runtime" not in extensions.available:
+        extensions.available["prompts.runtime"] = defaults.extensions.available[
+            "prompts.runtime"
+        ]
+        extensions.active.setdefault("runtime_service", []).append(
+            "prompts.runtime"
+        )
+        extensions.bindings.setdefault("prompts", "prompts.runtime")
     config = AgentConfig(
         agent=AgentMeta(
             name=agent.get("name", defaults.agent.name),
@@ -675,6 +718,37 @@ def config_from_dict(data: dict[str, Any]) -> AgentConfig:
             model=str(llm.get("model", defaults.llm.model)),
             enable_image=bool(llm.get("enable_image", defaults.llm.enable_image)),
             enable_video=bool(llm.get("enable_video", defaults.llm.enable_video)),
+        ),
+        prompts=PromptsConfig(
+            enabled=bool(prompts.get("enabled", defaults.prompts.enabled)),
+            root=str(prompts.get("root", defaults.prompts.root)),
+            user_profile=str(
+                prompts.get("user_profile", defaults.prompts.user_profile)
+            ),
+            working_memory=str(
+                prompts.get("working_memory", defaults.prompts.working_memory)
+            ),
+            max_profile_chars=int(
+                prompts.get(
+                    "max_profile_chars",
+                    defaults.prompts.max_profile_chars,
+                )
+            ),
+            max_working_memory_chars=int(
+                prompts.get(
+                    "max_working_memory_chars",
+                    defaults.prompts.max_working_memory_chars,
+                )
+            ),
+            max_layer_chars=int(
+                prompts.get("max_layer_chars", defaults.prompts.max_layer_chars)
+            ),
+            max_total_prompt_chars=int(
+                prompts.get(
+                    "max_total_prompt_chars",
+                    defaults.prompts.max_total_prompt_chars,
+                )
+            ),
         ),
         tool_routing=ToolRoutingConfig(
             base_url=str(
@@ -840,6 +914,7 @@ def validate_config(config: AgentConfig) -> list[str]:
         "memory_loop": "runtime_service",
         "policy": "policy_provider",
         "state": "storage_provider",
+        "prompts": "runtime_service",
         "context": "runtime_service",
         "mcp": "runtime_service",
         "skills": "runtime_service",
@@ -897,5 +972,19 @@ def validate_config(config: AgentConfig) -> list[str]:
         errors.append("tool_routing.min_similarity must be between 0 and 1")
     if config.tool_routing.timeout_seconds <= 0:
         errors.append("tool_routing.timeout_seconds must be positive")
+
+    prompt_limits = {
+        "max_profile_chars": (256, 64_000),
+        "max_working_memory_chars": (256, 128_000),
+        "max_layer_chars": (1_024, 256_000),
+        "max_total_prompt_chars": (4_096, 1_000_000),
+    }
+    for name, (minimum, maximum) in prompt_limits.items():
+        value = getattr(config.prompts, name)
+        if not isinstance(value, int) or not minimum <= value <= maximum:
+            errors.append(
+                f"prompts.{name} must be an integer from {minimum} to "
+                f"{maximum}, got {value!r}"
+            )
 
     return errors

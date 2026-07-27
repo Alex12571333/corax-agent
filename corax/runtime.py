@@ -9,6 +9,7 @@ their role-specific contracts.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -36,7 +37,7 @@ from .loader import CoreEngine, ExtensionLoader
 from .memory import NullMemory
 from .planner import StubPlanner
 from .registry import ExtensionCatalog
-from .tool_router import TOOL_SEARCH_ID, ToolRoutingHost
+from .tool_router import TOOL_CALL_ID, TOOL_SEARCH_ID, ToolRoutingHost
 
 _BUILTIN_FACTORIES: dict[str, Callable[[], Any]] = {
     "stub": StubPlanner,
@@ -222,6 +223,15 @@ class CoraxRuntime:
         self._started_extensions: list[tuple[str, Any]] = []
         self._managed_environment: dict[str, str] = {}
         self._mcp_tool_ids: set[str] = set()
+        self._prompt_turn_inputs: dict[
+            tuple[str, str, str], dict[str, Any]
+        ] = {}
+        self._prompt_turn_metadata: dict[
+            tuple[str, str, str], dict[str, Any]
+        ] = {}
+        self._prompt_provider_messages: dict[
+            tuple[str, str, str], list[dict[str, Any]]
+        ] = {}
 
     async def start(self) -> None:
         if self._running:
@@ -293,6 +303,9 @@ class CoraxRuntime:
         self._started_extensions.clear()
         self.extensions.clear()
         self.tool_routing.clear_turns()
+        self._prompt_turn_inputs.clear()
+        self._prompt_turn_metadata.clear()
+        self._prompt_provider_messages.clear()
         self._mcp_tool_ids.clear()
         self._running = False
         self._started_at = None
@@ -456,6 +469,19 @@ class CoraxRuntime:
         service_id = self.config.extensions.bindings.get("context", "")
         if service_id and self.services.has(service_id):
             return self.services.get(service_id)
+        return None
+
+    def active_prompt_runtime(self) -> Any | None:
+        """Return the selected layered prompt assembly service."""
+
+        if not self.config.prompts.enabled:
+            return None
+        service_id = self.config.extensions.bindings.get(
+            "prompts", "prompts.runtime"
+        )
+        if service_id and self.services.has(service_id):
+            service = self.services.get(service_id)
+            return service if getattr(service, "enabled", True) else None
         return None
 
     def active_mcp_manager(self) -> Any | None:
@@ -640,6 +666,182 @@ class CoraxRuntime:
         return augmented if getattr(result, "is_success", False) and isinstance(
             augmented, list
         ) else original
+
+    def _runtime_prompt_context(self) -> dict[str, str]:
+        now = self._clock()
+        if now.tzinfo is None or now.utcoffset() is None:
+            now = now.astimezone()
+        zone = getattr(now.tzinfo, "key", None) or now.tzname() or "local"
+        offset = now.strftime("%z")
+        return {
+            "local_date": now.date().isoformat(),
+            "local_time": now.time().isoformat(timespec="seconds"),
+            "timezone": zone,
+            "utc_offset": f"{offset[:3]}:{offset[3:]}" if offset else "unknown",
+        }
+
+    async def _prompt_inputs(
+        self,
+        context: dict[str, Any],
+        messages: list,
+        *,
+        prompt: str,
+        session_id: str,
+    ) -> tuple[tuple[str, str, str], dict[str, Any]]:
+        channel = str(context.get("channel") or "unknown")
+        turn_id = str(context.get("turn_id") or "")
+        key = (channel, session_id, turn_id)
+        cached = self._prompt_turn_inputs.get(key)
+        if cached is not None:
+            return key, cached
+
+        user_text = str(
+            context.get("user_text")
+            or self._last_user_text({"messages": messages, "prompt": prompt})
+        )
+        turn_kind = str(context.get("turn_kind") or "user")
+        recalled: dict[str, Any] = {}
+        blocks: list[dict[str, Any]] | None = None
+        selected: list[str] = []
+        hook_contexts: list[str] = []
+        project_path = context.get("project_path")
+
+        if turn_kind == "user":
+            recalled = await self.memory_before_turn(
+                user_text,
+                session_id=session_id,
+                scope={"channel": channel},
+            )
+            descriptors = context.get("tool_descriptors")
+            if not project_path and isinstance(descriptors, list):
+                project_ids = {
+                    str(item.get("id", ""))
+                    for item in descriptors
+                    if isinstance(item, dict)
+                }
+                if project_ids.intersection({"filesystem", "editor", "shell"}):
+                    project_path = str(self.workspace_path)
+
+            skills = self.active_skills_runtime()
+            if skills is not None:
+                payload: dict[str, Any] = {
+                    "messages": messages,
+                    "query": user_text,
+                }
+                if project_path:
+                    payload.update(
+                        {
+                            "project_path": str(project_path),
+                            "workspace_root": str(self.workspace_path),
+                        }
+                    )
+                try:
+                    result = await skills.handle(
+                        ExtensionRequest(
+                            operation="resolve",
+                            payload=payload,
+                            session_id=session_id,
+                        )
+                    )
+                except Exception as exc:  # noqa: BLE001 - optional skills fail soft
+                    self.log.debug("skill resolution failed: %s", exc)
+                else:
+                    value = result.payload or {}
+                    if getattr(result, "is_success", False):
+                        if isinstance(value.get("blocks"), list):
+                            blocks = [
+                                item
+                                for item in value["blocks"]
+                                if isinstance(item, dict)
+                            ]
+                        if isinstance(value.get("selected"), list):
+                            selected = [
+                                str(item) for item in value["selected"] if str(item)
+                            ]
+
+            hook_results = await self._dispatch_hooks(
+                "pre_model_call",
+                {
+                    "session_id": session_id,
+                    "prompt": prompt,
+                    "messages": messages,
+                },
+            )
+            hook_contexts = [
+                str(item.get("context", "")).strip()
+                for item in hook_results
+                if isinstance(item, dict) and str(item.get("context", "")).strip()
+            ]
+
+        inputs = {
+            "runtime_context": self._runtime_prompt_context(),
+            "recalled_records": list(recalled.get("records") or []),
+            "recalled_memory": str(recalled.get("context") or ""),
+            "instruction_blocks": blocks,
+            "selected_skill_ids": selected,
+            "hook_contexts": hook_contexts,
+            "project_path": str(project_path or ""),
+            "turn_kind": turn_kind,
+        }
+        self._prompt_turn_inputs[key] = inputs
+        return key, inputs
+
+    async def _assemble_model_messages(
+        self,
+        messages: tuple | list,
+        *,
+        prompt: str,
+        data: dict[str, Any],
+        session_id: str,
+    ) -> tuple[list, dict[str, Any]]:
+        context = data.pop("_corax_prompt_context", None)
+        service = self.active_prompt_runtime()
+        original = list(messages)
+        if (
+            service is None
+            or not getattr(service, "enabled", True)
+            or not isinstance(context, dict)
+        ):
+            prepared = await self.augment_with_skills(
+                original,
+                prompt=prompt,
+                session_id=session_id,
+            )
+            prepared = await self.augment_with_hooks(
+                prepared,
+                prompt=prompt,
+                session_id=session_id,
+            )
+            return self._with_temporal_context(prepared), {}
+
+        context = dict(context)
+        context.setdefault("session_id", session_id)
+        key, inputs = await self._prompt_inputs(
+            context,
+            original,
+            prompt=prompt,
+            session_id=session_id,
+        )
+        result = await service.build(
+            {
+                "messages": original,
+                "prompt": prompt,
+                "tool_failure": bool(context.get("tool_failure")),
+                "tool_descriptors": list(
+                    context.get("tool_descriptors") or []
+                ),
+                **inputs,
+            },
+            context=context,
+        )
+        prepared = result.get("messages") if isinstance(result, dict) else None
+        metadata = result.get("metadata") if isinstance(result, dict) else None
+        if not isinstance(prepared, list) or not prepared:
+            raise RuntimeError("prompt runtime returned no model messages")
+        safe_metadata = dict(metadata) if isinstance(metadata, dict) else {}
+        safe_metadata["_prompt_turn_key"] = key
+        self._prompt_turn_metadata[key] = safe_metadata
+        return prepared, safe_metadata
 
     async def compact_messages(
         self,
@@ -942,6 +1144,12 @@ class CoraxRuntime:
         value = usage.get("prompt_tokens") if isinstance(usage, dict) else None
         return value if type(value) is int and value >= 0 else None
 
+    @staticmethod
+    def _result_cached_tokens(result: Any) -> int | None:
+        payload = getattr(result, "payload", None)
+        value = payload.get("cached_tokens") if isinstance(payload, dict) else None
+        return value if type(value) is int and value >= 0 else None
+
     async def memory_before_turn(
         self,
         text: str,
@@ -976,28 +1184,134 @@ class CoraxRuntime:
         scope: dict | None = None,
         explicit: bool | None = None,
     ) -> dict[str, Any]:
-        loop = self.active_memory_loop()
-        if loop is None:
-            return {"stored": False, "reason": "memory loop unavailable"}
-        try:
-            result = await loop.handle(
-                ExtensionRequest(
-                    operation="after_turn",
-                    payload={
-                        "user_text": user_text,
-                        "assistant_text": assistant_text,
-                        "scope": dict(scope or {}),
-                        "explicit": explicit,
-                    },
-                    session_id=session_id,
-                )
+        scope_data = dict(scope or {})
+        channel = str(scope_data.get("channel") or "")
+        turn = (
+            self.tool_routing.current_turn(
+                session_id=session_id,
+                channel=channel,
             )
-        except Exception as exc:  # noqa: BLE001 - optional memory is fail-soft
-            self.log.warning("memory after_turn failed: %s", exc)
-            return {"stored": False, "reason": "memory loop unavailable"}
-        if getattr(result, "is_success", False):
-            return dict(result.payload or {})
-        return {"stored": False, "reason": "memory provider rejected write"}
+            if channel
+            else None
+        )
+        turn_id = str(
+            scope_data.get("turn_id")
+            or getattr(turn, "turn_id", "")
+            or ""
+        )
+        key = (channel, session_id, turn_id)
+        prompt_metadata = self._prompt_turn_metadata.get(key, {})
+        if prompt_metadata.get("retraction_mode"):
+            scope_data["retraction_mode"] = True
+
+        loop = self.active_memory_loop()
+        outcome = {"stored": False, "reason": "memory loop unavailable"}
+        if loop is not None:
+            try:
+                result = await loop.handle(
+                    ExtensionRequest(
+                        operation="after_turn",
+                        payload={
+                            "user_text": user_text,
+                            "assistant_text": assistant_text,
+                            "scope": scope_data,
+                            "explicit": explicit,
+                            "retraction_mode": bool(
+                                prompt_metadata.get("retraction_mode")
+                            ),
+                        },
+                        session_id=session_id,
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 - optional memory is fail-soft
+                self.log.warning("memory after_turn failed: %s", exc)
+            else:
+                outcome = (
+                    dict(result.payload or {})
+                    if getattr(result, "is_success", False)
+                    else {
+                        "stored": False,
+                        "reason": "memory provider rejected write",
+                    }
+                )
+
+        prompts = self.active_prompt_runtime()
+        if prompts is not None and turn_id and hasattr(prompts, "end_turn"):
+            try:
+                finish_kwargs = {
+                    "channel": channel,
+                    "session_id": session_id,
+                    "turn_id": turn_id,
+                    "assistant_text": assistant_text,
+                    "commit": True,
+                }
+                provider_messages = self._prompt_provider_messages.get(key)
+                if provider_messages is not None:
+                    finish_kwargs["provider_messages"] = provider_messages
+                finished = prompts.end_turn(
+                    **finish_kwargs,
+                )
+                if inspect.isawaitable(finished):
+                    await finished
+            except Exception as exc:  # noqa: BLE001 - retention remains fail-soft
+                self.log.warning("prompt turn finalization failed: %s", exc)
+                try:
+                    aborted = prompts.end_turn(
+                        channel=channel,
+                        session_id=session_id,
+                        turn_id=turn_id,
+                        commit=False,
+                    )
+                    if inspect.isawaitable(aborted):
+                        await aborted
+                except Exception as abort_exc:  # noqa: BLE001 - best-effort cleanup
+                    self.log.debug(
+                        "prompt turn cleanup after finalization failure failed: %s",
+                        abort_exc,
+                    )
+        self._prompt_turn_inputs.pop(key, None)
+        self._prompt_turn_metadata.pop(key, None)
+        self._prompt_provider_messages.pop(key, None)
+        return outcome
+
+    async def abort_turn(
+        self,
+        *,
+        session_id: str,
+        channel: str,
+        turn_id: str = "",
+    ) -> dict[str, Any]:
+        """Discard one unfinished host prompt snapshot and routing turn."""
+
+        turn = self.tool_routing.current_turn(
+            session_id=session_id,
+            channel=channel,
+        )
+        resolved_turn_id = str(turn_id or getattr(turn, "turn_id", "") or "")
+        key = (channel, session_id, resolved_turn_id)
+        prompts = self.active_prompt_runtime()
+        if prompts is not None and resolved_turn_id and hasattr(prompts, "end_turn"):
+            try:
+                finished = prompts.end_turn(
+                    channel=channel,
+                    session_id=session_id,
+                    turn_id=resolved_turn_id,
+                    commit=False,
+                )
+                if inspect.isawaitable(finished):
+                    await finished
+            except Exception as exc:  # noqa: BLE001 - cleanup remains fail-soft
+                self.log.debug("prompt turn abort failed: %s", exc)
+        self._prompt_turn_inputs.pop(key, None)
+        self._prompt_turn_metadata.pop(key, None)
+        self._prompt_provider_messages.pop(key, None)
+        self.tool_routing.end_turn(session_id=session_id, channel=channel)
+        return {
+            "aborted": bool(resolved_turn_id),
+            "session_id": session_id,
+            "turn_id": resolved_turn_id,
+            "channel": channel,
+        }
 
     def security_mode(self) -> str:
         policy = self.active_policy()
@@ -1007,6 +1321,30 @@ class CoraxRuntime:
     def _wire_runtime_services(self) -> None:
         """Bind cross-role services after every extension has started."""
 
+        prompts = self.active_prompt_runtime()
+        if prompts is not None and hasattr(prompts, "bind"):
+            try:
+                prompts.bind(
+                    runtime_root=self.root_path,
+                    data_root=self.data_path,
+                    workspace_root=self.workspace_path,
+                    legacy_prompt_root=self.root_path / self.config.prompts.root,
+                    config={
+                        "root": self.config.prompts.root,
+                        "user_profile": self.config.prompts.user_profile,
+                        "working_memory": self.config.prompts.working_memory,
+                        "max_profile_chars": self.config.prompts.max_profile_chars,
+                        "max_working_memory_chars": (
+                            self.config.prompts.max_working_memory_chars
+                        ),
+                        "max_layer_chars": self.config.prompts.max_layer_chars,
+                        "max_total_prompt_chars": (
+                            self.config.prompts.max_total_prompt_chars
+                        ),
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001 - startup isolates bad prompts
+                raise RuntimeError("failed wiring prompt runtime") from exc
         loop = self.active_memory_loop()
         if loop is not None and hasattr(loop, "bind"):
             try:
@@ -1109,17 +1447,21 @@ class CoraxRuntime:
         channel: str,
         kernel: Any | None = None,
     ) -> dict[str, Any]:
-        """Attach only the schemas active for this channel-neutral turn."""
+        """Attach fixed meta-tools and selected schemas as prompt context."""
 
         data = dict(payload)
         hinted_text = str(data.pop("_corax_user_text", "") or "")
+        recent_files = data.pop("_corax_recent_files", [])
+        tool_failure = bool(data.pop("_corax_tool_failure", False))
         data.pop("_corax_turn_id", None)
-        await self.refresh_dynamic_tools(kernel)
-        if not self.tool_routing.has_turn(
+        has_turn = self.tool_routing.has_turn(
             session_id=session_id,
             turn_id=turn_id,
             channel=channel,
-        ):
+        )
+        if not has_turn:
+            if not self.tool_routing.has_active_turns():
+                await self.refresh_dynamic_tools(kernel)
             user_text = hinted_text or self._last_user_text(data)
             turn = await self.tool_routing.begin_turn(
                 user_text,
@@ -1142,18 +1484,92 @@ class CoraxRuntime:
                     **self.tool_routing.router.last_route,
                 },
             )
-        schemas = self.tool_routing.active_schemas(
+        prompt_runtime = self.active_prompt_runtime()
+        if prompt_runtime is None:
+            data["tools"] = self.tool_routing.active_schemas(
+                session_id=session_id,
+                turn_id=turn_id,
+                channel=channel,
+            )
+            data["tool_choice"] = "auto"
+            return data
+
+        descriptors = self.tool_routing.active_descriptors(
             session_id=session_id,
             turn_id=turn_id,
             channel=channel,
         )
-        if schemas:
-            data["tools"] = schemas
-            data["tool_choice"] = "auto"
-        else:
-            data.pop("tools", None)
-            data.pop("tool_choice", None)
+        data["_corax_prompt_context"] = {
+            "channel": channel,
+            "session_id": session_id,
+            "turn_id": turn_id,
+            "user_text": hinted_text or self._last_user_text(data),
+            "tool_failure": tool_failure,
+            "tool_descriptors": descriptors,
+            "recent_files": (
+                [str(path)[:1024] for path in recent_files[:20]]
+                if isinstance(recent_files, list)
+                else []
+            ),
+        }
+        data["tools"] = self.tool_routing.model_schemas()
+        data["tool_choice"] = "auto"
         return data
+
+    async def invoke_turn_tool(
+        self,
+        extension_id: str,
+        payload: dict[str, Any],
+        *,
+        kernel: Any,
+        session_id: str,
+        turn_id: str,
+        channel: str,
+        policy_metadata: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Validate one routed model tool call, then cross the core boundary."""
+
+        data = dict(payload)
+        target = extension_id
+        if extension_id == TOOL_CALL_ID:
+            unknown = set(data) - {"capability", "input"}
+            if unknown:
+                raise ValueError(
+                    "tool.call received unknown fields: "
+                    + ", ".join(sorted(unknown))
+                )
+            target = data.get("capability")
+            tool_input = data.get("input")
+            if not isinstance(target, str) or not target.strip():
+                raise ValueError("tool.call capability must be a non-empty string")
+            target = target.strip()
+            if target in {TOOL_CALL_ID, TOOL_SEARCH_ID}:
+                raise ValueError("tool.call cannot invoke a host meta-tool")
+            if not isinstance(tool_input, dict):
+                raise ValueError("tool.call input must be an object")
+            data = dict(tool_input)
+
+        self.tool_routing.require_active(
+            target,
+            session_id=session_id,
+            turn_id=turn_id,
+            channel=channel,
+        )
+        if target == TOOL_SEARCH_ID:
+            return await self.search_tools(
+                data,
+                session_id=session_id,
+                turn_id=turn_id,
+                channel=channel,
+            )
+        if not self.tools.has(target):
+            raise KeyError(f"unknown tool: {target}")
+        return await kernel.invoke(
+            target,
+            data,
+            session_id=session_id,
+            policy_metadata=policy_metadata,
+        )
 
     async def search_tools(
         self,
@@ -1298,17 +1714,13 @@ class CoraxRuntime:
             )
         if kind is ExtensionKind.MODEL_PROVIDER:
             prompt = str(data.pop("prompt", ""))
-            messages = await self.augment_with_skills(
+            messages, prompt_metadata = await self._assemble_model_messages(
                 tuple(data.pop("messages", ())),
                 prompt=prompt,
+                data=data,
                 session_id=session_id,
             )
-            messages = await self.augment_with_hooks(
-                messages,
-                prompt=prompt,
-                session_id=session_id,
-            )
-            messages = self._with_temporal_context(messages)
+            prompt_key = prompt_metadata.pop("_prompt_turn_key", None)
             model_key = str(data.get("model") or extension_id)
             if operation == "plan":
                 request = self._model_request(
@@ -1327,6 +1739,16 @@ class CoraxRuntime:
                     session_id=session_id,
                     model_key=model_key,
                 )
+            if (
+                isinstance(prompt_key, tuple)
+                and len(prompt_key) == 3
+                and all(isinstance(item, str) for item in prompt_key)
+            ):
+                self._prompt_provider_messages[prompt_key] = [
+                    dict(message)
+                    for message in request.messages
+                    if isinstance(message, dict)
+                ]
             correlation_id = getattr(request, "request_id", "") or f"model-{session_id}"
             await self.record_observation(
                 TraceStage.PLANNER_CALLED,
@@ -1337,6 +1759,7 @@ class CoraxRuntime:
                     "model": request.model or "",
                     "modalities": list(request.modalities),
                     "operation": operation or "generate",
+                    **prompt_metadata,
                 },
             )
             try:
@@ -1381,6 +1804,8 @@ class CoraxRuntime:
                         "",
                     ),
                     "operation": operation or "generate",
+                    "cached_tokens": self._result_cached_tokens(result),
+                    **prompt_metadata,
                 },
             )
             await self._dispatch_hooks(
@@ -1488,17 +1913,13 @@ class CoraxRuntime:
         data = dict(payload or {})
         data.pop("operation", None)
         prompt = str(data.pop("prompt", ""))
-        messages = await self.augment_with_skills(
+        messages, prompt_metadata = await self._assemble_model_messages(
             tuple(data.pop("messages", ())),
             prompt=prompt,
+            data=data,
             session_id=session_id,
         )
-        messages = await self.augment_with_hooks(
-            messages,
-            prompt=prompt,
-            session_id=session_id,
-        )
-        messages = self._with_temporal_context(messages)
+        prompt_key = prompt_metadata.pop("_prompt_turn_key", None)
         model_key = str(data.get("model") or extension_id)
         request, context, prompt_bytes = await self._prepare_model_request(
             item,
@@ -1508,6 +1929,16 @@ class CoraxRuntime:
             session_id=session_id,
             model_key=model_key,
         )
+        if (
+            isinstance(prompt_key, tuple)
+            and len(prompt_key) == 3
+            and all(isinstance(item, str) for item in prompt_key)
+        ):
+            self._prompt_provider_messages[prompt_key] = [
+                dict(message)
+                for message in request.messages
+                if isinstance(message, dict)
+            ]
         correlation_id = getattr(request, "request_id", "") or f"stream-{session_id}"
         await self.record_observation(
             TraceStage.PLANNER_CALLED,
@@ -1518,8 +1949,10 @@ class CoraxRuntime:
                 "model": request.model or "",
                 "modalities": list(request.modalities),
                 "operation": "stream",
+                **prompt_metadata,
             },
         )
+        cached_tokens: int | None = None
         try:
             if context is not None and request.messages:
                 yield context
@@ -1529,6 +1962,9 @@ class CoraxRuntime:
                     and event.get("source") == "provider"
                     and event.get("scope") == "prompt"
                 ):
+                    value = event.get("cached_tokens")
+                    if type(value) is int and value >= 0:
+                        cached_tokens = value
                     self._record_context_calibration(
                         model_key,
                         prompt_bytes=prompt_bytes,
@@ -1550,7 +1986,11 @@ class CoraxRuntime:
                 correlation_id=correlation_id,
                 session_id=session_id,
                 capability_id=extension_id,
-                metadata={"operation": "stream"},
+                metadata={
+                    "operation": "stream",
+                    "cached_tokens": cached_tokens,
+                    **prompt_metadata,
+                },
             )
         finally:
             await self._dispatch_hooks(

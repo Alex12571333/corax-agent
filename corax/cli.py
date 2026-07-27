@@ -11,6 +11,7 @@ Usage:
     corax status                   # print runtime status and exit
     corax security status          # show the active permission mode
     corax security mode auto       # switch ask / auto / full
+    corax prompts status           # inspect layered prompt composition
     corax observability            # show the local trace sink status
     corax eval                     # run deterministic ecosystem checks
     corax doctor                   # check local runtime readiness
@@ -40,7 +41,7 @@ from corax import __version__ as CORAX_VERSION
 from corax import config as config_mod
 from corax.app import CoraxApp
 from corax.paths import default_config_path, ensure_paths
-from corax.tool_router import TOOL_SEARCH_ID
+from corax.tool_router import TOOL_CALL_ID, TOOL_SEARCH_ID
 
 
 def _minimal_runtime_snapshot(app: CoraxApp) -> dict[str, object]:
@@ -192,6 +193,7 @@ def build_parser() -> argparse.ArgumentParser:
             "gateway",
             "status",
             "security",
+            "prompts",
             "mcp",
             "skills",
             "hooks",
@@ -270,6 +272,26 @@ async def _run(args: argparse.Namespace) -> int:
             result = await app.runtime.security_control(security_command)
             _print_result("Security", result.get("message") or result)
             return 0 if result.get("ok") or result.get("challenge") else 2
+        elif command == "prompts":
+            service_id = app.config.extensions.bindings.get(
+                "prompts", "prompts.runtime"
+            )
+            if not app.runtime.services.has(service_id):
+                print("prompts.runtime is not loaded.")
+                return 1
+            requested = args.command_args[0] if args.command_args else "status"
+            operation = (
+                requested
+                if requested in {"status", "reload", "validate", "migrate"}
+                else "status"
+            )
+            result = await app.runtime.invoke_extension(
+                service_id,
+                {"operation": operation},
+                session_id="prompts-control",
+            )
+            _print_result("Prompts", result)
+            return 0 if result.get("ok", True) else 1
         elif command == "mcp":
             manager_id = app.config.extensions.bindings.get("mcp", "mcp.manager")
             if not app.runtime.services.has(manager_id):
@@ -676,23 +698,13 @@ async def _run_console_chat(
                 policy_metadata["turn_id"] = turn_id
             if not isinstance(turn_id, str) or not turn_id:
                 raise PermissionError("tool call has no active console turn")
-            runtime.tool_routing.require_active(
+            return await runtime.invoke_turn_tool(
                 extension_id,
+                payload,
+                kernel=kernel,
                 session_id=session_id,
                 turn_id=turn_id,
                 channel=local_channel,
-            )
-            if extension_id == TOOL_SEARCH_ID:
-                return await runtime.search_tools(
-                    payload,
-                    session_id=session_id,
-                    turn_id=turn_id,
-                    channel=local_channel,
-                )
-            return await kernel.invoke(
-                extension_id,
-                payload,
-                session_id=session_id,
                 policy_metadata=policy_metadata,
             )
 
@@ -804,6 +816,9 @@ async def _run_console_chat(
                 )
 
         async def memory_after_turn(*args, session_id, **kwargs):
+            scope = dict(kwargs.get("scope") or {})
+            scope["channel"] = local_channel
+            kwargs["scope"] = scope
             try:
                 return await runtime.memory_after_turn(
                     *args,
@@ -816,6 +831,14 @@ async def _run_console_chat(
                     channel=local_channel,
                 )
 
+        async def abort_turn(*, session_id, scope):
+            await runtime.abort_turn(
+                session_id=session_id,
+                channel=local_channel,
+                turn_id=str((scope or {}).get("turn_id") or ""),
+            )
+
+        host_prompt_assembly = runtime.active_prompt_runtime() is not None
         context_window = await discover_model_context_window(
             app.config.llm.base_url,
             app.config.llm.model,
@@ -832,8 +855,12 @@ async def _run_console_chat(
             status_command=status_control,
             security_command=security_control,
             memory_command=memory_control,
-            memory_before_turn=runtime.memory_before_turn,
+            memory_before_turn=(
+                None if host_prompt_assembly else runtime.memory_before_turn
+            ),
             memory_after_turn=memory_after_turn,
+            abort_turn=abort_turn,
+            host_prompt_assembly=host_prompt_assembly,
             load_state=load_state,
             save_state=save_state,
             version=CORAX_VERSION,
@@ -955,25 +982,17 @@ async def _run_chat(app: "CoraxApp", config_path: Path) -> int:
                         data,
                         session_id=session_id,
                     )
-                if extension_id == TOOL_SEARCH_ID or runtime.tools.has(extension_id):
+                if extension_id in {TOOL_SEARCH_ID, TOOL_CALL_ID} or runtime.tools.has(
+                    extension_id
+                ):
                     turn_id = str((policy_metadata or {}).get("turn_id", "") or "")
-                    runtime.tool_routing.require_active(
+                    return await runtime.invoke_turn_tool(
                         extension_id,
+                        data,
+                        kernel=kernel,
                         session_id=session_id,
                         turn_id=turn_id,
                         channel="telegram",
-                    )
-                    if extension_id == TOOL_SEARCH_ID:
-                        return await runtime.search_tools(
-                            data,
-                            session_id=session_id,
-                            turn_id=turn_id,
-                            channel="telegram",
-                        )
-                    return await kernel.invoke(
-                        extension_id,
-                        data,
-                        session_id=session_id or None,
                         policy_metadata=policy_metadata,
                     )
                 return await runtime.invoke_extension(
@@ -1020,6 +1039,13 @@ async def _run_chat(app: "CoraxApp", config_path: Path) -> int:
                         channel="telegram",
                     )
 
+            async def abort_turn(*, session_id, scope):
+                await runtime.abort_turn(
+                    session_id=session_id,
+                    channel="telegram",
+                    turn_id=str((scope or {}).get("turn_id") or ""),
+                )
+
             async def control_security(
                 command: str,
                 *,
@@ -1055,6 +1081,7 @@ async def _run_chat(app: "CoraxApp", config_path: Path) -> int:
                     transport=transport,
                 )
 
+            host_prompt_assembly = runtime.active_prompt_runtime() is not None
             gateway_kwargs = {
                 "run_capability": invoke_component,
                 "stream_capability": stream_component,
@@ -1065,11 +1092,19 @@ async def _run_chat(app: "CoraxApp", config_path: Path) -> int:
                 "llm_id": model_id,
                 "workspace_path": runtime.workspace_path,
                 "state_path": runtime.data_path / "telegram-gateway-fallback-state.json",
-                "profile_path": runtime.data_path / "profile.md",
                 "stream_transport": stream_transport,
                 "security_command": control_security,
-                "memory_before_turn": runtime.memory_before_turn,
+                "memory_before_turn": (
+                    None if host_prompt_assembly else runtime.memory_before_turn
+                ),
                 "memory_after_turn": memory_after_turn,
+                "abort_turn": abort_turn,
+                "host_prompt_assembly": host_prompt_assembly,
+                "profile_path": (
+                    None
+                    if host_prompt_assembly
+                    else runtime.data_path / "profile.md"
+                ),
                 "tool_mode": tool_mode_label,
             }
             if system_prompt is not None:

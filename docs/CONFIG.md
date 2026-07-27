@@ -24,6 +24,7 @@ defaults to `corax.yaml` (or `corax.json` when PyYAML is absent).
 | `security`     | `mode` (initial policy mode), `blocked_paths[]`                              |
 | `limits`       | `max_parallel_tasks`, `max_plan_tasks`, `max_tasks_per_correlation`, `task_timeout_seconds`, `max_payload_mb` |
 | `ui`           | `theme`, `mascot`, `show_banner`                                            |
+| `prompts`      | prompt root, identity paths, and per-layer/total character budgets          |
 | `tool_routing` | embedding endpoint/model, top-K, similarity and schema budgets              |
 
 `extensions` is the only activation catalogue. `bindings` select one provider
@@ -35,6 +36,11 @@ for scalar roles; `active` contains the loaded ids for every extension kind.
 the generation model. `CORAX_EMBEDDING_BASE_URL` and
 `CORAX_EMBEDDING_MODEL` may override those two values without editing the
 file. No LLM reranker is used.
+
+`prompts` selects the layered Markdown runtime. Package defaults are immutable;
+operator overrides and `USER.md` / `MEMORY.md` live under the configured
+runtime/data roots. `corax prompts validate` checks required UTF-8 layers and
+budgets without printing private content.
 
 Tool extensions may add an optional `routing` object to `extension.json`.
 Useful fields are `title`, `summary`, `domains`, `tags`, `intents`,
@@ -65,7 +71,7 @@ any active/enabled list so the config stays consistent.
 `validate_config(config) -> list[str]` returns human-readable errors (empty =
 valid). It checks: required sections, `log_level`, `security.mode`, that active
 extension ids and role bindings exist, have the right kind, and are enabled,
-and that runtime and tool-routing limits are valid. `corax init` runs it and
+and that runtime, prompt, and tool-routing limits are valid. `corax init` runs it and
 reports warnings.
 
 `security.mode` accepts `ask`, `auto`, or `full`. Old `normal`, `strict`, and

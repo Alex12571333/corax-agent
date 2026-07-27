@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 from corax.config import ToolRoutingConfig
 from corax.tool_router import (
+    TOOL_CALL_ID,
     TOOL_SEARCH_ID,
     ToolRoutingHost,
     is_trivial_chitchat,
@@ -129,7 +130,7 @@ class ToolRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(names, {"tool_search", "filesystem"})
         self.assertNotIn("input_schema", host.catalog.get("filesystem").__slots__)
 
-    async def test_search_expands_monotonically_without_returning_schemas(self):
+    async def test_search_expands_monotonically_and_returns_activated_schemas(self):
         host = _host()
         await host.begin_turn(
             "прочитай файл",
@@ -147,6 +148,8 @@ class ToolRoutingTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["activated"], ["web.search"])
         self.assertNotIn("input_schema", result["matches"][0])
+        self.assertEqual(result["tools"][0]["id"], "web.search")
+        self.assertIn("input_schema", result["tools"][0])
         turn = host.current_turn(session_id="s1", channel="telegram")
         self.assertEqual(
             turn.active_ids,
@@ -283,6 +286,17 @@ class ToolRoutingTests(unittest.IsolatedAsyncioTestCase):
         )
         names = [item["model_name"] for item in host.all_specs()]
         self.assertEqual(len(names), len(set(names)))
+
+    def test_model_schema_prefix_is_stable(self):
+        host = _host()
+        names = [
+            item["function"]["name"] for item in host.model_schemas()
+        ]
+        self.assertEqual(names, ["tool_search", "tool_call"])
+        self.assertEqual(
+            {item["id"] for item in host.all_specs()},
+            {TOOL_SEARCH_ID, TOOL_CALL_ID, "filesystem", "web.search"},
+        )
 
     def test_trivial_filter_is_conservative(self):
         for text in ("привет", "thanks!", "👍", "ok"):

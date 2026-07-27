@@ -84,6 +84,14 @@ class TestValidation(unittest.TestCase):
         errors = cfg.validate_config(config)
         self.assertTrue(any("max_parallel_tasks" in e for e in errors))
 
+    def test_prompt_limits_match_runtime_bounds(self) -> None:
+        config = cfg.default_config()
+        config.prompts.max_profile_chars = 255
+        config.prompts.max_total_prompt_chars = 1_000_001
+        errors = cfg.validate_config(config)
+        self.assertTrue(any("max_profile_chars" in e for e in errors))
+        self.assertTrue(any("max_total_prompt_chars" in e for e in errors))
+
 
 class TestRoundTrip(unittest.TestCase):
     def _round_trip(self, filename: str) -> None:

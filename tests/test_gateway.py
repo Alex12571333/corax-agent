@@ -436,6 +436,47 @@ class ChatToolLoopTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
+    async def test_meta_tool_call_unwraps_for_policy_and_artifacts(self) -> None:
+        backend = FakeBackend(
+            poll_batches=[[_text_update(5, "write file")]],
+            llm_responses=[
+                {
+                    "tool_calls": [
+                        _tool_call(
+                            "tool_call",
+                            json.dumps(
+                                {
+                                    "capability": "filesystem",
+                                    "input": {
+                                        "operation": "write",
+                                        "path": "note.txt",
+                                        "content": "hello",
+                                    },
+                                }
+                            ),
+                        )
+                    ]
+                },
+                {"text": "done"},
+            ],
+        )
+        backend.tool_results["filesystem"] = {
+            "ok": True,
+            "path": "note.txt",
+            "written": True,
+        }
+
+        await _gateway(
+            backend,
+            capabilities=[
+                *CAPS,
+                {"id": "tool.call", "model_name": "tool_call"},
+            ],
+        ).run(max_iterations=1)
+
+        self.assertEqual(backend.policy_calls[0][0], "filesystem")
+        self.assertTrue(any("filesystem" in message for message in backend.sends))
+
     async def test_plain_answer_no_tools(self) -> None:
         backend = FakeBackend(poll_batches=[[_text_update(5, "hi")]],
                               llm_responses=[{"text": "hello there"}])
@@ -808,6 +849,46 @@ class ChatToolLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(artifact_calls[0]["tool_capability_id"], "filesystem")
         self.assertEqual(artifact_calls[0]["tool_result"]["path"], "notes.txt")
 
+    async def test_failed_write_is_not_recorded_as_recent_artifact(self) -> None:
+        backend = FakeBackend(
+            poll_batches=[[_text_update(5, "create notes")]],
+            llm_responses=[
+                {
+                    "tool_calls": [
+                        _tool_call(
+                            "filesystem",
+                            '{"operation": "write", "path": "failed.txt"}',
+                        )
+                    ]
+                },
+                {"text": "could not write"},
+                {"text": "stopped"},
+            ],
+            tool_results={
+                "filesystem": {
+                    "ok": False,
+                    "error": "write failed",
+                    "path": "failed.txt",
+                }
+            },
+        )
+        gateway = _gateway(backend, capabilities=CAPS_WITH_GATEWAY)
+
+        await gateway.run(max_iterations=1)
+
+        artifact_calls = [
+            call
+            for call in backend.gateway_calls
+            if call["operation"] == "record_artifact"
+        ]
+        self.assertEqual(artifact_calls, [])
+        self.assertFalse(
+            any(
+                "failed.txt" in files
+                for files in gateway._recent_files.values()
+            )
+        )
+
     async def test_gateway_capability_plans_tool_recovery(self) -> None:
         backend = FakeBackend(
             poll_batches=[[_text_update(5, "read notes")]],
@@ -1010,6 +1091,219 @@ class ChatToolLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(memory_index, user_index)
         self.assertEqual(recalls[0][2]["channel"], "telegram")
 
+    async def test_host_prompt_assembly_keeps_raw_telegram_messages(self) -> None:
+        backend = FakeBackend(
+            poll_batches=[[_text_update(5, "hello")]],
+            llm_responses=[{"text": "hi"}],
+        )
+
+        async def before(*_args, **_kwargs):
+            raise AssertionError("host prompt assembly owns recall")
+
+        await _gateway(
+            backend,
+            host_prompt_assembly=True,
+            memory_before_turn=before,
+        ).run(max_iterations=1)
+
+        messages = [
+            payload
+            for _cap, operation, payload in backend.calls
+            if operation == "generate"
+        ][0]["messages"]
+        self.assertEqual(messages, [{"role": "user", "content": "hello"}])
+
+    async def test_failed_host_turn_is_aborted(self) -> None:
+        backend = FakeBackend(
+            poll_batches=[[_text_update(5, "hello")]],
+        )
+        backend.fail_operation = "generate"
+        aborted = []
+
+        async def abort(*, session_id, scope):
+            aborted.append((session_id, scope))
+            return {"aborted": True}
+
+        await _gateway(
+            backend,
+            capabilities=CAPS_WITH_GATEWAY,
+            host_prompt_assembly=True,
+            abort_turn=abort,
+        ).run(max_iterations=1)
+
+        self.assertEqual(len(aborted), 1)
+        self.assertEqual(aborted[0][0], "gw-session")
+        self.assertEqual(aborted[0][1]["channel"], "telegram")
+        self.assertTrue(aborted[0][1]["turn_id"].startswith("telegram:"))
+
+    async def test_cancelled_first_generate_aborts_and_reraises(self) -> None:
+        backend = FakeBackend(
+            poll_batches=[[_text_update(5, "hello")]],
+        )
+        original = backend.run_capability
+
+        async def cancel_generate(
+            cap_id,
+            payload,
+            *,
+            session_id=None,
+            policy_metadata=None,
+        ):
+            if cap_id == "llm.local" and payload.get("operation") == "generate":
+                raise asyncio.CancelledError
+            return await original(
+                cap_id,
+                payload,
+                session_id=session_id,
+                policy_metadata=policy_metadata,
+            )
+
+        backend.run_capability = cancel_generate
+        aborted = []
+
+        async def abort(*, session_id, scope):
+            aborted.append((session_id, scope))
+
+        gateway = _gateway(backend, abort_turn=abort)
+
+        with self.assertRaises(asyncio.CancelledError):
+            await gateway.run(max_iterations=1)
+
+        self.assertEqual(len(aborted), 1)
+        self.assertEqual(aborted[0][1]["channel"], "telegram")
+
+    async def test_cancel_after_confirmation_denies_then_aborts_and_reraises(
+        self,
+    ) -> None:
+        backend = FakeBackend(
+            poll_batches=[[_text_update(5, "delete file")]],
+            llm_responses=[
+                {"tool_calls": [_tool_call("filesystem", '{"path": "a.txt"}')]}
+            ],
+        )
+        backend.confirm_capability = "filesystem"
+        original = backend.run_capability
+        model_calls = 0
+
+        async def cancel_second_model(
+            cap_id,
+            payload,
+            *,
+            session_id=None,
+            policy_metadata=None,
+        ):
+            nonlocal model_calls
+            if cap_id == "llm.local" and payload.get("operation") == "generate":
+                model_calls += 1
+                if model_calls == 2:
+                    raise asyncio.CancelledError
+            return await original(
+                cap_id,
+                payload,
+                session_id=session_id,
+                policy_metadata=policy_metadata,
+            )
+
+        backend.run_capability = cancel_second_model
+        cleanup = []
+
+        async def security(command, *, actor, transport):
+            cleanup.append(("deny", command))
+            return {"ok": True}
+
+        async def abort(*, session_id, scope):
+            cleanup.append(("abort", scope["turn_id"]))
+
+        gateway = _gateway(
+            backend,
+            security_command=security,
+            abort_turn=abort,
+        )
+
+        with self.assertRaises(asyncio.CancelledError):
+            await gateway.run(max_iterations=1)
+
+        self.assertEqual([item[0] for item in cleanup], ["deny", "abort"])
+        self.assertEqual(gateway._pending_approvals, {})
+
+    async def test_aborted_turn_denies_and_forgets_pending_approval(self) -> None:
+        backend = FakeBackend(
+            poll_batches=[[_text_update(5, "delete file")]],
+            llm_responses=[
+                {"tool_calls": [_tool_call("filesystem", '{"path": "a.txt"}')]}
+            ],
+        )
+        backend.confirm_capability = "filesystem"
+        original = backend.run_capability
+        model_calls = 0
+
+        async def fail_second_model(
+            cap_id,
+            payload,
+            *,
+            session_id=None,
+            policy_metadata=None,
+        ):
+            nonlocal model_calls
+            if cap_id == "llm.local" and payload.get("operation") == "generate":
+                model_calls += 1
+                if model_calls == 2:
+                    raise GatewayError("model failed")
+            return await original(
+                cap_id,
+                payload,
+                session_id=session_id,
+                policy_metadata=policy_metadata,
+            )
+
+        backend.run_capability = fail_second_model
+        security_calls = []
+
+        async def security(command, *, actor, transport):
+            security_calls.append((command, actor, transport))
+            return {"ok": True}
+
+        gateway = _gateway(
+            backend,
+            security_command=security,
+            abort_turn=lambda **_kwargs: asyncio.sleep(0),
+        )
+        await gateway.run(max_iterations=1)
+
+        self.assertEqual(
+            security_calls,
+            [("deny task-confirm-1 once", "5", "telegram")],
+        )
+        self.assertEqual(gateway._pending_approvals, {})
+
+    async def test_failed_pending_denial_remains_retryable(self) -> None:
+        async def security(_command, *, actor, transport):
+            return {"ok": False}
+
+        gateway = _gateway(FakeBackend(), security_command=security)
+        gateway._pending_approvals["5"] = {"task-1": "filesystem"}
+
+        await gateway._discard_pending_approvals(5)
+
+        self.assertEqual(
+            gateway._pending_approvals,
+            {"5": {"task-1": "filesystem"}},
+        )
+
+    async def test_pending_denial_exception_remains_retryable(self) -> None:
+        async def security(_command, *, actor, transport):
+            raise GatewayError("unavailable")
+
+        gateway = _gateway(FakeBackend(), security_command=security)
+        gateway._pending_approvals["5"] = {"task-1": "filesystem"}
+
+        await gateway._discard_pending_approvals(5)
+
+        self.assertEqual(
+            gateway._pending_approvals,
+            {"5": {"task-1": "filesystem"}},
+        )
+
     async def test_memory_loop_retains_after_completed_turn(self) -> None:
         backend = FakeBackend(
             poll_batches=[[_text_update(5, "Запомни, меня зовут Алекс")]],
@@ -1079,9 +1373,10 @@ class ChatToolLoopTests(unittest.IsolatedAsyncioTestCase):
             llm_responses=[{"tool_calls": [_tool_call("filesystem")]}, {"text": "ok"}],
         )
         backend.fail_capability = "filesystem"
-        gw = _gateway(backend)
+        gw = _gateway(backend, host_prompt_assembly=True)
         await gw.run(max_iterations=1)
         gen_calls = [p for c, op, p in backend.calls if op == "generate"]
+        self.assertTrue(gen_calls[1]["_corax_tool_failure"])
         tool_msg = _last_tool_message(gen_calls[1]["messages"])
         self.assertIn("error", tool_msg["content"])
         self.assertIn("recovery_hint", tool_msg["content"])
