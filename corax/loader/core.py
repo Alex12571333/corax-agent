@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
 import logging
 import uuid
 from typing import Any, AsyncIterator, Iterable
@@ -67,7 +66,6 @@ _DECLARATION_ATTRS = (
     "config_schema", "secrets", "input_schema", "output_schema",
 )
 _echo_wrapper_cache: dict[int, type] = {}
-_CONFIRMATION_APPROVAL_METADATA = "_confirmation_approval"
 
 
 class _ExtensionTraceWriter:
@@ -224,7 +222,7 @@ class RunningCore:
             input=dict(input or {}),
             required_capability=required_capability,
             timeout_seconds=timeout_seconds,
-            metadata=dict(policy_metadata or {}),
+            policy_metadata=dict(policy_metadata or {}),
         )
         await self.task_store.save(task)
         return task.task_id
@@ -272,7 +270,7 @@ class RunningCore:
             transport=transport,
             reason=reason,
         )
-        if not resolved.startswith("allow_"):
+        if task.status is not self._ac.TaskStatus.READY:
             return {
                 "ok": True,
                 "task_id": task_id,
@@ -355,14 +353,7 @@ class RunningCore:
             echoed = state.temporary_context.get(state_key)
 
         if task.status is self._ac.TaskStatus.WAITING_CONFIRMATION:
-            approval: dict[str, Any] = {}
-            raw_approval = task.metadata.get(_CONFIRMATION_APPROVAL_METADATA, "")
-            try:
-                candidate = json.loads(raw_approval)
-            except (TypeError, ValueError):
-                candidate = {}
-            if isinstance(candidate, dict):
-                approval = candidate
+            approval = self.executor.confirmation_descriptor(task)
             raise ConfirmationRequired(
                 task.task_id,
                 capability_id,

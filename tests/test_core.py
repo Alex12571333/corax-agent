@@ -193,10 +193,14 @@ class TestCoreEngine(unittest.TestCase):
         from agent_core import DecisionType, PolicyDecision, PolicyEngine
 
         seen: list[dict] = []
+        task_metadata: list[dict] = []
+        task_policy_metadata: list[dict] = []
 
         class _RecordingPolicy(PolicyEngine):
             async def evaluate(self, task, capability, context):
                 seen.append(dict(context.metadata))
+                task_metadata.append(dict(task.metadata))
+                task_policy_metadata.append(dict(task.policy_metadata))
                 return PolicyDecision(DecisionType.ALLOW, "recorded")
 
         async def go():
@@ -228,6 +232,62 @@ class TestCoreEngine(unittest.TestCase):
                 "turn_id": "turn-11",
             }],
         )
+        self.assertEqual(task_metadata, [{}])
+        self.assertEqual(task_policy_metadata, seen)
+
+    def test_confirmation_resolution_is_opaque_to_core_and_host(self) -> None:
+        from agent_core import DecisionType, PolicyDecision, PolicyEngine
+
+        writer = _make_confirmed_writer()
+
+        class _OpaquePolicy(PolicyEngine):
+            async def evaluate(self, task, capability, context):
+                return PolicyDecision(
+                    DecisionType.REQUIRES_CONFIRMATION,
+                    "product approval",
+                    metadata={
+                        "approval": {
+                            "summary": "Proceed with write?",
+                            "choices": ["proceed", "stop"],
+                        },
+                    },
+                )
+
+            async def resolve_confirmation(
+                self,
+                task,
+                extension,
+                context,
+                *,
+                resolution,
+                actor,
+                transport,
+                reason="",
+            ):
+                return resolution == "proceed"
+
+        async def go():
+            async with self.engine.session(
+                [("writer", writer)],
+                policy=_OpaquePolicy(),
+            ) as kernel:
+                with self.assertRaises(ConfirmationRequired) as raised:
+                    await kernel.invoke("writer", {"path": "notes.txt"})
+                self.assertEqual(
+                    raised.exception.choices,
+                    ("proceed", "stop"),
+                )
+                return await kernel.resolve_confirmation(
+                    raised.exception.task_id,
+                    resolution="proceed",
+                    actor="test",
+                )
+
+        result = asyncio.run(go())
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["resolution"], "proceed")
+        self.assertEqual(result["result"], {"written": True})
+        self.assertEqual(writer.calls, 1)
 
     def test_live_registry_sync_adds_and_removes_tools(self) -> None:
         first = _make_adder()
