@@ -131,6 +131,33 @@ class CliCommandTests(unittest.TestCase):
 
         self.assertIsNone(result)
 
+    def test_eval_uses_installed_source_root(self) -> None:
+        report = SimpleNamespace(ok=True, render=Mock(return_value="ok"))
+        run_evaluations = Mock(return_value=report)
+        app = SimpleNamespace(
+            runtime=SimpleNamespace(root_path=Path("/wrong/runtime/path")),
+            boot=AsyncMock(),
+            shutdown=AsyncMock(),
+        )
+        with (
+            patch("corax.cli._needs_setup", return_value=False),
+            patch("corax.cli.CoraxApp", return_value=app),
+            patch("corax.cli._print_result"),
+            patch.dict(
+                sys.modules,
+                {
+                    "corax_evals": SimpleNamespace(
+                        run_evaluations=run_evaluations,
+                    )
+                },
+            ),
+        ):
+            result = asyncio.run(_run(build_parser().parse_args(["eval"])))
+
+        agent_root = Path(sys.modules["corax.cli"].__file__).resolve().parents[1]
+        self.assertEqual(result, 0)
+        run_evaluations.assert_called_once_with(agent_root, agent_root.parent)
+
     def test_setup_gated_commands_fall_back_to_builtin_menu(self) -> None:
         for argv in ([], ["setup"], ["gateway"]):
             with self.subTest(argv=argv), tempfile.TemporaryDirectory() as tmp:

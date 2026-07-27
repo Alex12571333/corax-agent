@@ -368,10 +368,8 @@ async def _run(args: argparse.Namespace) -> int:
                     "or the corax-evals package."
                 )
                 return 1
-            report = run_evaluations(
-                app.runtime.root_path,
-                app.runtime.root_path.parent,
-            )
+            agent_root = Path(__file__).resolve().parents[1]
+            report = run_evaluations(agent_root, agent_root.parent)
             _print_result("Evaluations", report.render())
             return 0 if report.ok else 1
         elif command == "doctor":
