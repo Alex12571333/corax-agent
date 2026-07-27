@@ -229,6 +229,22 @@ class TestCoreEngine(unittest.TestCase):
             }],
         )
 
+    def test_live_registry_sync_adds_and_removes_tools(self) -> None:
+        first = _make_adder()
+        second = _make_adder()
+        second.id = "second"
+        second.name = "Second"
+
+        async def go():
+            async with self.engine.session([("adder", first)]) as kernel:
+                await kernel.sync_capabilities([("second", second)])
+                result = await kernel.invoke("second", {"a": 3, "b": 4})
+                return result, kernel.capability_ids
+
+        result, ids = asyncio.run(go())
+        self.assertEqual(result, {"sum": 7})
+        self.assertEqual(ids, ["second"])
+
     def test_session_unavailable_raises_when_core_absent(self) -> None:
         engine = CoreEngine(cfg.default_config())
         engine._probed = True

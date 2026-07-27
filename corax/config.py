@@ -48,6 +48,7 @@ REQUIRED_SECTIONS = (
     "limits",
     "ui",
     "llm",
+    "tool_routing",
     "telegram",
     "websearch",
 )
@@ -153,6 +154,20 @@ class LLMConfig:
 
 
 @dataclass
+class ToolRoutingConfig:
+    """Embedding-only selection of model-visible tools."""
+
+    base_url: str = "http://192.168.0.10:8080/v1"
+    model: str = "nvidia/Nemotron-3-Embed-1B-NVFP4"
+    dimension: int = 2048
+    top_k: int = 6
+    max_active_tools: int = 12
+    max_schema_bytes: int = 32_768
+    min_similarity: float = 0.20
+    timeout_seconds: float = 30.0
+
+
+@dataclass
 class TelegramConfig:
     """Setup for the Telegram connector capability (``telegram.connector``).
 
@@ -194,6 +209,7 @@ class AgentConfig:
     limits: LimitsConfig = field(default_factory=LimitsConfig)
     ui: UIConfig = field(default_factory=UIConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
+    tool_routing: ToolRoutingConfig = field(default_factory=ToolRoutingConfig)
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
     websearch: WebSearchConfig = field(default_factory=WebSearchConfig)
 
@@ -410,6 +426,7 @@ def default_config() -> AgentConfig:
             enable_image=False,
             enable_video=False,
         ),
+        tool_routing=ToolRoutingConfig(),
         telegram=TelegramConfig(
             base_url="https://api.telegram.org",
             allowed_chats="",
@@ -571,6 +588,16 @@ def config_to_dict(config: AgentConfig) -> dict[str, Any]:
             "enable_image": config.llm.enable_image,
             "enable_video": config.llm.enable_video,
         },
+        "tool_routing": {
+            "base_url": config.tool_routing.base_url,
+            "model": config.tool_routing.model,
+            "dimension": config.tool_routing.dimension,
+            "top_k": config.tool_routing.top_k,
+            "max_active_tools": config.tool_routing.max_active_tools,
+            "max_schema_bytes": config.tool_routing.max_schema_bytes,
+            "min_similarity": config.tool_routing.min_similarity,
+            "timeout_seconds": config.tool_routing.timeout_seconds,
+        },
         "telegram": {
             "base_url": config.telegram.base_url,
             "allowed_chats": config.telegram.allowed_chats,
@@ -597,6 +624,7 @@ def config_from_dict(data: dict[str, Any]) -> AgentConfig:
     limits = data.get("limits", {}) or {}
     ui = data.get("ui", {}) or {}
     llm = data.get("llm", {}) or {}
+    tool_routing = data.get("tool_routing", {}) or {}
     telegram = data.get("telegram", {}) or {}
     websearch = data.get("websearch", {}) or {}
 
@@ -647,6 +675,50 @@ def config_from_dict(data: dict[str, Any]) -> AgentConfig:
             model=str(llm.get("model", defaults.llm.model)),
             enable_image=bool(llm.get("enable_image", defaults.llm.enable_image)),
             enable_video=bool(llm.get("enable_video", defaults.llm.enable_video)),
+        ),
+        tool_routing=ToolRoutingConfig(
+            base_url=str(
+                tool_routing.get(
+                    "base_url",
+                    defaults.tool_routing.base_url,
+                )
+            ),
+            model=str(
+                tool_routing.get("model", defaults.tool_routing.model)
+            ),
+            dimension=int(
+                tool_routing.get(
+                    "dimension",
+                    defaults.tool_routing.dimension,
+                )
+            ),
+            top_k=int(
+                tool_routing.get("top_k", defaults.tool_routing.top_k)
+            ),
+            max_active_tools=int(
+                tool_routing.get(
+                    "max_active_tools",
+                    defaults.tool_routing.max_active_tools,
+                )
+            ),
+            max_schema_bytes=int(
+                tool_routing.get(
+                    "max_schema_bytes",
+                    defaults.tool_routing.max_schema_bytes,
+                )
+            ),
+            min_similarity=float(
+                tool_routing.get(
+                    "min_similarity",
+                    defaults.tool_routing.min_similarity,
+                )
+            ),
+            timeout_seconds=float(
+                tool_routing.get(
+                    "timeout_seconds",
+                    defaults.tool_routing.timeout_seconds,
+                )
+            ),
         ),
         telegram=TelegramConfig(
             base_url=str(telegram.get("base_url", defaults.telegram.base_url)),
@@ -809,5 +881,21 @@ def validate_config(config: AgentConfig) -> list[str]:
         value = getattr(config.limits, name)
         if not isinstance(value, int) or value <= 0:
             errors.append(f"limits.{name} must be a positive integer, got {value!r}")
+
+    for name in (
+        "dimension",
+        "top_k",
+        "max_active_tools",
+        "max_schema_bytes",
+    ):
+        value = getattr(config.tool_routing, name)
+        if not isinstance(value, int) or value <= 0:
+            errors.append(
+                f"tool_routing.{name} must be a positive integer, got {value!r}"
+            )
+    if not 0 <= config.tool_routing.min_similarity <= 1:
+        errors.append("tool_routing.min_similarity must be between 0 and 1")
+    if config.tool_routing.timeout_seconds <= 0:
+        errors.append("tool_routing.timeout_seconds must be positive")
 
     return errors

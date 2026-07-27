@@ -168,6 +168,7 @@ class CoraxTelegramGateway:
         memory_before_turn: MemoryBeforeTurn | None = None,
         memory_after_turn: MemoryAfterTurn | None = None,
         max_active_tools: int = 8,
+        tool_mode: str | None = None,
         log: logging.Logger | None = None,
         new_session: Callable[[], str] | None = None,
         sleep: Callable[[float], Awaitable[None]] | None = None,
@@ -200,6 +201,7 @@ class CoraxTelegramGateway:
         self._memory_before_turn = memory_before_turn
         self._memory_after_turn = memory_after_turn
         self.max_active_tools = max(1, max_active_tools)
+        self.tool_mode = tool_mode
         self.log = log or logging.getLogger("corax.gateway")
         self._new_session = new_session or (lambda: f"chat-{uuid.uuid4().hex[:8]}")
         self._sleep = sleep or _async_sleep
@@ -221,7 +223,7 @@ class CoraxTelegramGateway:
             cap_id = cap.get("id")
             if not cap_id or cap_id in (gateway_id, llm_id, telegram_id):
                 continue
-            name = _SAFE_TOOL_NAME.sub("_", cap_id)
+            name = str(cap.get("model_name") or _SAFE_TOOL_NAME.sub("_", cap_id))
             self._tool_to_cap[name] = cap_id
             self._cap_to_tool[cap_id] = name
             params = cap.get("input_schema") or {}
@@ -504,6 +506,8 @@ class CoraxTelegramGateway:
                 "operation": "generate",
                 "messages": messages,
                 "tool_choice": "auto",
+                "_corax_turn_id": turn_id,
+                "_corax_user_text": text,
             }
             if active_tools:
                 generate["tools"] = active_tools
@@ -606,7 +610,9 @@ class CoraxTelegramGateway:
             for spec in self._tool_specs
             if spec["function"]["name"] != _SEND_DOCUMENT_TOOL
         ) or "none"
-        if self.tool_router is not None:
+        if self.tool_mode:
+            tool_mode = self.tool_mode
+        elif self.tool_router is not None:
             tool_mode = "llm router"
         elif self.tool_selector is not None:
             tool_mode = "dynamic top-K selector"
@@ -836,7 +842,6 @@ class CoraxTelegramGateway:
             document_sent = False
         else:
             self.log.info("tool %-20s %s", cap_id, self._format_tool_args_for_log(cap_id, args))
-            self.log.debug("tool payload: %s(%s)", cap_id, args)
             try:
                 result = await self._run(
                     cap_id,
@@ -970,8 +975,8 @@ class CoraxTelegramGateway:
         ]
         selection = await self._resolve_tool_selection(user_text, base_specs)
         if selection is None:
-            # Static mode, or the router/selector errored: offer the full set so
-            # the model is never silently left without tools.
+            # Compatibility-only static mode. The Corax host replaces this
+            # internal list immediately before every generation request.
             selected_specs = base_specs
         else:
             # The selector ran. A concrete list (possibly empty) is authoritative:
@@ -1001,25 +1006,20 @@ class CoraxTelegramGateway:
     async def _resolve_tool_selection(
         self, user_text: str, base_specs: list[dict]
     ) -> list[str] | None:
-        """Return selected capability ids, or ``None`` to offer the full set.
-
-        ``None`` means "no opinion" (static mode, or the router/selector raised)
-        and the caller offers every tool as a safety net. A concrete list — even
-        an empty one — is an authoritative selection for the turn.
-        """
+        """Return selected capability ids, or ``None`` only in static mode."""
         if self.tool_router is not None:
             try:
                 ids = await self.tool_router(user_text, base_specs)
             except Exception as exc:  # noqa: BLE001 - routing must never break a turn
                 self.log.debug("tool router failed: %s", exc)
-                return None
+                return []
             return [str(cap_id) for cap_id in ids if str(cap_id) in self._cap_to_tool]
         if self.tool_selector is not None:
             try:
                 ids = self.tool_selector(user_text, base_specs)
             except Exception as exc:  # noqa: BLE001 - selector must not break chat
                 self.log.debug("tool selector failed: %s", exc)
-                return None
+                return []
             return [str(cap_id) for cap_id in ids if str(cap_id) in self._cap_to_tool]
         return None
 

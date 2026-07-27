@@ -218,6 +218,17 @@ llm:
   enable_image: false
   enable_video: false
 
+tool_routing:
+  # Tool selection uses only the Nemotron embedding service; no routing LLM.
+  base_url: http://192.168.0.10:8080/v1
+  model: nvidia/Nemotron-3-Embed-1B-NVFP4
+  dimension: 2048
+  top_k: 6
+  max_active_tools: 12
+  max_schema_bytes: 32768
+  min_similarity: 0.20
+  timeout_seconds: 30.0
+
 telegram:
   # Telegram connector setup. Exported to CORAX_TELEGRAM_* at runtime start.
   # Edit here or via the runtime menu (option "T"). The bot token is read from

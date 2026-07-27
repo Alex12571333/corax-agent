@@ -1,151 +1,294 @@
-"""LLM tool router: parsing, fallback, and robustness."""
+"""Embedding-only tool catalog, selection and per-turn activation."""
 
 from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
 
-from corax.tool_router import LLMToolRouter, is_trivial_chitchat
+from corax.config import ToolRoutingConfig
+from corax.tool_router import (
+    TOOL_SEARCH_ID,
+    ToolRoutingHost,
+    is_trivial_chitchat,
+)
 
-CATALOG = [
-    {
-        "id": "filesystem",
-        "description": "Read, write, list and delete workspace files",
-        "input_schema": {
+
+def _tool(
+    extension_id: str,
+    *,
+    summary: str,
+    intents: list[str],
+    examples: list[str],
+    anti_examples: list[str] | None = None,
+    channels: list[str] | None = None,
+    permission_level: str = "safe",
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=extension_id,
+        name=extension_id.title(),
+        description=summary,
+        version="1.0.0",
+        tags={"tool"},
+        permission_level=permission_level,
+        required_scopes=set(),
+        risk_level="low",
+        side_effects={"none"},
+        input_schema={
             "type": "object",
-            "properties": {"operation": {"enum": ["list", "read", "write", "delete"]}},
+            "properties": {
+                "operation": {"type": "string", "enum": ["run"]},
+                "value": {"type": "string"},
+            },
         },
-    },
-    {"id": "shell", "description": "Run shell commands", "input_schema": {}},
-    {"id": "web.search", "description": "Search the public web via SearXNG", "input_schema": {}},
-]
+        routing={
+            "summary": summary,
+            "intents": intents,
+            "examples": examples,
+            "anti_examples": anti_examples or [],
+            "channels": channels or ["console", "tui", "telegram"],
+        },
+    )
 
 
-def _runner(text):
-    async def _run(_cap_id, _payload):
-        return {"text": text}
+class FakeEmbeddings:
+    def __init__(self, *, fail: bool = False) -> None:
+        self.fail = fail
+        self.calls: list[tuple[str, tuple[str, ...]]] = []
 
-    return _run
+    async def embed(self, texts, *, input_type):
+        self.calls.append((input_type, tuple(texts)))
+        if self.fail:
+            raise OSError("offline")
+        return [self._vector(text) for text in texts]
+
+    @staticmethod
+    def _vector(text: str) -> tuple[float, float, float]:
+        lowered = text.lower()
+        if any(word in lowered for word in ("file", "файл", "document")):
+            return (1.0, 0.0, 0.0)
+        if any(word in lowered for word in ("web", "news", "интернет", "новост")):
+            return (0.0, 1.0, 0.0)
+        if "cron" in lowered or "schedule" in lowered:
+            return (0.0, 0.0, 1.0)
+        return (0.1, 0.1, 0.1)
 
 
-def _boom(_cap_id, _payload):
-    raise RuntimeError("llm down")
+def _host(client: FakeEmbeddings | None = None) -> ToolRoutingHost:
+    config = ToolRoutingConfig(
+        dimension=3,
+        top_k=1,
+        max_active_tools=4,
+        max_schema_bytes=20_000,
+        min_similarity=0.2,
+    )
+    host = ToolRoutingHost(config, client=client or FakeEmbeddings())
+    host.sync(
+        [
+            (
+                "filesystem",
+                _tool(
+                    "filesystem",
+                    summary="Read and write workspace files",
+                    intents=["local file operations"],
+                    examples=["прочитай файл config.yaml"],
+                ),
+            ),
+            (
+                "web.search",
+                _tool(
+                    "web.search",
+                    summary="Search current information on the web",
+                    intents=["internet research and current news"],
+                    examples=["найди последние новости"],
+                ),
+            ),
+        ]
+    )
+    return host
 
 
-def _counting_runner(text):
-    calls = {"n": 0}
-
-    async def _run(_cap_id, _payload):
-        calls["n"] += 1
-        return {"text": text}
-
-    return _run, calls
-
-
-class RouteTests(unittest.IsolatedAsyncioTestCase):
-    async def test_parses_json_array(self) -> None:
-        router = LLMToolRouter(_runner('["filesystem"]'), catalog=CATALOG)
-        self.assertEqual(await router.route("удали файл x", []), ["filesystem"])
-
-    async def test_composite_intent(self) -> None:
-        router = LLMToolRouter(
-            _runner('Sure: ["web.search", "filesystem"]'), catalog=CATALOG
+class ToolRoutingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_initial_selection_exposes_only_selected_schema_and_search(self):
+        host = _host()
+        turn = await host.begin_turn(
+            "прочитай файл config.yaml",
+            session_id="s1",
+            turn_id="t1",
+            channel="console",
         )
-        self.assertEqual(
-            await router.route("узнай погоду и сохрани в файл", []),
-            ["web.search", "filesystem"],
+
+        self.assertEqual(turn.active_ids, [TOOL_SEARCH_ID, "filesystem"])
+        names = {
+            item["function"]["name"]
+            for item in host.active_schemas(
+                session_id="s1",
+                turn_id="t1",
+                channel="console",
+            )
+        }
+        self.assertEqual(names, {"tool_search", "filesystem"})
+        self.assertNotIn("input_schema", host.catalog.get("filesystem").__slots__)
+
+    async def test_search_expands_monotonically_without_returning_schemas(self):
+        host = _host()
+        await host.begin_turn(
+            "прочитай файл",
+            session_id="s1",
+            turn_id="t1",
+            channel="telegram",
         )
-
-    async def test_empty_array_is_authoritative_no_fallback(self) -> None:
-        # Model says "no tools needed" -> [] (not a fallback trigger).
-        called = {"n": 0}
-
-        def fallback(_q, _s):
-            called["n"] += 1
-            return ["filesystem"]
-
-        router = LLMToolRouter(_runner("[]"), catalog=CATALOG, fallback=fallback)
-        self.assertEqual(await router.route("привет", []), [])
-        self.assertEqual(called["n"], 0)
-
-    async def test_normalises_safe_names(self) -> None:
-        router = LLMToolRouter(_runner('["web_search"]'), catalog=CATALOG)
-        self.assertEqual(await router.route("новости", []), ["web.search"])
-
-    async def test_drops_unknown_ids(self) -> None:
-        router = LLMToolRouter(_runner('["filesystem", "rm -rf", 5]'), catalog=CATALOG)
-        self.assertEqual(await router.route("x", []), ["filesystem"])
-
-    async def test_unparseable_reply_uses_fallback(self) -> None:
-        router = LLMToolRouter(
-            _runner("I think filesystem"),
-            catalog=CATALOG,
-            fallback=lambda _q, _s: ["filesystem"],
-        )
-        self.assertEqual(await router.route("list files", []), ["filesystem"])
-
-    async def test_llm_error_uses_fallback(self) -> None:
-        router = LLMToolRouter(
-            _boom, catalog=CATALOG, fallback=lambda _q, _s: ["shell"]
-        )
-        self.assertEqual(await router.route("run tests", []), ["shell"])
-
-    async def test_error_without_fallback_returns_empty(self) -> None:
-        router = LLMToolRouter(_boom, catalog=CATALOG)
-        self.assertEqual(await router.route("x", []), [])
-
-    async def test_fallback_filters_unknown_and_is_capped(self) -> None:
-        router = LLMToolRouter(
-            _runner("garbage"),
-            catalog=CATALOG,
+        result = await host.search(
+            "найди новости в интернете",
+            session_id="s1",
+            turn_id="t1",
+            channel="telegram",
             top_k=1,
-            fallback=lambda _q, _s: ["web.search", "nope", "shell"],
         )
-        self.assertEqual(await router.route("x", []), ["web.search"])
 
-    async def test_top_k_caps_llm_selection(self) -> None:
-        router = LLMToolRouter(
-            _runner('["filesystem", "shell", "web.search"]'), catalog=CATALOG, top_k=2
+        self.assertEqual(result["activated"], ["web.search"])
+        self.assertNotIn("input_schema", result["matches"][0])
+        turn = host.current_turn(session_id="s1", channel="telegram")
+        self.assertEqual(
+            turn.active_ids,
+            [TOOL_SEARCH_ID, "filesystem", "web.search"],
         )
-        self.assertEqual(len(await router.route("do everything", [])), 2)
 
-    async def test_non_string_text_uses_fallback(self) -> None:
-        async def _run(_cap_id, _payload):
-            return {"text": None}
+    async def test_new_turn_drops_previous_expansion_and_reuses_index(self):
+        client = FakeEmbeddings()
+        host = _host(client)
+        await host.begin_turn(
+            "прочитай файл",
+            session_id="s1",
+            turn_id="t1",
+            channel="console",
+        )
+        await host.search(
+            "найди новости",
+            session_id="s1",
+            turn_id="t1",
+            channel="console",
+        )
+        await host.begin_turn(
+            "прочитай другой файл",
+            session_id="s1",
+            turn_id="t2",
+            channel="console",
+        )
 
-        router = LLMToolRouter(_run, catalog=CATALOG, fallback=lambda _q, _s: ["shell"])
-        self.assertEqual(await router.route("x", []), ["shell"])
+        turn = host.current_turn(session_id="s1", channel="console")
+        self.assertEqual(turn.active_ids, [TOOL_SEARCH_ID, "filesystem"])
+        document_calls = [call for call in client.calls if call[0] == "document"]
+        self.assertEqual(len(document_calls), 1)
 
-    async def test_trivial_message_skips_llm_call(self) -> None:
-        for message in ("привет", "спасибо!", "ок", "👍", "lol", "  ", "2+2", "да", "пока"):
-            run, calls = _counting_runner('["filesystem"]')
-            router = LLMToolRouter(run, catalog=CATALOG)
-            self.assertEqual(await router.route(message, []), [], message)
-            self.assertEqual(calls["n"], 0, f"router fired for trivial message {message!r}")
+    async def test_embedding_failure_is_lexical_and_never_full_catalog(self):
+        host = _host(FakeEmbeddings(fail=True))
+        turn = await host.begin_turn(
+            "unrelated question",
+            session_id="s1",
+            turn_id="t1",
+            channel="console",
+        )
+        self.assertEqual(turn.active_ids, [TOOL_SEARCH_ID])
+        self.assertTrue(host.router.last_route["fallback"])
 
-    async def test_real_request_still_calls_llm(self) -> None:
-        for message in ("удали файл x.txt", "ls", "какая погода завтра", "привет, удали файл"):
-            run, calls = _counting_runner('["filesystem"]')
-            router = LLMToolRouter(run, catalog=CATALOG)
-            await router.route(message, [])
-            self.assertEqual(calls["n"], 1, f"router did not fire for {message!r}")
+    async def test_anti_example_vetoes_false_positive(self):
+        client = FakeEmbeddings()
+        config = ToolRoutingConfig(
+            dimension=3,
+            top_k=2,
+            min_similarity=0.2,
+        )
+        host = ToolRoutingHost(config, client=client)
+        host.sync(
+            [
+                (
+                    "scheduler",
+                    _tool(
+                        "scheduler",
+                        summary="Schedule automated jobs with cron",
+                        intents=["create schedules"],
+                        examples=["schedule a nightly backup"],
+                        anti_examples=["explain cron syntax"],
+                    ),
+                )
+            ]
+        )
+        turn = await host.begin_turn(
+            "explain cron syntax",
+            session_id="s1",
+            turn_id="t1",
+            channel="console",
+        )
+        self.assertEqual(turn.active_ids, [TOOL_SEARCH_ID])
 
-    async def test_skip_trivial_can_be_disabled(self) -> None:
-        run, calls = _counting_runner("[]")
-        router = LLMToolRouter(run, catalog=CATALOG, skip_trivial=False)
-        await router.route("привет", [])
-        self.assertEqual(calls["n"], 1)
+    async def test_channel_and_policy_prefilter(self):
+        host = ToolRoutingHost(
+            ToolRoutingConfig(dimension=3, top_k=3),
+            client=FakeEmbeddings(),
+        )
+        telegram_only = _tool(
+            "telegram.only",
+            summary="Search web news",
+            intents=["news"],
+            examples=["find news"],
+            channels=["telegram"],
+        )
+        denied = _tool(
+            "denied",
+            summary="Search web news",
+            intents=["news"],
+            examples=["find news"],
+        )
+        host.sync([("telegram.only", telegram_only), ("denied", denied)])
+        policy = SimpleNamespace(
+            deny_capabilities={"denied"},
+            deny_scopes=set(),
+            deny_effects=set(),
+        )
+        turn = await host.begin_turn(
+            "find web news",
+            session_id="s1",
+            turn_id="t1",
+            channel="console",
+            policy=policy,
+        )
+        self.assertEqual(turn.active_ids, [TOOL_SEARCH_ID])
 
-    def test_is_trivial_chitchat(self) -> None:
-        for trivial in ("привет", "Спасибо!", "ок", "👍", "", "?", "2+2", "хаха", "ok ok"):
-            self.assertTrue(is_trivial_chitchat(trivial), trivial)
-        for real in ("удали файл", "ls", "какая погода", "привет, найди новости", "спасибо за код, открой main.py"):
-            self.assertFalse(is_trivial_chitchat(real), real)
+    async def test_inactive_tool_call_is_rejected(self):
+        host = _host()
+        await host.begin_turn(
+            "прочитай файл",
+            session_id="s1",
+            turn_id="t1",
+            channel="console",
+        )
+        with self.assertRaises(PermissionError):
+            host.require_active(
+                "web.search",
+                session_id="s1",
+                turn_id="t1",
+                channel="console",
+            )
 
-    async def test_menu_lists_operations(self) -> None:
-        router = LLMToolRouter(_runner("[]"), catalog=CATALOG)
-        self.assertIn("filesystem", router._menu)
-        self.assertIn("operations: list, read, write, delete", router._menu)
-        self.assertIn("web.search", router._menu)
+    def test_colliding_model_names_are_unique(self):
+        host = ToolRoutingHost(
+            ToolRoutingConfig(dimension=3),
+            client=FakeEmbeddings(),
+        )
+        host.sync(
+            [
+                ("foo.bar", _tool("foo.bar", summary="one", intents=[], examples=[])),
+                ("foo_bar", _tool("foo_bar", summary="two", intents=[], examples=[])),
+            ]
+        )
+        names = [item["model_name"] for item in host.all_specs()]
+        self.assertEqual(len(names), len(set(names)))
+
+    def test_trivial_filter_is_conservative(self):
+        for text in ("привет", "thanks!", "👍", "ok"):
+            self.assertTrue(is_trivial_chitchat(text), text)
+        for text in ("прочитай файл", "latest news", "объясни cron"):
+            self.assertFalse(is_trivial_chitchat(text), text)
 
 
 if __name__ == "__main__":

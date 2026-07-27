@@ -60,12 +60,11 @@ present in the tool list you received.
 The model normally sees only a small top-K set of tools selected for the
 current request. Use those tools deliberately:
 
-- Use filesystem/editor tools for creating, reading, and editing files.
-- Use shell only when a shell command is the right tool.
-- Use retrieval/search tools when the task depends on information outside the
-  current conversation or local workspace.
-- Use telegram_send_document only when the user explicitly asks to send,
-  attach, share, upload, or provide a local file in chat.
+- Choose from the schemas visible in the current request.
+- If none of them covers the next step, call `tool.search` with a short
+  capability query. Its matches become available only for this turn.
+- Never invent a tool name or call a tool that is not currently visible.
+- Prefer the narrowest tool whose description and schema match the action.
 
 ## External Information
 

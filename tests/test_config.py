@@ -171,6 +171,30 @@ class TestLLMConfig(unittest.TestCase):
             self.assertEqual(loaded.to_dict(), original.to_dict())
 
 
+class TestToolRoutingConfig(unittest.TestCase):
+    def test_embedding_router_defaults_and_round_trip(self) -> None:
+        config = cfg.default_config()
+        self.assertEqual(
+            config.tool_routing.base_url,
+            "http://192.168.0.10:8080/v1",
+        )
+        self.assertEqual(
+            config.tool_routing.model,
+            "nvidia/Nemotron-3-Embed-1B-NVFP4",
+        )
+        self.assertEqual(config.tool_routing.dimension, 2048)
+        loaded = cfg.config_from_dict(config.to_dict())
+        self.assertEqual(loaded.tool_routing, config.tool_routing)
+
+    def test_invalid_router_limits_are_rejected(self) -> None:
+        config = cfg.default_config()
+        config.tool_routing.max_active_tools = 0
+        config.tool_routing.min_similarity = 1.1
+        errors = cfg.validate_config(config)
+        self.assertTrue(any("max_active_tools" in item for item in errors))
+        self.assertTrue(any("min_similarity" in item for item in errors))
+
+
 class TestTelegramConfig(unittest.TestCase):
     def test_default_telegram_section_and_registration(self) -> None:
         config = cfg.default_config()

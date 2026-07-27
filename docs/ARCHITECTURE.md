@@ -128,7 +128,29 @@ budget without adding another model call.
 
 `mcp.manager` uses the official MCP client SDK and registers discovered remote
 tools only after connection. Those proxies still execute through Agent Core and
-cannot bypass schema validation or the active policy.
+cannot bypass schema validation or the active policy. MCP
+`notifications/tools/list_changed` marks a server catalog dirty; the host
+refreshes and reconciles add/change/remove updates before the next model call.
+
+## Tool discovery and per-turn schemas
+
+The full executable registry stays host-side. `ToolCatalog` contains compact
+routing records (intent examples, anti-examples, operations, channel and
+security/cost hints), while `SchemaStore` is the only owner of full input
+schemas. Stable schema and routing hashes let reloads re-embed only changed
+cards; removed tools disappear from the catalog and the live Agent Core
+registry.
+At each user turn the host filters blocked/channel-incompatible tools, embeds
+the request with `Nemotron-3-Embed-1B` on the configured `.10:8080` endpoint,
+and creates a bounded `TurnToolSet`. Only schemas from that set enter the model
+request; Console, TUI, and Telegram use the same runtime method.
+
+Routing never calls a generation LLM. If embeddings are unavailable, a small
+deterministic lexical fallback may select matching tools, but failure never
+reveals the full catalog. The host-managed `tool.search` meta-tool can add
+matches to the current turn without returning schemas in its tool result.
+Agent Core remains the execution boundary and rejects calls to tools outside
+the active turn before policy and execution.
 
 `skills.runtime` implements progressive disclosure for portable Agent Skills.
 It reads metadata from bounded, trusted roots and injects only selected

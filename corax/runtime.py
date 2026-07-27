@@ -15,7 +15,7 @@ import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from agent_core import (
@@ -36,6 +36,7 @@ from .loader import CoreEngine, ExtensionLoader
 from .memory import NullMemory
 from .planner import StubPlanner
 from .registry import ExtensionCatalog
+from .tool_router import TOOL_SEARCH_ID, ToolRoutingHost
 
 _BUILTIN_FACTORIES: dict[str, Callable[[], Any]] = {
     "stub": StubPlanner,
@@ -212,10 +213,15 @@ class CoraxRuntime:
         )
         self.capability_loader = self.extension_loader
         self.core = CoreEngine(self.config, log=self.log)
+        self.tool_routing = ToolRoutingHost(
+            self.config.tool_routing,
+            log=self.log.getChild("tool_routing"),
+        )
         self._running = False
         self._started_at: datetime | None = None
         self._started_extensions: list[tuple[str, Any]] = []
         self._managed_environment: dict[str, str] = {}
+        self._mcp_tool_ids: set[str] = set()
 
     async def start(self) -> None:
         if self._running:
@@ -245,6 +251,7 @@ class CoraxRuntime:
                     self._started_extensions.append((entry.id, entry.item))
                 starting = None
             self._wire_runtime_services()
+            self.sync_tool_catalog()
             await self._dispatch_hooks(
                 "runtime_start",
                 {
@@ -285,6 +292,8 @@ class CoraxRuntime:
             await self._stop_extension(extension_id, item)
         self._started_extensions.clear()
         self.extensions.clear()
+        self.tool_routing.clear_turns()
+        self._mcp_tool_ids.clear()
         self._running = False
         self._started_at = None
 
@@ -345,6 +354,10 @@ class CoraxRuntime:
         ).resolve()
         self.data_path = (self.root_path / config.runtime.data_path).resolve()
         self.extension_loader.workspace_path = self.workspace_path
+        self.tool_routing = ToolRoutingHost(
+            config.tool_routing,
+            log=self.log.getChild("tool_routing"),
+        )
 
     async def status(self) -> RuntimeStatus:
         return self.snapshot()
@@ -1015,11 +1028,7 @@ class CoraxRuntime:
         manager = self.active_mcp_manager()
         if manager is not None and hasattr(manager, "tool_proxies"):
             try:
-                for proxy in manager.tool_proxies():
-                    if self.extensions.has(proxy.id):
-                        self.log.warning("MCP tool id collision: %s", proxy.id)
-                        continue
-                    self.tools.register(proxy.id, proxy)
+                self._replace_mcp_tools(manager.tool_proxies(), wrap_hooks=False)
             except Exception as exc:  # noqa: BLE001 - optional integration
                 self.log.warning("failed wiring MCP tools: %s", exc)
         orchestrator = self.active_subagent_orchestrator()
@@ -1055,6 +1064,181 @@ class CoraxRuntime:
                         entry.item = hooks.wrap_tool(entry.item)
             except Exception as exc:  # noqa: BLE001 - optional integration
                 self.log.warning("failed wiring tool hooks: %s", exc)
+
+    def sync_tool_catalog(self) -> None:
+        """Refresh routing metadata from the actual executable registry."""
+
+        self.tool_routing.sync(
+            (
+                (entry.id, entry.item)
+                for entry in self.tools.list_all()
+                if self.core.is_executable(entry.item)
+            ),
+            manifests=self.extension_loader.manifests,
+        )
+
+    async def refresh_dynamic_tools(self, kernel: Any | None = None) -> bool:
+        """Apply MCP ``tools/list_changed`` updates before the next model call."""
+
+        manager = self.active_mcp_manager()
+        changed = False
+        if manager is not None and hasattr(manager, "refresh_tools"):
+            try:
+                result = await manager.refresh_tools()
+                changed = bool(
+                    isinstance(result, dict) and result.get("changed")
+                )
+                if changed:
+                    self._replace_mcp_tools(manager.tool_proxies())
+            except Exception as exc:  # noqa: BLE001 - retain last known-good tools
+                self.log.warning(
+                    "failed refreshing MCP tools: %s",
+                    type(exc).__name__,
+                )
+        self.sync_tool_catalog()
+        if changed and kernel is not None and hasattr(kernel, "sync_capabilities"):
+            await kernel.sync_capabilities(self.tools)
+        return changed
+
+    async def prepare_tool_model_request(
+        self,
+        payload: dict[str, Any],
+        *,
+        session_id: str,
+        turn_id: str,
+        channel: str,
+        kernel: Any | None = None,
+    ) -> dict[str, Any]:
+        """Attach only the schemas active for this channel-neutral turn."""
+
+        data = dict(payload)
+        hinted_text = str(data.pop("_corax_user_text", "") or "")
+        data.pop("_corax_turn_id", None)
+        await self.refresh_dynamic_tools(kernel)
+        if not self.tool_routing.has_turn(
+            session_id=session_id,
+            turn_id=turn_id,
+            channel=channel,
+        ):
+            user_text = hinted_text or self._last_user_text(data)
+            turn = await self.tool_routing.begin_turn(
+                user_text,
+                session_id=session_id,
+                turn_id=turn_id,
+                channel=channel,
+                policy=self.active_policy(),
+            )
+            await self.record_observation(
+                TraceStage.PLANNER_CALLED,
+                correlation_id=f"tool-route-{turn_id}",
+                session_id=session_id,
+                capability_id="tool.router",
+                metadata={
+                    "channel": channel,
+                    "catalog_version": turn.catalog_version,
+                    "active_tool_ids": list(turn.active_ids),
+                    "schema_count": len(turn.active_ids),
+                    "schema_bytes": turn.schema_bytes,
+                    **self.tool_routing.router.last_route,
+                },
+            )
+        schemas = self.tool_routing.active_schemas(
+            session_id=session_id,
+            turn_id=turn_id,
+            channel=channel,
+        )
+        if schemas:
+            data["tools"] = schemas
+            data["tool_choice"] = "auto"
+        else:
+            data.pop("tools", None)
+            data.pop("tool_choice", None)
+        return data
+
+    async def search_tools(
+        self,
+        payload: dict[str, Any],
+        *,
+        session_id: str,
+        turn_id: str,
+        channel: str,
+    ) -> dict[str, Any]:
+        unknown = set(payload) - {"query", "top_k"}
+        if unknown:
+            raise ValueError(
+                "tool.search received unknown fields: "
+                + ", ".join(sorted(unknown))
+            )
+        top_k = payload.get("top_k", 5)
+        if type(top_k) is not int or not 1 <= top_k <= 10:
+            raise ValueError("tool.search top_k must be an integer from 1 to 10")
+        query = payload.get("query")
+        if not isinstance(query, str):
+            raise ValueError("tool.search query must be a string")
+        result = await self.tool_routing.search(
+            query,
+            top_k=top_k,
+            session_id=session_id,
+            turn_id=turn_id,
+            channel=channel,
+            policy=self.active_policy(),
+        )
+        await self.record_observation(
+            TraceStage.RESULT_PUBLISHED,
+            correlation_id=f"tool-search-{turn_id}",
+            session_id=session_id,
+            capability_id=TOOL_SEARCH_ID,
+            metadata={
+                "channel": channel,
+                "activated": list(result["activated"]),
+                "match_ids": [
+                    item["id"] for item in result["matches"]
+                ],
+                "catalog_version": result["catalog_version"],
+            },
+        )
+        return result
+
+    @staticmethod
+    def _last_user_text(payload: dict[str, Any]) -> str:
+        for message in reversed(payload.get("messages", ())):
+            if (
+                isinstance(message, dict)
+                and message.get("role") == "user"
+                and isinstance(message.get("content"), str)
+            ):
+                return message["content"]
+        return str(payload.get("prompt", "") or "")
+
+    def _replace_mcp_tools(
+        self,
+        proxies: Iterable[Any],
+        *,
+        wrap_hooks: bool = True,
+    ) -> None:
+        for extension_id in self._mcp_tool_ids:
+            if self.tools.has(extension_id):
+                self.tools.unregister(extension_id)
+        self._mcp_tool_ids.clear()
+
+        hooks = self.active_hooks_runtime() if wrap_hooks else None
+        for proxy in proxies:
+            if self.extensions.has(proxy.id):
+                self.log.warning("MCP tool id collision: %s", proxy.id)
+                continue
+            item = proxy
+            if hooks is not None and hasattr(hooks, "wrap_tool"):
+                try:
+                    item = hooks.wrap_tool(item)
+                except Exception as exc:  # noqa: BLE001 - proxy remains usable
+                    self.log.warning(
+                        "failed wiring hooks for MCP tool '%s': %s",
+                        proxy.id,
+                        exc,
+                    )
+                    item = proxy
+            self.tools.register(proxy.id, item)
+            self._mcp_tool_ids.add(proxy.id)
 
     async def _run_subagent_model(
         self,
@@ -1380,6 +1564,8 @@ class CoraxRuntime:
 
     def _populate_extensions(self) -> None:
         self.extensions.clear()
+        self.extension_loader.manifests.clear()
+        self._mcp_tool_ids.clear()
         for kind_name, extension_ids in self.config.extensions.active.items():
             try:
                 expected_kind = ExtensionKind(kind_name)

@@ -24,9 +24,25 @@ defaults to `corax.yaml` (or `corax.json` when PyYAML is absent).
 | `security`     | `mode` (initial policy mode), `blocked_paths[]`                              |
 | `limits`       | `max_parallel_tasks`, `max_plan_tasks`, `max_tasks_per_correlation`, `task_timeout_seconds`, `max_payload_mb` |
 | `ui`           | `theme`, `mascot`, `show_banner`                                            |
+| `tool_routing` | embedding endpoint/model, top-K, similarity and schema budgets              |
 
 `extensions` is the only activation catalogue. `bindings` select one provider
 for scalar roles; `active` contains the loaded ids for every extension kind.
+
+`tool_routing` defaults to the local OpenAI-compatible embedding service at
+`http://192.168.0.10:8080/v1` with
+`nvidia/Nemotron-3-Embed-1B-NVFP4` (2048 dimensions). It is independent from
+the generation model. `CORAX_EMBEDDING_BASE_URL` and
+`CORAX_EMBEDDING_MODEL` may override those two values without editing the
+file. No LLM reranker is used.
+
+Tool extensions may add an optional `routing` object to `extension.json`.
+Useful fields are `title`, `summary`, `domains`, `tags`, `intents`,
+`examples`, `anti_examples`, `operations`, `channels`, `always_available`,
+and `cost`. Old manifests remain valid: missing routing fields fall back to
+the loaded tool description, tags, schema operations, and security metadata.
+Changing only an input schema invalidates its schema hash; changing the compact
+routing card causes only that tool to be re-embedded.
 
 ## Settings API
 
@@ -49,8 +65,8 @@ any active/enabled list so the config stays consistent.
 `validate_config(config) -> list[str]` returns human-readable errors (empty =
 valid). It checks: required sections, `log_level`, `security.mode`, that active
 extension ids and role bindings exist, have the right kind, and are enabled,
-and that limits are positive integers. `corax init` runs it and reports
-warnings.
+and that runtime and tool-routing limits are valid. `corax init` runs it and
+reports warnings.
 
 `security.mode` accepts `ask`, `auto`, or `full`. Old `normal`, `strict`, and
 `paranoid` values are migrated to the conservative `ask` mode. The selected

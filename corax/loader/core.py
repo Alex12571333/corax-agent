@@ -159,6 +159,9 @@ class RunningCore:
         capability_ids: list[str],
         state_manager: Any | None = None,
         streamers: dict[str, Any] | None = None,
+        registry: Any | None = None,
+        echo_cls: type | None = None,
+        items: dict[str, Any] | None = None,
     ) -> None:
         self._ac = agent_core
         self.executor = executor
@@ -166,6 +169,36 @@ class RunningCore:
         self.capability_ids = list(capability_ids)
         self.state_manager = state_manager
         self._streamers = dict(streamers or {})
+        self._registry = registry
+        self._echo_cls = echo_cls
+        self._items = dict(items or {})
+
+    async def sync_capabilities(self, capabilities: Any) -> None:
+        """Apply add/change/remove updates to the live Agent Core registry."""
+
+        if self._registry is None or self._echo_cls is None:
+            return
+        desired = {
+            cap_id: item
+            for cap_id, item in _as_pairs(capabilities)
+            if isinstance(item, self._ac.ToolCapability)
+        }
+        for cap_id in set(self._items) - set(desired):
+            await self._registry.unregister(cap_id)
+            self._items.pop(cap_id, None)
+            self._streamers.pop(cap_id, None)
+        for cap_id, item in desired.items():
+            if self._items.get(cap_id) is item:
+                continue
+            if cap_id in self._items:
+                await self._registry.unregister(cap_id)
+            await self._registry.register(self._echo_cls(item))
+            self._items[cap_id] = item
+            if hasattr(item, "stream_generate_events"):
+                self._streamers[cap_id] = item
+            else:
+                self._streamers.pop(cap_id, None)
+        self.capability_ids = list(desired)
 
     async def get_state(self, session_id: str) -> Any:
         """Read a session's ephemeral state (where capabilities' ``state_patch``
@@ -478,7 +511,21 @@ class CoreEngine:
         await lifecycle.start_all()
         self.log.debug("agent-core kernel started: %d capability(ies) adopted", len(adopted))
         try:
-            yield RunningCore(ac, executor, task_store, adopted, state, streamers)
+            yield RunningCore(
+                ac,
+                executor,
+                task_store,
+                adopted,
+                state,
+                streamers,
+                registry,
+                echo_cls,
+                {
+                    cap_id: item
+                    for cap_id, item in _as_pairs(capabilities)
+                    if cap_id in adopted
+                },
+            )
         finally:
             await lifecycle.stop_all()
             self.log.debug("agent-core kernel stopped")

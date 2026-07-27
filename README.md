@@ -163,6 +163,14 @@ by a valid turn/session lease get their own approval; `auto` reviews routine
 calls automatically, while `full` still respects immutable denials and
 sandbox boundaries.
 
+The complete tool registry and full schemas stay in the host. Before each user
+turn Corax ranks compact tool metadata with the local Nemotron embedding model
+at `192.168.0.10:8080`, then attaches only the bounded active schemas to the
+model request. Console, TUI, and Telegram share this path. Routing makes no LLM
+call; an embedding outage fails closed to a narrow lexical fallback.
+`tool.search` can activate additional tools within the same turn, while the
+next turn starts with a fresh set.
+
 Telegram document delivery is currently host-controlled. The direct
 `telegram_send_document` pseudo-tool is deliberately absent from the model
 catalogue until a typed ToolCapability proxy can route it through Agent Core,
@@ -309,6 +317,8 @@ Common secret and integration variables:
 | Variable | Purpose |
 | --- | --- |
 | `CORAX_LLM_API_KEY` | Bearer token for the OpenAI-compatible model endpoint. |
+| `CORAX_EMBEDDING_BASE_URL` | Optional override for the embedding endpoint. |
+| `CORAX_EMBEDDING_MODEL` | Optional override for the embedding model ID. |
 | `CORAX_TELEGRAM_BOT_TOKEN` | Telegram bot token. |
 | `CORAX_TELEGRAM_ALLOWED_CHATS` | Comma-separated Telegram chat allow-list. |
 | `CORAX_SECURITY_ADMIN_IDS` | Remote actors allowed to change policy or resolve approvals. |
@@ -329,7 +339,10 @@ Do not store tokens in `corax.yaml`, prompts, extension manifests, or Git.
 
 ```mermaid
 flowchart LR
-    Channel["Console or Telegram"] --> Host["Corax runtime host"]
+    Channel["Console, TUI, or Telegram"] --> Host["Corax runtime host"]
+    Host --> Catalog["ToolCatalog + SchemaStore"]
+    Catalog --> Embed["Embedding top-K + TurnToolSet"]
+    Embed --> Model
     Host --> Memory["Memory and context services"]
     Memory --> Model["Model provider or router"]
     Model -->|tool call| Core["Universal Agent Core"]

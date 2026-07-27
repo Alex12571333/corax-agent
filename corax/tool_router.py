@@ -1,221 +1,801 @@
-"""LLM-based tool router.
-
-A more capable replacement for the lexical top-K selector. Instead of matching
-hand-maintained keyword lists, it asks the LLM itself which tools (if any) a
-user message needs — so it handles paraphrase, any language, and composite
-intents ("find the weather *and* save it to a file") without per-tool wiring.
-
-It is deliberately cheap: one short, temperature-0 completion that must return
-only a JSON array of tool ids. It never breaks a turn — on a model error,
-timeout, or unparseable reply it falls back to an injected lexical selector (and
-to "no opinion" if none is given, which the gateway reads as "offer all tools").
-
-The LLM call is injected as an async ``run_capability(cap_id, payload) -> dict``
-(the kernel ``invoke``), so the router unit-tests without a kernel or network.
-"""
+"""Host-owned tool catalog and embedding-only per-turn selection."""
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
+import math
+import os
 import re
-from typing import Awaitable, Callable, Iterable, Sequence
+import time
+from dataclasses import dataclass, field
+from typing import Any, Iterable, Mapping, Sequence
+from urllib.request import Request, urlopen
 
-RunCapability = Callable[..., Awaitable[dict]]
-LexicalSelector = Callable[[str, list[dict]], Iterable[str]]
+from .config import ToolRoutingConfig
 
-# Matches a single (non-nested) JSON array, e.g. ["filesystem", "web.search"].
-_JSON_ARRAY = re.compile(r"\[[^\[\]]*\]", re.DOTALL)
-
-_ROUTER_SYSTEM = (
-    "You are the tool router for a local AI assistant. Given the user message "
-    "and the list of available tools, decide which tools are needed to fulfil "
-    'the message. Reply with ONLY a JSON array of tool ids, e.g. ["filesystem"]. '
-    "Rules:\n"
-    "- Return [] when no tool is needed: greetings, small talk, opinions, or "
-    "facts that are stable and that you already know (math, definitions, history).\n"
-    "- Anything time-sensitive or that you cannot know precisely from memory "
-    "REQUIRES a web search: today's or tomorrow's weather, current news, prices, "
-    "exchange rates, schedules, scores, 'latest/current/now/today/tomorrow', or "
-    "any fact about the real world right now. Do not answer these from memory.\n"
-    "- Local files, listing/reading/writing/deleting files, and running commands "
-    "use the file/shell tools, never web search.\n"
-    "- Include every tool a multi-step task needs (for example searching the web "
-    "AND writing a file).\n"
-    "- Choose only ids from the provided list; never invent one. Output the JSON "
-    "array and nothing else."
-)
-
-
-# Contentless social replies that never need a tool. Kept high-precision so the
-# pre-filter only ever skips messages we are sure require no tool — anything not
-# obviously trivial still goes to the router.
+TOOL_SEARCH_ID = "tool.search"
+_SAFE_TOOL_NAME = re.compile(r"[^a-zA-Z0-9_-]")
+_WORD_RE = re.compile(r"[^\W_]+", re.UNICODE)
 _TRIVIAL_WORDS = frozenset(
     {
-        # greetings
-        "привет", "приветик", "прив", "здравствуй", "здравствуйте", "хай", "хелло",
-        "дарова", "даров", "здарова", "ку", "hi", "hello", "hey", "yo", "hiya", "hallo",
-        "добрый", "доброе", "утро", "день", "вечер",  # "добрый день" / "доброе утро"
-        # thanks
-        "спасибо", "спс", "спасибки", "благодарю", "пасиб", "пасибо", "мерси",
-        "thanks", "thank", "thx", "ty",
-        # acknowledgements / yes-no
-        "ок", "окей", "окей", "ok", "okay", "k", "kk", "угу", "ага", "ладно",
-        "хорошо", "понятно", "ясно", "принято", "да", "нет", "неа", "yes", "no",
-        "yep", "nope", "супер", "класс", "отлично", "круто", "cool", "nice", "great",
-        # farewells
-        "пока", "покеда", "бывай", "досвидания", "свидания", "споки", "bye", "goodbye",
-        "cya", "увидимся",
-        # laughter
-        "лол", "lol", "ха", "хах", "хаха", "хахаха", "хех", "haha", "hahaha", "lmao",
-        "рофл", "ржу",
+        "привет",
+        "приветик",
+        "прив",
+        "здравствуй",
+        "здравствуйте",
+        "хай",
+        "ку",
+        "hi",
+        "hello",
+        "hey",
+        "спасибо",
+        "спс",
+        "благодарю",
+        "thanks",
+        "thank",
+        "thx",
+        "ок",
+        "окей",
+        "ok",
+        "okay",
+        "угу",
+        "ага",
+        "ладно",
+        "понятно",
+        "да",
+        "нет",
+        "yes",
+        "no",
+        "пока",
+        "bye",
+        "лол",
+        "lol",
+        "ха",
+        "хаха",
+        "haha",
     }
 )
-_TRIVIAL_MAX_WORDS = 4
-_LETTERS_RE = re.compile(r"[^\W\d_]+", re.UNICODE)
+
+_SEARCH_SPEC = {
+    "id": TOOL_SEARCH_ID,
+    "model_name": "tool_search",
+    "description": (
+        "Find and activate additional tools for the current turn. "
+        "Use when the visible tools are insufficient."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "What capability is needed",
+            },
+            "top_k": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 10,
+                "default": 5,
+            },
+        },
+        "required": ["query"],
+        "additionalProperties": False,
+    },
+}
+
+
+class EmbeddingError(RuntimeError):
+    """The configured embedding service returned an unusable response."""
 
 
 def is_trivial_chitchat(text: str) -> bool:
-    """True when a message is plainly social/contentless and needs no tool.
+    """Return true only for short, plainly social messages."""
 
-    Conservative on purpose: emoji/punctuation/number-only pings and short
-    greeting/thanks/ack/farewell/laughter messages skip the router; everything
-    with real words is left for the model to route.
-    """
     if not text or not text.strip():
         return True
-    words = _LETTERS_RE.findall(text.lower())
-    if not words:
-        return True  # emoji-, punctuation-, or number-only (e.g. "👍", "?", "2+2")
-    if len(words) > _TRIVIAL_MAX_WORDS:
-        return False
-    return all(word in _TRIVIAL_WORDS for word in words)
+    words = _WORD_RE.findall(text.lower())
+    return not words or (len(words) <= 4 and all(word in _TRIVIAL_WORDS for word in words))
 
 
-class LLMToolRouter:
-    """Pick the active tool set for a turn by asking the LLM."""
+def _json_hash(value: Any) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _strings(value: Any) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple, set, frozenset)):
+        return ()
+    items = tuple(
+        clean
+        for item in value
+        if isinstance(item, str) and (clean := " ".join(item.split()))
+    )
+    return tuple(sorted(items)) if isinstance(value, (set, frozenset)) else items
+
+
+def _value(value: Any) -> str:
+    return str(getattr(value, "value", value or ""))
+
+
+def _operations(schema: Mapping[str, Any]) -> tuple[str, ...]:
+    properties = schema.get("properties")
+    if not isinstance(properties, Mapping):
+        return ()
+    operation = properties.get("operation")
+    if not isinstance(operation, Mapping):
+        return ()
+    values = operation.get("enum")
+    return _strings(values)
+
+
+def _model_name(extension_id: str, used: set[str]) -> str:
+    base = _SAFE_TOOL_NAME.sub("_", extension_id).strip("_") or "tool"
+    base = base[:64]
+    if base not in used:
+        return base
+    suffix = hashlib.sha256(extension_id.encode("utf-8")).hexdigest()[:8]
+    return f"{base[:55]}_{suffix}"
+
+
+@dataclass(frozen=True, slots=True)
+class ToolRecord:
+    """Compact routing metadata. Full JSON Schema deliberately lives elsewhere."""
+
+    id: str
+    model_name: str
+    title: str
+    summary: str
+    routing_text: str
+    domains: tuple[str, ...]
+    tags: tuple[str, ...]
+    operations: tuple[str, ...]
+    anti_examples: tuple[str, ...]
+    channels: tuple[str, ...]
+    always_available: bool
+    permission_level: str
+    required_scopes: tuple[str, ...]
+    risk_level: str
+    side_effects: tuple[str, ...]
+    cost_hint: str
+    version: str
+    schema_hash: str
+    routing_hash: str
+
+
+class SchemaStore:
+    """Full tool schemas, keyed by stable host IDs."""
+
+    def __init__(self) -> None:
+        self._specs: dict[str, dict[str, Any]] = {}
+        self._names: dict[str, str] = {TOOL_SEARCH_ID: "tool_search"}
+
+    def sync(self, tools: Iterable[tuple[str, Any]]) -> None:
+        used = set(self._names.values())
+        current: dict[str, dict[str, Any]] = {}
+        for extension_id, item in tools:
+            if extension_id not in self._names:
+                self._names[extension_id] = _model_name(extension_id, used)
+                used.add(self._names[extension_id])
+            current[extension_id] = {
+                "id": extension_id,
+                "model_name": self._names[extension_id],
+                "description": str(getattr(item, "description", "") or extension_id),
+                "input_schema": dict(getattr(item, "input_schema", {}) or {}),
+            }
+        current[TOOL_SEARCH_ID] = dict(_SEARCH_SPEC)
+        self._specs = current
+
+    def raw(self, extension_id: str) -> dict[str, Any]:
+        return self._specs[extension_id]
+
+    def all_raw(self) -> list[dict[str, Any]]:
+        return [dict(spec) for spec in self._specs.values()]
+
+    def openai(self, extension_id: str) -> dict[str, Any]:
+        spec = self._specs[extension_id]
+        return {
+            "type": "function",
+            "function": {
+                "name": spec["model_name"],
+                "description": spec["description"],
+                "parameters": spec["input_schema"]
+                or {"type": "object", "properties": {}},
+            },
+        }
+
+    def size(self, extension_id: str) -> int:
+        return len(
+            json.dumps(
+                self.openai(extension_id),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+
+    def has(self, extension_id: str) -> bool:
+        return extension_id in self._specs
+
+
+class ToolCatalog:
+    """Routing records derived only from tools that actually loaded."""
+
+    def __init__(self) -> None:
+        self._records: dict[str, ToolRecord] = {}
+        self.version = _json_hash([])
+
+    def sync(
+        self,
+        tools: Iterable[tuple[str, Any]],
+        schemas: SchemaStore,
+        manifests: Mapping[str, Any] | None = None,
+    ) -> None:
+        records: dict[str, ToolRecord] = {}
+        manifests = manifests or {}
+        for extension_id, item in tools:
+            manifest = manifests.get(extension_id)
+            if manifest is None:
+                manifest = getattr(item, "__corax_manifest__", None)
+            if manifest is None:
+                manifest = getattr(type(item), "__extension_manifest__", None)
+            routing = getattr(manifest, "routing", None)
+            if not isinstance(routing, dict):
+                routing = getattr(item, "routing", {})
+            if not isinstance(routing, dict):
+                routing = {}
+
+            schema = schemas.raw(extension_id)
+            input_schema = schema["input_schema"]
+            title = str(routing.get("title") or getattr(item, "name", "") or extension_id)
+            summary = str(
+                routing.get("summary")
+                or getattr(item, "description", "")
+                or extension_id
+            )
+            intents = _strings(routing.get("intents"))
+            examples = _strings(routing.get("examples"))
+            anti_examples = _strings(routing.get("anti_examples"))
+            domains = _strings(routing.get("domains"))
+            tags = _strings(routing.get("tags")) or _strings(
+                getattr(item, "tags", ())
+            )
+            operations = _strings(routing.get("operations")) or _operations(
+                input_schema
+            )
+            channels = _strings(routing.get("channels"))
+            permission_level = _value(getattr(item, "permission_level", ""))
+            required_scopes = _strings(getattr(item, "required_scopes", ()))
+            risk_level = _value(getattr(item, "risk_level", ""))
+            side_effects = tuple(
+                sorted(_value(effect) for effect in getattr(item, "side_effects", ()))
+            )
+            cost_hint = str(routing.get("cost") or "")
+            routing_text = "\n".join(
+                (
+                    f"Tool: {extension_id}",
+                    f"Title: {title}",
+                    f"Summary: {summary}",
+                    f"Domains: {', '.join(domains)}",
+                    f"Tags: {', '.join(tags)}",
+                    f"Intents: {'; '.join(intents)}",
+                    f"Examples: {'; '.join(examples)}",
+                    f"Operations: {', '.join(operations)}",
+                    f"Permission: {permission_level}",
+                    f"Risk: {risk_level}",
+                    f"Side effects: {', '.join(side_effects)}",
+                    f"Required scopes: {', '.join(required_scopes)}",
+                    f"Channels: {', '.join(channels)}",
+                    f"Cost: {cost_hint}",
+                )
+            )
+            schema_hash = _json_hash(input_schema)
+            routing_hash = _json_hash(
+                {
+                    "text": routing_text,
+                    "anti_examples": anti_examples,
+                    "channels": channels,
+                    "always_available": bool(routing.get("always_available", False)),
+                }
+            )
+            records[extension_id] = ToolRecord(
+                id=extension_id,
+                model_name=schema["model_name"],
+                title=title,
+                summary=summary,
+                routing_text=routing_text,
+                domains=domains,
+                tags=tags,
+                operations=operations,
+                anti_examples=anti_examples,
+                channels=channels,
+                always_available=bool(routing.get("always_available", False)),
+                permission_level=permission_level,
+                required_scopes=required_scopes,
+                risk_level=risk_level,
+                side_effects=side_effects,
+                cost_hint=cost_hint,
+                version=str(getattr(item, "version", "")),
+                schema_hash=schema_hash,
+                routing_hash=routing_hash,
+            )
+        self._records = records
+        self.version = _json_hash(
+            [
+                (record.id, record.schema_hash, record.routing_hash, record.version)
+                for record in sorted(records.values(), key=lambda item: item.id)
+            ]
+        )
+
+    def get(self, extension_id: str) -> ToolRecord:
+        return self._records[extension_id]
+
+    def visible(self, channel: str, policy: Any = None) -> list[ToolRecord]:
+        denied_ids = set(getattr(policy, "deny_capabilities", ()) or ())
+        denied_scopes = set(getattr(policy, "deny_scopes", ()) or ())
+        denied_effects = {
+            _value(effect)
+            for effect in (getattr(policy, "deny_effects", ()) or ())
+        }
+        result = []
+        for record in self._records.values():
+            if record.permission_level == "blocked" or record.id in denied_ids:
+                continue
+            if record.channels and channel not in record.channels:
+                continue
+            item = record
+            if denied_effects.intersection(item.side_effects):
+                continue
+            if denied_scopes.intersection(record.required_scopes):
+                continue
+            result.append(record)
+        return result
+
+    def __len__(self) -> int:
+        return len(self._records)
+
+
+class OpenAIEmbeddingClient:
+    """Tiny OpenAI-compatible embeddings client using only the stdlib."""
+
+    def __init__(self, config: ToolRoutingConfig) -> None:
+        self.base_url = os.getenv(
+            "CORAX_EMBEDDING_BASE_URL",
+            config.base_url,
+        ).rstrip("/")
+        self.model = os.getenv("CORAX_EMBEDDING_MODEL", config.model)
+        self.dimension = config.dimension
+        self.timeout = config.timeout_seconds
+
+    async def embed(
+        self,
+        texts: Sequence[str],
+        *,
+        input_type: str,
+    ) -> list[tuple[float, ...]]:
+        if not texts:
+            return []
+        prefix = "query: " if input_type == "query" else "passage: "
+        payload = {
+            "model": self.model,
+            "input": [prefix + text for text in texts],
+            "encoding_format": "float",
+        }
+        return await asyncio.to_thread(self._post, payload, len(texts))
+
+    def _post(self, payload: dict[str, Any], expected: int) -> list[tuple[float, ...]]:
+        request = Request(
+            f"{self.base_url}/embeddings",
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=self.timeout) as response:
+                body = json.loads(response.read().decode("utf-8"))
+        except Exception as exc:  # noqa: BLE001 - endpoint details stay out of logs
+            raise EmbeddingError(f"embedding request failed: {type(exc).__name__}") from exc
+        rows = body.get("data") if isinstance(body, dict) else None
+        if not isinstance(rows, list) or len(rows) != expected:
+            raise EmbeddingError("embedding response count mismatch")
+        rows.sort(key=lambda row: row.get("index", -1) if isinstance(row, dict) else -1)
+        vectors: list[tuple[float, ...]] = []
+        for row in rows:
+            raw = row.get("embedding") if isinstance(row, dict) else None
+            if not isinstance(raw, list) or len(raw) != self.dimension:
+                raise EmbeddingError("embedding response dimension mismatch")
+            vector = tuple(float(value) for value in raw)
+            if not all(math.isfinite(value) for value in vector):
+                raise EmbeddingError("embedding response contains non-finite values")
+            vectors.append(vector)
+        return vectors
+
+
+class EmbeddingToolRouter:
+    """Rank compact ToolRecords with embeddings; never calls a generation LLM."""
 
     def __init__(
         self,
-        run_capability: RunCapability,
+        config: ToolRoutingConfig,
         *,
-        catalog: Sequence[dict],
-        llm_id: str = "llm.local",
-        model: str | None = None,
-        fallback: LexicalSelector | None = None,
-        top_k: int = 8,
-        timeout: float = 12.0,
-        max_tokens: int = 64,
-        skip_trivial: bool = True,
+        client: OpenAIEmbeddingClient | Any | None = None,
         log: logging.Logger | None = None,
     ) -> None:
-        self._run = run_capability
-        self.llm_id = llm_id
-        self.model = model
-        self.fallback = fallback
-        self.top_k = max(1, top_k)
-        self.timeout = timeout
-        self.max_tokens = max_tokens
-        self.skip_trivial = skip_trivial
+        self.config = config
+        self.client = client or OpenAIEmbeddingClient(config)
         self.log = log or logging.getLogger("corax.tool_router")
+        # ponytail: linear in-memory scan; add persistent ANN only after the
+        # measured catalog size makes one query per turn too slow.
+        self._vectors: dict[str, tuple[float, ...]] = {}
+        self._index_lock = asyncio.Lock()
+        self.last_route: dict[str, Any] = {}
 
-        self._ids = [str(cap["id"]) for cap in catalog if cap.get("id")]
-        self._id_set = set(self._ids)
-        # Accept both the dotted id and its safe-name form (web.search/web_search).
-        self._alias: dict[str, str] = {}
-        for cap_id in self._ids:
-            self._alias[cap_id] = cap_id
-            self._alias[cap_id.replace(".", "_")] = cap_id
-        self._menu = _render_menu(catalog)
-
-    async def route(self, user_text: str, specs: list[dict]) -> list[str]:
-        """Return the selected capability ids ([] means 'no tool needed')."""
-        # Cheap, deterministic pre-filter: skip the LLM call entirely for plainly
-        # social messages (greetings, thanks, "ok", emoji) so the router does not
-        # fire on every reply — only on messages that might actually need a tool.
-        if self.skip_trivial and is_trivial_chitchat(user_text):
-            self.log.debug("skipped tool routing for trivial message")
+    async def rank(
+        self,
+        query: str,
+        records: Sequence[ToolRecord],
+        *,
+        top_k: int,
+        min_similarity: float | None = None,
+        explicit: bool = False,
+    ) -> list[tuple[ToolRecord, float]]:
+        started = time.monotonic()
+        if not explicit and is_trivial_chitchat(query):
+            self.last_route = {
+                "fallback": "trivial",
+                "candidates": len(records),
+                "selected": 0,
+                "latency_ms": round((time.monotonic() - started) * 1000, 2),
+            }
             return []
         try:
-            ids = await asyncio.wait_for(self._route_via_llm(user_text), self.timeout)
-        except Exception as exc:  # noqa: BLE001 - routing (incl. timeout) must never break a turn
-            self.log.debug("llm tool router failed (%s); using lexical fallback", exc)
-            return self._fallback(user_text, specs)
-        if ids is None:
-            self.log.debug("llm tool router gave no parseable ids; using lexical fallback")
-            return self._fallback(user_text, specs)
-        return ids[: self.top_k]
-
-    async def _route_via_llm(self, user_text: str) -> list[str] | None:
-        payload: dict = {
-            "operation": "generate",
-            "messages": [
-                {"role": "system", "content": f"{_ROUTER_SYSTEM}\n\n{self._menu}"},
-                {"role": "user", "content": user_text},
+            await self._ensure_index(records)
+            query_vector = (
+                await self.client.embed([query], input_type="query")
+            )[0]
+            ranked = self._embedding_rank(
+                query_vector,
+                records,
+                min_similarity=(
+                    self.config.min_similarity
+                    if min_similarity is None
+                    else min_similarity
+                ),
+            )[: max(1, top_k)]
+            fallback = ""
+        except Exception as exc:  # noqa: BLE001 - routing is fail-closed
+            self.log.warning(
+                "embedding tool routing unavailable (%s); using lexical fallback",
+                type(exc).__name__,
+            )
+            ranked = self._lexical_rank(query, records)[: max(1, top_k)]
+            fallback = type(exc).__name__
+        self.last_route = {
+            "fallback": fallback,
+            "candidates": len(records),
+            "selected": len(ranked),
+            "latency_ms": round((time.monotonic() - started) * 1000, 2),
+            "scores": [
+                {"id": record.id, "score": round(score, 4)}
+                for record, score in ranked
             ],
-            "temperature": 0.0,
-            "max_tokens": self.max_tokens,
         }
-        if self.model:
-            payload["model"] = self.model
-        result = await self._run(self.llm_id, payload)
-        text = result.get("text") if isinstance(result, dict) else None
-        if not isinstance(text, str):
-            return None
-        return self._parse_ids(text)
+        return ranked
 
-    def _parse_ids(self, text: str) -> list[str] | None:
-        match = _JSON_ARRAY.search(text)
-        if match is None:
-            return None
-        try:
-            raw = json.loads(match.group(0))
-        except json.JSONDecodeError:
-            return None
-        if not isinstance(raw, list):
-            return None
-        selected: list[str] = []
-        for item in raw:
-            if not isinstance(item, str):
+    async def _ensure_index(self, records: Sequence[ToolRecord]) -> None:
+        missing: list[tuple[str, str]] = []
+        for record in records:
+            key = f"positive:{record.routing_hash}"
+            if key not in self._vectors:
+                missing.append((key, record.routing_text))
+            for anti in record.anti_examples:
+                anti_key = f"anti:{_json_hash(anti)}"
+                if anti_key not in self._vectors:
+                    missing.append((anti_key, anti))
+        if not missing:
+            return
+        async with self._index_lock:
+            pending = [(key, text) for key, text in missing if key not in self._vectors]
+            if not pending:
+                return
+            vectors = await self.client.embed(
+                [text for _, text in pending],
+                input_type="document",
+            )
+            self._vectors.update(
+                (key, vector)
+                for (key, _), vector in zip(pending, vectors, strict=True)
+            )
+
+    def _embedding_rank(
+        self,
+        query: tuple[float, ...],
+        records: Sequence[ToolRecord],
+        *,
+        min_similarity: float,
+    ) -> list[tuple[ToolRecord, float]]:
+        ranked: list[tuple[ToolRecord, float]] = []
+        for record in records:
+            positive = _cosine(
+                query,
+                self._vectors[f"positive:{record.routing_hash}"],
+            )
+            if positive < min_similarity:
                 continue
-            cap_id = self._alias.get(item.strip())
-            if cap_id and cap_id not in selected:
-                selected.append(cap_id)
-        return selected
+            anti = max(
+                (
+                    _cosine(query, self._vectors[f"anti:{_json_hash(example)}"])
+                    for example in record.anti_examples
+                ),
+                default=-1.0,
+            )
+            if anti >= positive:
+                continue
+            ranked.append((record, positive))
+        ranked.sort(key=lambda item: (-item[1], item[0].id))
+        return ranked
 
-    def _fallback(self, user_text: str, specs: list[dict]) -> list[str]:
-        if self.fallback is None:
+    @staticmethod
+    def _lexical_rank(
+        query: str,
+        records: Sequence[ToolRecord],
+    ) -> list[tuple[ToolRecord, float]]:
+        terms = set(_WORD_RE.findall(query.lower()))
+        if not terms:
             return []
+        ranked = []
+        for record in records:
+            positive_terms = set(_WORD_RE.findall(record.routing_text.lower()))
+            score = len(terms & positive_terms) / len(terms)
+            anti_score = max(
+                (
+                    len(terms & set(_WORD_RE.findall(example.lower()))) / len(terms)
+                    for example in record.anti_examples
+                ),
+                default=0.0,
+            )
+            if score > 0 and anti_score < score:
+                ranked.append((record, score))
+        ranked.sort(key=lambda item: (-item[1], item[0].id))
+        return ranked
+
+
+def _cosine(left: Sequence[float], right: Sequence[float]) -> float:
+    if len(left) != len(right):
+        raise EmbeddingError("embedding dimensions differ")
+    dot = sum(a * b for a, b in zip(left, right, strict=True))
+    left_norm = math.sqrt(sum(value * value for value in left))
+    right_norm = math.sqrt(sum(value * value for value in right))
+    return dot / (left_norm * right_norm) if left_norm and right_norm else 0.0
+
+
+@dataclass(slots=True)
+class TurnToolSet:
+    """Monotonic active set for one user turn."""
+
+    turn_id: str
+    session_id: str
+    channel: str
+    catalog_version: str
+    active_ids: list[str] = field(default_factory=list)
+    schema_bytes: int = 0
+
+    def activate(
+        self,
+        extension_ids: Iterable[str],
+        schemas: SchemaStore,
+        *,
+        max_tools: int,
+        max_schema_bytes: int,
+    ) -> list[str]:
+        added = []
+        for extension_id in extension_ids:
+            if extension_id in self.active_ids or not schemas.has(extension_id):
+                continue
+            size = schemas.size(extension_id)
+            if len(self.active_ids) >= max_tools:
+                break
+            if self.schema_bytes + size > max_schema_bytes:
+                continue
+            self.active_ids.append(extension_id)
+            self.schema_bytes += size
+            added.append(extension_id)
+        return added
+
+
+class ToolRoutingHost:
+    """One channel-neutral catalog, schema store and per-turn router."""
+
+    def __init__(
+        self,
+        config: ToolRoutingConfig,
+        *,
+        client: OpenAIEmbeddingClient | Any | None = None,
+        log: logging.Logger | None = None,
+    ) -> None:
+        self.config = config
+        self.log = log or logging.getLogger("corax.tool_routing")
+        self.catalog = ToolCatalog()
+        self.schemas = SchemaStore()
+        self.router = EmbeddingToolRouter(config, client=client, log=self.log)
+        self._turns: dict[tuple[str, str], TurnToolSet] = {}
+
+    def sync(
+        self,
+        tools: Iterable[tuple[str, Any]],
+        *,
+        manifests: Mapping[str, Any] | None = None,
+    ) -> None:
+        pairs = list(tools)
+        self.schemas.sync(pairs)
+        self.catalog.sync(pairs, self.schemas, manifests)
+
+    def all_specs(self) -> list[dict[str, Any]]:
+        return self.schemas.all_raw()
+
+    async def begin_turn(
+        self,
+        user_text: str,
+        *,
+        session_id: str,
+        turn_id: str,
+        channel: str,
+        policy: Any = None,
+    ) -> TurnToolSet:
+        visible = self.catalog.visible(channel, policy)
+        ranked = await self.router.rank(
+            user_text,
+            visible,
+            top_k=self.config.top_k,
+        )
+        turn = TurnToolSet(
+            turn_id=turn_id,
+            session_id=session_id,
+            channel=channel,
+            catalog_version=self.catalog.version,
+        )
+        turn.activate(
+            [TOOL_SEARCH_ID],
+            self.schemas,
+            max_tools=self.config.max_active_tools,
+            max_schema_bytes=self.config.max_schema_bytes,
+        )
+        turn.activate(
+            [record.id for record in visible if record.always_available],
+            self.schemas,
+            max_tools=self.config.max_active_tools,
+            max_schema_bytes=self.config.max_schema_bytes,
+        )
+        turn.activate(
+            [record.id for record, _ in ranked],
+            self.schemas,
+            max_tools=self.config.max_active_tools,
+            max_schema_bytes=self.config.max_schema_bytes,
+        )
+        self._turns[(channel, session_id)] = turn
+        self.log.info(
+            "tool routing turn=%s catalog=%s candidates=%d active=%d schemas=%dB "
+            "embedding_ms=%s fallback=%s",
+            turn_id,
+            self.catalog.version[:12],
+            len(visible),
+            len(turn.active_ids),
+            turn.schema_bytes,
+            self.router.last_route.get("latency_ms", 0),
+            self.router.last_route.get("fallback", ""),
+        )
+        return turn
+
+    def active_schemas(
+        self,
+        *,
+        session_id: str,
+        turn_id: str,
+        channel: str,
+    ) -> list[dict[str, Any]]:
+        turn = self._turn(session_id=session_id, channel=channel)
+        if turn.turn_id != turn_id:
+            return []
+        return [
+            self.schemas.openai(extension_id)
+            for extension_id in turn.active_ids
+            if self.schemas.has(extension_id)
+        ]
+
+    def current_turn(
+        self,
+        *,
+        session_id: str,
+        channel: str,
+    ) -> TurnToolSet | None:
+        return self._turns.get((channel, session_id))
+
+    def has_turn(
+        self,
+        *,
+        session_id: str,
+        turn_id: str,
+        channel: str,
+    ) -> bool:
+        turn = self.current_turn(session_id=session_id, channel=channel)
+        return turn is not None and turn.turn_id == turn_id
+
+    def require_active(
+        self,
+        extension_id: str,
+        *,
+        session_id: str,
+        turn_id: str,
+        channel: str,
+    ) -> None:
+        turn = self._turn(session_id=session_id, channel=channel)
+        if turn.turn_id != turn_id or extension_id not in turn.active_ids:
+            raise PermissionError(
+                f"tool {extension_id!r} is not active for turn {turn_id!r}"
+            )
+
+    async def search(
+        self,
+        query: str,
+        *,
+        session_id: str,
+        turn_id: str,
+        channel: str,
+        policy: Any = None,
+        top_k: int = 5,
+    ) -> dict[str, Any]:
+        turn = self._turn(session_id=session_id, channel=channel)
+        if turn.turn_id != turn_id:
+            raise PermissionError("tool.search is not active for this turn")
+        query = " ".join(str(query).split())
+        if not query:
+            raise ValueError("tool.search query must not be empty")
+        if len(query) > 1000:
+            raise ValueError("tool.search query is too long")
+        ranked = await self.router.rank(
+            query,
+            self.catalog.visible(channel, policy),
+            top_k=min(max(int(top_k), 1), 10),
+            min_similarity=0.0,
+            explicit=True,
+        )
+        activated = turn.activate(
+            [record.id for record, _ in ranked],
+            self.schemas,
+            max_tools=self.config.max_active_tools,
+            max_schema_bytes=self.config.max_schema_bytes,
+        )
+        turn.catalog_version = self.catalog.version
+        return {
+            "ok": True,
+            "matches": [
+                {
+                    "id": record.id,
+                    "title": record.title,
+                    "summary": record.summary,
+                    "score": round(score, 4),
+                }
+                for record, score in ranked
+            ],
+            "activated": activated,
+            "active_count": len(turn.active_ids),
+            "catalog_version": turn.catalog_version,
+        }
+
+    def end_turn(self, *, session_id: str, channel: str) -> None:
+        self._turns.pop((channel, session_id), None)
+
+    def clear_turns(self) -> None:
+        self._turns.clear()
+
+    def _turn(self, *, session_id: str, channel: str) -> TurnToolSet:
         try:
-            return [
-                str(cap_id)
-                for cap_id in self.fallback(user_text, specs)
-                if str(cap_id) in self._id_set
-            ][: self.top_k]
-        except Exception as exc:  # noqa: BLE001 - fallback must not break a turn
-            self.log.debug("lexical fallback failed: %s", exc)
-            return []
-
-
-def _render_menu(catalog: Sequence[dict]) -> str:
-    lines = ["Tools:"]
-    for cap in catalog:
-        cap_id = str(cap.get("id") or "")
-        if not cap_id:
-            continue
-        description = " ".join(str(cap.get("description") or "").split())
-        operations = _operations(cap)
-        line = f"- {cap_id}: {description}" if description else f"- {cap_id}"
-        if operations:
-            line += f" (operations: {', '.join(operations)})"
-        lines.append(line)
-    return "\n".join(lines)
-
-
-def _operations(cap: dict) -> list[str]:
-    schema = cap.get("input_schema") or {}
-    properties = schema.get("properties") or {}
-    operation = properties.get("operation") or {}
-    enum = operation.get("enum")
-    return [str(value) for value in enum] if isinstance(enum, list) else []
+            return self._turns[(channel, session_id)]
+        except KeyError:
+            raise PermissionError("no active tool set for this turn") from None

@@ -26,6 +26,7 @@ class ExtensionLoader:
         self.workspace_path = Path(workspace_path)
         self.core_version = core_version
         self.log = log or logging.getLogger("corax.loader")
+        self.manifests: dict[str, Any] = {}
 
     def load(
         self,
@@ -80,12 +81,14 @@ class ExtensionLoader:
                     manifest.kind.value,
                 )
                 return None
-            return load_extension_instance(
+            instance = load_extension_instance(
                 manifest,
                 package_path,
                 core_version=self.core_version,
                 kwargs=self._kwargs(extension_id),
             )
+            self.manifests[extension_id] = manifest
+            return instance
         except Exception as exc:  # noqa: BLE001
             self.log.warning("failed loading extension '%s': %s", extension_id, exc)
             return None

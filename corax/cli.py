@@ -40,6 +40,7 @@ from corax import __version__ as CORAX_VERSION
 from corax import config as config_mod
 from corax.app import CoraxApp
 from corax.paths import default_config_path, ensure_paths
+from corax.tool_router import TOOL_SEARCH_ID
 
 
 def _minimal_runtime_snapshot(app: CoraxApp) -> dict[str, object]:
@@ -595,20 +596,8 @@ def _set_active_extension(
 
 def _tool_capability_specs(runtime) -> list[dict]:
     """Describe only kernel-executable tools for the model."""
-    from corax.loader.core import _as_pairs
-
-    specs: list[dict] = []
-    for cap_id, item in _as_pairs(runtime.tools):
-        if not runtime.core.is_executable(item):
-            continue
-        specs.append(
-            {
-                "id": cap_id,
-                "description": getattr(item, "description", "") or "",
-                "input_schema": getattr(item, "input_schema", {}) or {},
-            }
-        )
-    return specs
+    runtime.sync_tool_catalog()
+    return runtime.tool_routing.all_specs()
 
 
 async def _run_console_chat(
@@ -636,6 +625,7 @@ async def _run_console_chat(
         return 1
 
     connector = runtime.channels.get("console.connector")
+    local_channel = "tui" if use_tui else "console"
     specs = _tool_capability_specs(runtime)
     system_prompt = _chat_system_prompt(runtime.root_path) or (
         "You are Corax, a helpful local agent. Use tools when action or "
@@ -649,17 +639,29 @@ async def _run_console_chat(
     ) as kernel:
         chat: Any | None = None
 
+        async def routed_payload(payload, *, session_id):
+            turn_id = str(getattr(chat, "turn_id", "") or "")
+            if not turn_id:
+                raise RuntimeError("console model call has no active turn")
+            return await runtime.prepare_tool_model_request(
+                payload,
+                session_id=session_id,
+                turn_id=turn_id,
+                channel=local_channel,
+                kernel=kernel,
+            )
+
         async def run_model(payload, *, session_id):
             return await runtime.invoke_extension(
                 model_id,
-                payload,
+                await routed_payload(payload, session_id=session_id),
                 session_id=session_id,
             )
 
         async def run_model_stream(payload, *, session_id):
             async for event in runtime.stream_extension(
                 model_id,
-                payload,
+                await routed_payload(payload, session_id=session_id),
                 session_id=session_id,
             ):
                 yield event
@@ -674,6 +676,21 @@ async def _run_console_chat(
             turn_id = getattr(chat, "turn_id", "")
             if isinstance(turn_id, str) and turn_id:
                 policy_metadata["turn_id"] = turn_id
+            if not isinstance(turn_id, str) or not turn_id:
+                raise PermissionError("tool call has no active console turn")
+            runtime.tool_routing.require_active(
+                extension_id,
+                session_id=session_id,
+                turn_id=turn_id,
+                channel=local_channel,
+            )
+            if extension_id == TOOL_SEARCH_ID:
+                return await runtime.search_tools(
+                    payload,
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    channel=local_channel,
+                )
             return await kernel.invoke(
                 extension_id,
                 payload,
@@ -788,6 +805,19 @@ async def _run_console_chat(
                     },
                 )
 
+        async def memory_after_turn(*args, session_id, **kwargs):
+            try:
+                return await runtime.memory_after_turn(
+                    *args,
+                    session_id=session_id,
+                    **kwargs,
+                )
+            finally:
+                runtime.tool_routing.end_turn(
+                    session_id=session_id,
+                    channel=local_channel,
+                )
+
         context_window = await discover_model_context_window(
             app.config.llm.base_url,
             app.config.llm.model,
@@ -805,7 +835,7 @@ async def _run_console_chat(
             security_command=security_control,
             memory_command=memory_control,
             memory_before_turn=runtime.memory_before_turn,
-            memory_after_turn=runtime.memory_after_turn,
+            memory_after_turn=memory_after_turn,
             load_state=load_state,
             save_state=save_state,
             version=CORAX_VERSION,
@@ -826,46 +856,6 @@ async def _run_console_chat(
             else:
                 return await run_tui(chat, context_window=context_window)
         return await chat.run()
-
-
-def _resolve_tool_routing(app: "CoraxApp", selector_available: bool) -> tuple[str, str]:
-    """Decide how tools are picked per turn, from ``CORAX_TOOL_ROUTER``.
-
-    Modes: ``llm`` (default) — ask the model which tools to activate;
-    ``lexical`` — the keyword/hint top-K selector; ``off`` — offer every tool.
-    Falls back gracefully when a mode's prerequisite is missing. Returns the
-    resolved mode and a human-readable label for the dashboard.
-    """
-    mode = (os.getenv("CORAX_TOOL_ROUTER") or "llm").strip().lower()
-    if mode == "off":
-        return "off", "static full list"
-    if mode == "lexical":
-        if selector_available:
-            return "lexical", "lexical top-K selector"
-        return "off", "static full list (no selector)"
-    # default: llm router (the chat path guarantees llm.local is loaded)
-    return "llm", f"llm router ({app.config.llm.model})"
-
-
-def _build_tool_routing(
-    routing_mode: str, invoke_extension, specs: list[dict], selector, app: "CoraxApp"
-) -> dict:
-    """Build the gateway's tool-selection kwargs for the resolved routing mode."""
-    if routing_mode == "llm":
-        from corax.tool_router import LLMToolRouter
-
-        router = LLMToolRouter(
-            invoke_extension,
-            catalog=specs,
-            llm_id=app.runtime.active_generation_model_id(),
-            model=app.config.llm.model,
-            fallback=selector.select if selector.available else None,
-            log=logging.getLogger("corax.tool_router"),
-        )
-        return {"tool_router": router.route}
-    if routing_mode == "lexical":
-        return {"tool_selector": selector.select}
-    return {}
 
 
 def _chat_system_prompt(root_path: str | Path) -> str | None:
@@ -903,7 +893,6 @@ async def _run_chat(app: "CoraxApp", config_path: Path) -> int:
         return 1
 
     from corax.gateway import CoraxTelegramGateway
-    from corax.tool_discovery import RuntimeToolSelector
     from corax_console import discover_model_context_window
 
     runtime.set_model_context_window(
@@ -914,8 +903,10 @@ async def _run_chat(app: "CoraxApp", config_path: Path) -> int:
     )
 
     specs = _tool_capability_specs(runtime)
-    selector = RuntimeToolSelector(app.config, root_path=runtime.root_path)
-    routing_mode, tool_mode_label = _resolve_tool_routing(app, selector.available)
+    tool_mode_label = (
+        f"embedding top-{app.config.tool_routing.top_k} "
+        f"({app.config.tool_routing.model})"
+    )
     stream_transport = _telegram_stream_transport()
     system_prompt = _chat_system_prompt(runtime.root_path)
     tool_ids = [
@@ -949,18 +940,87 @@ async def _run_chat(app: "CoraxApp", config_path: Path) -> int:
                 session_id: str = "",
                 policy_metadata: dict[str, str] | None = None,
             ):
-                if runtime.tools.has(extension_id):
+                data = dict(payload or {})
+                if extension_id == model_id:
+                    turn_id = str(data.get("_corax_turn_id", "") or "")
+                    if not turn_id:
+                        raise RuntimeError("Telegram model call has no active turn")
+                    data = await runtime.prepare_tool_model_request(
+                        data,
+                        session_id=session_id,
+                        turn_id=turn_id,
+                        channel="telegram",
+                        kernel=kernel,
+                    )
+                    return await runtime.invoke_extension(
+                        extension_id,
+                        data,
+                        session_id=session_id,
+                    )
+                if extension_id == TOOL_SEARCH_ID or runtime.tools.has(extension_id):
+                    turn_id = str((policy_metadata or {}).get("turn_id", "") or "")
+                    runtime.tool_routing.require_active(
+                        extension_id,
+                        session_id=session_id,
+                        turn_id=turn_id,
+                        channel="telegram",
+                    )
+                    if extension_id == TOOL_SEARCH_ID:
+                        return await runtime.search_tools(
+                            data,
+                            session_id=session_id,
+                            turn_id=turn_id,
+                            channel="telegram",
+                        )
                     return await kernel.invoke(
                         extension_id,
-                        payload,
+                        data,
                         session_id=session_id or None,
                         policy_metadata=policy_metadata,
                     )
                 return await runtime.invoke_extension(
                     extension_id,
-                    payload,
+                    data,
                     session_id=session_id,
                 )
+
+            async def stream_component(
+                extension_id: str,
+                payload: dict | None = None,
+                *,
+                session_id: str = "",
+            ):
+                data = dict(payload or {})
+                if extension_id == model_id:
+                    turn_id = str(data.get("_corax_turn_id", "") or "")
+                    if not turn_id:
+                        raise RuntimeError("Telegram model call has no active turn")
+                    data = await runtime.prepare_tool_model_request(
+                        data,
+                        session_id=session_id,
+                        turn_id=turn_id,
+                        channel="telegram",
+                        kernel=kernel,
+                    )
+                async for event in runtime.stream_extension(
+                    extension_id,
+                    data,
+                    session_id=session_id,
+                ):
+                    yield event
+
+            async def memory_after_turn(*args, session_id, **kwargs):
+                try:
+                    return await runtime.memory_after_turn(
+                        *args,
+                        session_id=session_id,
+                        **kwargs,
+                    )
+                finally:
+                    runtime.tool_routing.end_turn(
+                        session_id=session_id,
+                        channel="telegram",
+                    )
 
             async def control_security(
                 command: str,
@@ -999,7 +1059,7 @@ async def _run_chat(app: "CoraxApp", config_path: Path) -> int:
 
             gateway_kwargs = {
                 "run_capability": invoke_component,
-                "stream_capability": runtime.stream_extension,
+                "stream_capability": stream_component,
                 "capabilities": specs,
                 "gateway_available": runtime.services.has("gateway"),
                 "telegram_available": runtime.channels.has("telegram.connector"),
@@ -1011,17 +1071,9 @@ async def _run_chat(app: "CoraxApp", config_path: Path) -> int:
                 "stream_transport": stream_transport,
                 "security_command": control_security,
                 "memory_before_turn": runtime.memory_before_turn,
-                "memory_after_turn": runtime.memory_after_turn,
+                "memory_after_turn": memory_after_turn,
+                "tool_mode": tool_mode_label,
             }
-            gateway_kwargs.update(
-                _build_tool_routing(
-                    routing_mode,
-                    runtime.invoke_extension,
-                    specs,
-                    selector,
-                    app,
-                )
-            )
             if system_prompt is not None:
                 gateway_kwargs["system_prompt"] = system_prompt
             gateway = CoraxTelegramGateway(**gateway_kwargs)
@@ -1039,8 +1091,10 @@ async def _run_chat(app: "CoraxApp", config_path: Path) -> int:
                 print("telegram.connector is not loaded after reload.")
                 return 1
             specs = _tool_capability_specs(runtime)
-            selector = RuntimeToolSelector(app.config, root_path=runtime.root_path)
-            routing_mode, tool_mode_label = _resolve_tool_routing(app, selector.available)
+            tool_mode_label = (
+                f"embedding top-{app.config.tool_routing.top_k} "
+                f"({app.config.tool_routing.model})"
+            )
             stream_transport = _telegram_stream_transport()
             system_prompt = _chat_system_prompt(runtime.root_path)
             tool_ids = [

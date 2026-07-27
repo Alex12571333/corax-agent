@@ -278,14 +278,15 @@ class ToolSpecTests(unittest.IsolatedAsyncioTestCase):
         specs = await gw._active_tool_specs("привет", allow_media=False)
         self.assertEqual(specs, [])
 
-    async def test_selector_error_falls_back_to_all_tools(self) -> None:
-        # A broken selector must not strip the model's tools.
+    async def test_selector_error_fails_closed(self) -> None:
         def boom(_query, _specs):
             raise RuntimeError("selector down")
 
         gw = _gateway(FakeBackend(), tool_selector=boom)
-        names = {t["function"]["name"] for t in await gw._active_tool_specs("read file", allow_media=False)}
-        self.assertIn("filesystem", names)
+        self.assertEqual(
+            await gw._active_tool_specs("read file", allow_media=False),
+            [],
+        )
 
     async def test_async_tool_router_selects_tools(self) -> None:
         async def router(query, _specs):
@@ -300,13 +301,15 @@ class ToolSpecTests(unittest.IsolatedAsyncioTestCase):
         gw = _gateway(FakeBackend(), tool_router=_async_return([]))
         self.assertEqual(await gw._active_tool_specs("привет", allow_media=False), [])
 
-    async def test_async_tool_router_error_falls_back_to_all_tools(self) -> None:
+    async def test_async_tool_router_error_fails_closed(self) -> None:
         async def boom(_query, _specs):
             raise RuntimeError("router down")
 
         gw = _gateway(FakeBackend(), tool_router=boom)
-        names = {t["function"]["name"] for t in await gw._active_tool_specs("read file", allow_media=False)}
-        self.assertIn("filesystem", names)
+        self.assertEqual(
+            await gw._active_tool_specs("read file", allow_media=False),
+            [],
+        )
 
     async def test_send_document_is_never_model_callable(self) -> None:
         gw = _gateway(FakeBackend(), tool_selector=lambda _query, _specs: ["filesystem"])
