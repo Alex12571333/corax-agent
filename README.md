@@ -319,7 +319,8 @@ stay in RAM and are never written to conversation checkpoints.
 Use `corax prompts identity status profile` (or `memory`) for sizes and limits,
 `show` for an explicit private-content read, and
 `replace profile ./USER.md` to update a file. `reset` requires the same explicit
-target; `onboarding profile` preserves facts and reopens onboarding.
+target. Fresh installs do not start conversational onboarding implicitly;
+`onboarding profile` preserves facts and explicitly reopens it.
 
 When the operator corrects an answer, the host persists only a bounded
 assistant-message hash and correction category in `state.file`. The prompt
