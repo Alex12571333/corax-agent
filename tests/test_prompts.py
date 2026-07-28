@@ -133,7 +133,12 @@ class CliCommandTests(unittest.TestCase):
 
     def test_eval_uses_installed_source_root(self) -> None:
         report = SimpleNamespace(ok=True, render=Mock(return_value="ok"))
-        run_evaluations = Mock(return_value=report)
+        run_evaluations = Mock(
+            side_effect=lambda *_args: (
+                asyncio.run(asyncio.sleep(0)),
+                report,
+            )[1]
+        )
         app = SimpleNamespace(
             runtime=SimpleNamespace(root_path=Path("/wrong/runtime/path")),
             boot=AsyncMock(),

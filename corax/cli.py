@@ -391,7 +391,11 @@ async def _run(args: argparse.Namespace) -> int:
                 )
                 return 1
             agent_root = Path(__file__).resolve().parents[1]
-            report = run_evaluations(agent_root, agent_root.parent)
+            report = await asyncio.to_thread(
+                run_evaluations,
+                agent_root,
+                agent_root.parent,
+            )
             _print_result("Evaluations", report.render())
             return 0 if report.ok else 1
         elif command == "doctor":
