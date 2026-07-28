@@ -159,6 +159,14 @@ class TestRuntime(unittest.TestCase):
 
         async def run() -> None:
             await self.runtime.start()
+            now = [datetime(2026, 7, 27, 23, 59, 59, tzinfo=timezone.utc)]
+            self.runtime._clock = lambda: now[0]
+            observations = []
+
+            async def record_observation(*_args, **kwargs):
+                observations.append(dict(kwargs.get("metadata") or {}))
+
+            self.runtime.record_observation = record_observation
             model = Model()
             self.runtime.models.register(model.id, model)
             self.runtime.tool_routing.router.client = OfflineEmbeddings()
@@ -186,6 +194,7 @@ class TestRuntime(unittest.TestCase):
                 session_id=session_id,
                 channel="console",
             )
+            now[0] = datetime(2026, 7, 28, 0, 0, 1, tzinfo=timezone.utc)
 
             second_user = {"role": "user", "content": "Summarize it"}
             second = await self.runtime.prepare_tool_model_request(
@@ -215,7 +224,14 @@ class TestRuntime(unittest.TestCase):
                 first_request.parameters["tools"],
                 second_request.parameters["tools"],
             )
+            appended = "\n".join(
+                str(message.get("content") or "")
+                for message in second_request.messages[len(first_request.messages) :]
+            )
+            self.assertIn("Local date: 2026-07-28", appended)
             self.assertNotIn("_corax_prompt_context", second_request.parameters)
+            self.assertNotIn("input_schema", str(observations))
+            self.assertNotIn("active_tool_descriptors", str(observations))
 
         asyncio.run(run())
 

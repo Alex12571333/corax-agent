@@ -131,6 +131,8 @@ It freezes file/profile/skill layers for a turn, keeps effective hidden replay
 in RAM, and appends runtime, recall, selected schemas, tool-loop messages, and
 new user turns. Checkpoints continue to contain only raw user/assistant history;
 a restart is cache-cold but does not persist schemas or recalled private data.
+Prompt traces contain only layer/tool IDs, sizes, and hashes—not descriptors,
+schemas, compiled prompts, profile text, or recalled memory.
 
 `mcp.manager` uses the official MCP client SDK and registers discovered remote
 tools only after connection. Those proxies still execute through Agent Core and
