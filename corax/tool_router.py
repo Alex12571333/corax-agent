@@ -833,7 +833,6 @@ class ToolRoutingHost:
             query,
             self.catalog.visible(channel, policy),
             top_k=min(max(int(top_k), 1), 10),
-            min_similarity=0.0,
             explicit=True,
         )
         activated = turn.activate(
@@ -843,8 +842,19 @@ class ToolRoutingHost:
             max_schema_bytes=self.config.max_schema_bytes,
         )
         turn.catalog_version = self.catalog.version
+        found = bool(ranked)
         return {
             "ok": True,
+            "found": found,
+            "message": (
+                "Matching tools were activated. Use their exact schemas."
+                if found
+                else (
+                    "No matching tool is available in this environment. "
+                    "Tell the user that this capability is unavailable and "
+                    "do not repeat tool.search with synonyms."
+                )
+            ),
             "matches": [
                 {
                     "id": record.id,

@@ -135,31 +135,6 @@ class TestRuntime(unittest.TestCase):
         )
         self.assertNotIn("_corax_prompt_context", prepared)
 
-    def test_force_answer_disables_tools_and_keeps_recovery_context(self) -> None:
-        with mock.patch.object(
-            self.runtime,
-            "active_prompt_runtime",
-            return_value=SimpleNamespace(enabled=True),
-        ):
-            prepared = asyncio.run(
-                self.runtime.prepare_tool_model_request(
-                    {
-                        "messages": [{"role": "user", "content": "open browser"}],
-                        "_corax_tool_failure": True,
-                        "_corax_force_answer": True,
-                    },
-                    session_id="force-answer",
-                    turn_id="force-answer-1",
-                    channel="console",
-                )
-            )
-
-        self.assertNotIn("tools", prepared)
-        self.assertEqual(prepared["tool_choice"], "none")
-        self.assertTrue(
-            prepared["_corax_prompt_context"]["tool_failure"]
-        )
-
     def test_new_turn_extends_provider_prefix_without_changing_meta_tools(self) -> None:
         from agent_core import ExtensionKind
 

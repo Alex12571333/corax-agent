@@ -1453,7 +1453,6 @@ class CoraxRuntime:
         hinted_text = str(data.pop("_corax_user_text", "") or "")
         recent_files = data.pop("_corax_recent_files", [])
         tool_failure = bool(data.pop("_corax_tool_failure", False))
-        force_answer = bool(data.pop("_corax_force_answer", False))
         data.pop("_corax_turn_id", None)
         has_turn = self.tool_routing.has_turn(
             session_id=session_id,
@@ -1487,16 +1486,12 @@ class CoraxRuntime:
             )
         prompt_runtime = self.active_prompt_runtime()
         if prompt_runtime is None:
-            if force_answer:
-                data.pop("tools", None)
-                data["tool_choice"] = "none"
-            else:
-                data["tools"] = self.tool_routing.active_schemas(
-                    session_id=session_id,
-                    turn_id=turn_id,
-                    channel=channel,
-                )
-                data["tool_choice"] = "auto"
+            data["tools"] = self.tool_routing.active_schemas(
+                session_id=session_id,
+                turn_id=turn_id,
+                channel=channel,
+            )
+            data["tool_choice"] = "auto"
             return data
 
         descriptors = self.tool_routing.active_descriptors(
@@ -1517,12 +1512,8 @@ class CoraxRuntime:
                 else []
             ),
         }
-        if force_answer:
-            data.pop("tools", None)
-            data["tool_choice"] = "none"
-        else:
-            data["tools"] = self.tool_routing.model_schemas()
-            data["tool_choice"] = "auto"
+        data["tools"] = self.tool_routing.model_schemas()
+        data["tool_choice"] = "auto"
         return data
 
     async def invoke_turn_tool(

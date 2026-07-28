@@ -156,6 +156,33 @@ class ToolRoutingTests(unittest.IsolatedAsyncioTestCase):
             [TOOL_SEARCH_ID, "filesystem", "web.search"],
         )
 
+    async def test_search_tells_model_when_no_tool_matches(self):
+        class NoMatchEmbeddings(FakeEmbeddings):
+            async def embed(self, texts, *, input_type):
+                if input_type == "query":
+                    return [(0.0, 0.0, 0.0) for _ in texts]
+                return await super().embed(texts, input_type=input_type)
+
+        host = _host(NoMatchEmbeddings())
+        await host.begin_turn(
+            "launch a browser",
+            session_id="s1",
+            turn_id="t1",
+            channel="console",
+        )
+
+        result = await host.search(
+            "open a desktop browser",
+            session_id="s1",
+            turn_id="t1",
+            channel="console",
+        )
+
+        self.assertFalse(result["found"])
+        self.assertEqual(result["activated"], [])
+        self.assertEqual(result["matches"], [])
+        self.assertIn("Tell the user", result["message"])
+
     async def test_new_turn_drops_previous_expansion_and_reuses_index(self):
         client = FakeEmbeddings()
         host = _host(client)
