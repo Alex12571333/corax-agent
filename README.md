@@ -129,7 +129,12 @@ Real-time thinking is kept separate from the answer and collapsed by default.
 Use `Ctrl-T` or `/thinking` to expand or collapse the current block. Typing `/`
 opens command suggestions with descriptions. The status bar shows the active
 model, context use, security mode, memory provider, and session. Corax
-discovers the selected model's real context window from its OpenAI-compatible
+does not cap reasoning by the number of characters retained for display.
+Model output starts with a 32K envelope; if the provider reports
+`finish_reason=length`, the incomplete block is discarded and retried once
+with 81,920 tokens. A second truncated result is reported as an error and is
+never committed to conversation history.
+Corax discovers the selected model's real context window from its OpenAI-compatible
 `/models` metadata and updates current use from streaming `prompt_tokens`.
 Occupied tokens are shown as an exact integer, so adjacent turns cannot be
 hidden by `k` rounding. Until provider usage arrives the bar shows unknown or

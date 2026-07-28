@@ -80,6 +80,11 @@ _MODEL_CHANNEL_MARKER_LINE = re.compile(
     r"^\s*(?:<\|?(?:channel|analysis|commentary|final|assistant|thought|reasoning)\|?>|thought|reasoning)\s*[▌|]?\s*$",
     re.IGNORECASE,
 )
+_OUTPUT_LIMIT_REASONS = {"length", "max_tokens"}
+_OUTPUT_LIMIT_MESSAGE = (
+    "⚠️ Model output limit reached before a complete answer. "
+    "The partial response was discarded."
+)
 _SEND_DOCUMENT_TOOL = "telegram_send_document"
 _LOG_VALUE_LIMIT = 140
 _PROFILE_NOTE_LIMIT = 900
@@ -560,6 +565,11 @@ class CoraxTelegramGateway:
                 session_id=session_id,
                 chat_type=chat_type,
             )
+            if response.get("_incomplete"):
+                return
+            if response.get("finish_reason") in _OUTPUT_LIMIT_REASONS:
+                await self._send(chat_id, _OUTPUT_LIMIT_MESSAGE)
+                return
             tool_calls = response.get("tool_calls") or []
             if not tool_calls:
                 if (
@@ -744,6 +754,24 @@ class CoraxTelegramGateway:
                 break
 
         text = self._sanitize_model_text(text)
+        if finish_reason in _OUTPUT_LIMIT_REASONS:
+            await self._stream_edit(
+                chat_id,
+                message_id,
+                _OUTPUT_LIMIT_MESSAGE,
+                last_sent,
+                done=True,
+                elapsed_ms=10 ** 9,
+                chat_type=chat_type,
+                draft_id=draft_id,
+            )
+            return {
+                "text": "",
+                "tool_calls": [],
+                "finish_reason": finish_reason,
+                "_streamed": True,
+                "_incomplete": True,
+            }
         if text:
             await self._stream_edit(
                 chat_id,

@@ -175,7 +175,8 @@ class FakeBackend:
             resp = self.llm_responses.pop(0) if self.llm_responses else {"text": "(default)"}
             tcs = resp.get("tool_calls") or []
             return {"text": resp.get("text", ""), "tool_calls": tcs,
-                    "finish_reason": "tool_calls" if tcs else "stop"}
+                    "finish_reason": resp.get("finish_reason")
+                    or ("tool_calls" if tcs else "stop")}
         self.tools_run.append((cap_id, payload))  # a tool invocation
         return self.tool_results.get(cap_id, {"ok": True})
 
@@ -490,6 +491,25 @@ class ChatToolLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(gen["messages"][1]["role"], "user")
         self.assertRegex(gen["messages"][1]["content"], r"^\[[A-Z][a-z]{2} \d{4}-\d{2}-\d{2} ")
 
+    async def test_batch_output_limit_is_not_recorded_as_an_answer(self) -> None:
+        backend = FakeBackend(
+            poll_batches=[[_text_update(5, "hi")]],
+            llm_responses=[
+                {"text": "internal draft", "finish_reason": "length"}
+            ],
+        )
+
+        await _gateway(backend).run(max_iterations=1)
+
+        self.assertNotIn("internal draft", backend.sends)
+        self.assertTrue(
+            any("partial response was discarded" in text for text in backend.sends)
+        )
+        self.assertNotIn(
+            "record_turn",
+            [operation for _capability, operation, _payload in backend.calls],
+        )
+
     async def test_streaming_answer_is_sent_live_without_duplicate_final(self) -> None:
         backend = FakeBackend(poll_batches=[[_text_update(5, "hi", chat_type="private")]])
         gw = _gateway(
@@ -511,6 +531,33 @@ class ChatToolLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(stream_calls[0]["draft_id"], int)
         self.assertEqual(stream_calls[-1]["draft_id"], stream_calls[0]["draft_id"])
         self.assertEqual(backend.sends.count("hello there"), 1)
+
+    async def test_streaming_output_limit_discards_partial_answer(self) -> None:
+        backend = FakeBackend(poll_batches=[[_text_update(5, "hi")]])
+        gw = _gateway(
+            backend,
+            stream_capability=_streamer(
+                [
+                    {"type": "reasoning", "content": "unfinished thought"},
+                    {"type": "delta", "content": "internal draft"},
+                    {
+                        "type": "done",
+                        "finish_reason": "length",
+                        "tool_calls": [],
+                    },
+                ]
+            ),
+        )
+
+        await gw.run(max_iterations=1)
+
+        stream_calls = [p for _c, op, p in backend.calls if op == "stream"]
+        self.assertTrue(stream_calls[-1]["done"])
+        self.assertIn("partial response was discarded", stream_calls[-1]["text"])
+        self.assertNotIn(
+            "record_turn",
+            [operation for _capability, operation, _payload in backend.calls],
+        )
 
     async def test_streaming_strips_model_channel_marker(self) -> None:
         backend = FakeBackend(poll_batches=[[_text_update(5, "hi")]])
