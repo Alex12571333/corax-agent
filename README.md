@@ -226,7 +226,8 @@ Meaning is always repeated in text or symbols; color is never the only signal.
 | `corax doctor` | Run offline readiness checks. |
 | `corax security status` | Show the active permission mode. |
 | `corax security mode ask\|auto\|full` | Change the permission mode. |
-| `corax prompts status\|reload\|validate` | Inspect, reload, or validate layered Markdown prompts. |
+| `corax prompts status\|reload\|validate\|migrate` | Inspect, reload, validate, or migrate layered Markdown prompts. |
+| `corax prompts identity …` | Inspect or atomically update the bounded profile and working memory. |
 | `corax mcp status` / `corax mcp tools` | Inspect MCP connections and discovered tools. |
 | `corax skills list` / `corax skills reload` | Inspect or reload trusted Agent Skills. |
 | `corax hooks status` / `corax hooks reload` | Inspect or reload approved hooks. |
@@ -314,6 +315,11 @@ Prompt identity is separate from semantic recall. Operator-editable
 `data/identity/MEMORY.md` stores bounded working notes, and recalled backend
 records remain untrusted turn data. Prompt schemas and hidden effective replay
 stay in RAM and are never written to conversation checkpoints.
+
+Use `corax prompts identity status profile` (or `memory`) for sizes and limits,
+`show` for an explicit private-content read, and
+`replace profile ./USER.md` to update a file. `reset` requires the same explicit
+target; `onboarding profile` preserves facts and reopens onboarding.
 
 ## Configuration and secrets
 

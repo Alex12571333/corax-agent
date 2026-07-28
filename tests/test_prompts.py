@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import signal
 import sys
 import tempfile
@@ -25,6 +26,19 @@ from corax.cli import (
 
 
 class ChatPromptTests(unittest.TestCase):
+    def test_packaged_legacy_prompts_are_known_stock(self) -> None:
+        from corax_prompt_runtime import _LEGACY_STOCK_HASHES
+
+        root = Path(__file__).resolve().parents[1]
+        for filename, target in (
+            ("system.md", "legacy/SYSTEM.md"),
+            ("safety.md", "legacy/SAFETY.md"),
+        ):
+            digest = hashlib.sha256(
+                (root / "prompts" / filename).read_bytes()
+            ).hexdigest()
+            self.assertIn(digest, _LEGACY_STOCK_HASHES[target])
+
     def test_chat_system_prompt_loads_system_and_safety_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -81,6 +95,95 @@ class CliCommandTests(unittest.TestCase):
         args = build_parser().parse_args(["security", "mode", "auto"])
         self.assertEqual(_resolve_command(args), "security")
         self.assertEqual(args.command_args, ["mode", "auto"])
+
+    def test_prompt_identity_status_is_forwarded_without_content(self) -> None:
+        runtime = SimpleNamespace(
+            services=SimpleNamespace(has=Mock(return_value=True)),
+            invoke_extension=AsyncMock(
+                return_value={
+                    "target": "profile",
+                    "chars": 20,
+                    "max_chars": 6_000,
+                }
+            ),
+        )
+        app = SimpleNamespace(
+            config=SimpleNamespace(
+                extensions=SimpleNamespace(
+                    bindings={"prompts": "prompts.runtime"}
+                )
+            ),
+            runtime=runtime,
+            boot=AsyncMock(),
+            shutdown=AsyncMock(),
+        )
+        with (
+            patch("corax.cli._needs_setup", return_value=False),
+            patch("corax.cli.CoraxApp", return_value=app),
+            patch("corax.cli._print_result") as output,
+        ):
+            result = asyncio.run(
+                _run(
+                    build_parser().parse_args(
+                        ["prompts", "identity", "status", "profile"]
+                    )
+                )
+            )
+
+        self.assertEqual(result, 0)
+        runtime.invoke_extension.assert_awaited_once_with(
+            "prompts.runtime",
+            {
+                "operation": "identity",
+                "action": "status",
+                "target": "profile",
+            },
+            session_id="prompts-control",
+        )
+        output.assert_called_once()
+
+    def test_prompt_identity_replace_reads_bounded_source_file(self) -> None:
+        runtime = SimpleNamespace(
+            services=SimpleNamespace(has=Mock(return_value=True)),
+            invoke_extension=AsyncMock(
+                return_value={"target": "memory", "chars": 31}
+            ),
+        )
+        app = SimpleNamespace(
+            config=SimpleNamespace(
+                extensions=SimpleNamespace(
+                    bindings={"prompts": "prompts.runtime"}
+                )
+            ),
+            runtime=runtime,
+            boot=AsyncMock(),
+            shutdown=AsyncMock(),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "MEMORY.md"
+            source.write_text("# Working memory\n- Corax\n", encoding="utf-8")
+            with (
+                patch("corax.cli._needs_setup", return_value=False),
+                patch("corax.cli.CoraxApp", return_value=app),
+                patch("corax.cli._print_result"),
+            ):
+                result = asyncio.run(
+                    _run(
+                        build_parser().parse_args(
+                            [
+                                "prompts",
+                                "identity",
+                                "replace",
+                                "memory",
+                                str(source),
+                            ]
+                        )
+                    )
+                )
+
+        self.assertEqual(result, 0)
+        payload = runtime.invoke_extension.await_args.args[1]
+        self.assertEqual(payload["content"], "# Working memory\n- Corax\n")
 
     def test_confirmation_command_scopes(self) -> None:
         self.assertEqual(

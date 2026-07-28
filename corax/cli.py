@@ -279,6 +279,59 @@ async def _run(args: argparse.Namespace) -> int:
             if not app.runtime.services.has(service_id):
                 print("prompts.runtime is not loaded.")
                 return 1
+            if args.command_args and args.command_args[0] == "identity":
+                identity_args = args.command_args[1:]
+                usage = (
+                    "usage: corax prompts identity "
+                    "<status|show|replace|reset|onboarding> "
+                    "<profile|memory> [file]"
+                )
+                if len(identity_args) < 2:
+                    print(usage)
+                    return 2
+                action, target = identity_args[:2]
+                if action not in {
+                    "status",
+                    "show",
+                    "replace",
+                    "reset",
+                    "onboarding",
+                } or target not in {"profile", "memory"}:
+                    print(usage)
+                    return 2
+                payload = {
+                    "operation": "identity",
+                    "action": action,
+                    "target": target,
+                }
+                if action == "replace":
+                    if len(identity_args) != 3:
+                        print(usage)
+                        return 2
+                    try:
+                        payload["content"] = (
+                            sys.stdin.read()
+                            if identity_args[2] == "-"
+                            else Path(identity_args[2])
+                            .expanduser()
+                            .read_text(encoding="utf-8")
+                        )
+                    except (OSError, UnicodeError) as exc:
+                        print(f"cannot read identity replacement: {exc}")
+                        return 2
+                elif len(identity_args) != 2:
+                    print(usage)
+                    return 2
+                result = await app.runtime.invoke_extension(
+                    service_id,
+                    payload,
+                    session_id="prompts-control",
+                )
+                if action == "show":
+                    print(str(result.get("content") or ""))
+                else:
+                    _print_result("Prompt identity", result)
+                return 0
             requested = args.command_args[0] if args.command_args else "status"
             operation = (
                 requested
