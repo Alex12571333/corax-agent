@@ -321,6 +321,11 @@ Use `corax prompts identity status profile` (or `memory`) for sizes and limits,
 `replace profile ./USER.md` to update a file. `reset` requires the same explicit
 target; `onboarding profile` preserves facts and reopens onboarding.
 
+When the operator corrects an answer, the host persists only a bounded
+assistant-message hash and correction category in `state.file`. The prompt
+runtime rebuilds the retraction notice after restart; message text never enters
+that ledger or observability.
+
 ## Configuration and secrets
 
 Use `corax setup` for onboarding and `corax settings` for advanced edits. The

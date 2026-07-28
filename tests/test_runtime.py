@@ -390,6 +390,118 @@ class TestRuntime(unittest.TestCase):
         skills.assert_awaited_once()
         hooks.assert_awaited_once()
 
+    def test_retraction_ledger_persists_before_model_and_stays_private(
+        self,
+    ) -> None:
+        import hashlib
+
+        from agent_core import ExtensionKind
+
+        events, seen, observations = [], [], []
+        initial = [
+            {"target_sha256": f"{index:064x}", "reason": "old"}
+            for index in range(65)
+        ]
+        state = {"value": initial, "key": None, "writes": [], "fail": False}
+        target = "A" * 64
+        record = {
+            "target_sha256": target,
+            "reason": "superseded",
+            "ignored": True,
+        }
+
+        async def read(key, *, namespace=""):
+            events.append("read")
+            state["key"] = (namespace, key)
+            if state["fail"]:
+                raise OSError("read failed")
+            return state["value"]
+
+        async def write(key, value, *, namespace=""):
+            events.append("write")
+            if state["fail"]:
+                raise OSError("write failed")
+            state.update(key=(namespace, key), value=value)
+            state["writes"].append(value)
+
+        async def build(payload, *, context):
+            events.append("build")
+            records = list(payload["retraction_records"])
+            seen.append(records)
+            return {
+                "messages": list(payload["messages"]),
+                "metadata": {
+                    "public": "kept",
+                    "_retraction_records": [*records, record],
+                },
+            }
+
+        async def generate(request):
+            events.append("generate")
+            return SimpleNamespace(
+                is_success=True,
+                payload={"text": "ok"},
+                status=None,
+            )
+
+        async def observe(*_args, **kwargs):
+            observations.append(dict(kwargs.get("metadata") or {}))
+
+        store = SimpleNamespace(read=read, write=write)
+        prompts = SimpleNamespace(enabled=True, build=build)
+        payload = {
+            "messages": [{"role": "user", "content": "hello"}],
+            "_corax_prompt_context": {"channel": "console"},
+        }
+
+        async def run():
+            for index in range(1, 4):
+                runtime = (
+                    self.runtime
+                    if index == 1
+                    else CoraxRuntime(cfg.default_config())
+                )
+                if index == 3:
+                    state.update(value=None, fail=True)
+                model = SimpleNamespace(
+                    id="retraction-ledger.test",
+                    kind=ExtensionKind.MODEL_PROVIDER,
+                    generate=generate,
+                )
+                runtime.models.register(model.id, model)
+                runtime.active_prompt_runtime = lambda: prompts
+                runtime.active_state_store = lambda: store
+                runtime.record_observation = observe
+                payload["_corax_prompt_context"]["turn_id"] = f"turn-{index}"
+                await runtime.invoke_extension(
+                    model.id,
+                    payload,
+                    session_id="session-1",
+                )
+
+        asyncio.run(run())
+        added = {"target_sha256": target.lower(), "reason": "superseded"}
+        expected = [*initial[-63:], added]
+        self.assertEqual(
+            events,
+            [
+                "read", "build", "write", "generate",
+                "read", "build", "generate",
+                "read", "build", "write", "generate",
+            ],
+        )
+        self.assertEqual(seen, [initial[-64:], expected, []])
+        self.assertEqual(state["writes"], [expected])
+        self.assertEqual(
+            state["key"],
+            (
+                "prompt-retractions",
+                hashlib.sha256(b"console\0session-1").hexdigest(),
+            ),
+        )
+        self.assertTrue(any(item.get("public") == "kept" for item in observations))
+        self.assertNotIn("_retraction_records", str(observations))
+
     def test_abort_turn_discards_all_host_turn_state(self) -> None:
         end_turn = mock.AsyncMock(return_value={"committed": False})
         prompt_service = SimpleNamespace(enabled=True, end_turn=end_turn)

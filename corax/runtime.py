@@ -9,6 +9,7 @@ their role-specific contracts.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
 import logging
@@ -822,6 +823,57 @@ class CoraxRuntime:
             prompt=prompt,
             session_id=session_id,
         )
+        channel = str(context.get("channel") or "unknown")
+        state_store = self.active_state_store()
+        state_key = hashlib.sha256(
+            f"{channel}\0{session_id}".encode("utf-8")
+        ).hexdigest()
+
+        def retraction_records(value: Any) -> list[dict[str, str]]:
+            records: list[dict[str, str]] = []
+            seen: set[tuple[str, str]] = set()
+            for item in reversed(value) if isinstance(value, list) else ():
+                if not isinstance(item, dict):
+                    continue
+                target = item.get("target_sha256")
+                reason = item.get("reason")
+                if not isinstance(target, str) or not isinstance(reason, str):
+                    continue
+                target = target.lower()
+                pair = (target, reason)
+                if (
+                    len(target) != 64
+                    or any(char not in "0123456789abcdef" for char in target)
+                    or not reason
+                    or len(reason) > 64
+                    or reason[0] not in "abcdefghijklmnopqrstuvwxyz"
+                    or any(
+                        char not in "abcdefghijklmnopqrstuvwxyz0123456789_-"
+                        for char in reason[1:]
+                    )
+                    or pair in seen
+                ):
+                    continue
+                seen.add(pair)
+                records.append(
+                    {"target_sha256": target, "reason": reason}
+                )
+                if len(records) == 64:
+                    break
+            records.reverse()
+            return records
+
+        stored_records: list[dict[str, str]] = []
+        if state_store is not None:
+            try:
+                stored_records = retraction_records(
+                    await state_store.read(
+                        state_key,
+                        namespace="prompt-retractions",
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 - durable state is fail-soft
+                self.log.debug("prompt retraction state read failed: %s", exc)
         result = await service.build(
             {
                 "messages": original,
@@ -831,6 +883,7 @@ class CoraxRuntime:
                     context.get("tool_descriptors") or []
                 ),
                 **inputs,
+                "retraction_records": stored_records,
             },
             context=context,
         )
@@ -839,6 +892,21 @@ class CoraxRuntime:
         if not isinstance(prepared, list) or not prepared:
             raise RuntimeError("prompt runtime returned no model messages")
         safe_metadata = dict(metadata) if isinstance(metadata, dict) else {}
+        updated = safe_metadata.pop("_retraction_records", None)
+        updated_records = (
+            retraction_records(updated)
+            if isinstance(updated, list)
+            else stored_records
+        )
+        if state_store is not None and updated_records != stored_records:
+            try:
+                await state_store.write(
+                    state_key,
+                    updated_records,
+                    namespace="prompt-retractions",
+                )
+            except Exception as exc:  # noqa: BLE001 - durable state is fail-soft
+                self.log.debug("prompt retraction state write failed: %s", exc)
         safe_metadata["_prompt_turn_key"] = key
         self._prompt_turn_metadata[key] = safe_metadata
         return prepared, safe_metadata
