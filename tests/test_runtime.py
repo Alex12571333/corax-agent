@@ -1187,6 +1187,32 @@ class TestRuntime(unittest.TestCase):
         self.assertEqual(status["write_mode"], "native")
         self.assertEqual(generic.calls, 0)
 
+    def test_provider_owned_memory_tools_enter_the_normal_tool_catalog(self) -> None:
+        from agent_core import ExtensionKind, Result
+
+        class NativeMemory:
+            id = "memory.native-tools"
+            kind = ExtensionKind.MEMORY_PROVIDER
+            interfaces = {"agent.memory/v1", "agent.memoryloop/v1"}
+
+            async def handle(self, request):
+                return Result.ok({}, session_id=request.session_id)
+
+            def tool_proxies(self):
+                proxy = EchoCapability()
+                proxy.id = "memory_search"
+                return [proxy]
+
+        native = NativeMemory()
+        self.runtime.memories.register(native.id, native)
+        self.config.extensions.bindings["memory"] = native.id
+
+        self.runtime._wire_runtime_services()
+        self.runtime.sync_tool_catalog()
+
+        self.assertTrue(self.runtime.tools.has("memory_search"))
+        self.assertTrue(self.runtime.tool_routing.schemas.has("memory_search"))
+
     def test_start_exports_llm_environment(self) -> None:
         import os
 

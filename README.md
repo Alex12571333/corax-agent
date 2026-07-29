@@ -314,9 +314,11 @@ requires authentication. A provider that implements `agent.memoryloop/v1`
 owns its turn lifecycle; otherwise Corax binds the generic `memory.loop`.
 Mnemonic Vault uses the native path: both sides of each completed turn are
 `fsync`ed to a persistent spool, replayed after outages, and recalled with a
-bounded budget. UAM continues to use the generic privacy-aware loop. In both
-cases recalled text is untrusted data. Console checkpoints remain independent
-and are stored by `state.file`.
+bounded budget. It also supplies eight policy-controlled `memory_*` tool
+proxies, so the model can search and inspect the Vault instead of treating it
+as workspace files. UAM continues to use the generic privacy-aware loop. In
+both cases recalled text is untrusted data. Console checkpoints remain
+independent and are stored by `state.file`.
 
 Prompt identity is separate from semantic recall. Operator-editable
 `data/identity/USER.md` stores a small durable profile,
@@ -391,7 +393,7 @@ The package kind defines how a component participates in the runtime:
 | `tool` | Performs an action selected by the model. | Yes, through Agent Core. |
 | `channel_connector` | Receives and sends messages. | No. |
 | `model_provider` | Calls or hosts a model. | No. |
-| `memory_provider` | Stores and recalls long-lived memory. | No. |
+| `memory_provider` | Stores and recalls long-lived memory; it may supply separate typed tool proxies. | No. |
 | `policy_provider` | Makes authorization decisions. | No. |
 | `runtime_service` | Runs host orchestration such as MCP, hooks, or memory flow. | No. |
 | `storage_provider` | Persists host and session state. | No. |
@@ -399,7 +401,8 @@ The package kind defines how a component participates in the runtime:
 
 This boundary is the main architectural invariant: a component does not become
 a tool merely because it has callable methods. Security, memory, models,
-channels, storage, and orchestration never enter the model's tool registry.
+channels, storage, and orchestration stay outside the model's tool registry;
+an explicit typed proxy is still required for any model-callable operation.
 
 ### Repository map
 

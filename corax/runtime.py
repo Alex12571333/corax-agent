@@ -1429,6 +1429,17 @@ class CoraxRuntime:
                 loop.bind(memory)
             except Exception as exc:  # noqa: BLE001 - optional integration
                 self.log.warning("failed wiring memory loop: %s", exc)
+        if memory is not None and hasattr(memory, "tool_proxies"):
+            try:
+                for proxy in memory.tool_proxies():
+                    if self.extensions.has(proxy.id):
+                        self.log.warning(
+                            "memory tool id collision: %s", proxy.id
+                        )
+                        continue
+                    self.tools.register(proxy.id, proxy)
+            except Exception as exc:  # noqa: BLE001 - recall remains available
+                self.log.warning("failed wiring memory tools: %s", exc)
         router = self.active_model_router()
         if router is not None and hasattr(router, "bind"):
             try:
