@@ -134,6 +134,9 @@ Model output starts with a 32K envelope; if the provider reports
 `finish_reason=length`, the incomplete block is discarded and retried once
 with 81,920 tokens. A second truncated result is reported as an error and is
 never committed to conversation history.
+After an answer is checkpointed, memory capture and prompt retention finish in
+the background. Follow-up turns remain ordered within one session, while
+`/new` starts a fresh session immediately and is never dropped by the TUI.
 Corax discovers the selected model's real context window from its OpenAI-compatible
 `/models` metadata and updates current use from streaming `prompt_tokens`.
 Occupied tokens are shown as an exact integer, so adjacent turns cannot be
