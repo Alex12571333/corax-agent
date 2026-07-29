@@ -296,7 +296,7 @@ user turn
   -> bounded recall
   -> recalled text inserted as untrusted context
   -> model and tool execution
-  -> privacy-aware retention
+  -> provider-specific durable retention
 ```
 
 The stock configuration uses `memory.none`, so long-term retention is off until
@@ -310,10 +310,13 @@ providers:
 
 Select the provider with `corax setup`. Set `UAM_API_KEY` or
 `MNEMONIC_VAULT_API_TOKEN` in the environment when the selected service
-requires authentication. The memory loop bounds recalled context, treats it
-as data rather than instructions, and rejects secret-like facts during
-retention. Console conversation checkpoints are independent of long-term
-memory and are stored by `state.file`.
+requires authentication. A provider that implements `agent.memoryloop/v1`
+owns its turn lifecycle; otherwise Corax binds the generic `memory.loop`.
+Mnemonic Vault uses the native path: both sides of each completed turn are
+`fsync`ed to a persistent spool, replayed after outages, and recalled with a
+bounded budget. UAM continues to use the generic privacy-aware loop. In both
+cases recalled text is untrusted data. Console checkpoints remain independent
+and are stored by `state.file`.
 
 Prompt identity is separate from semantic recall. Operator-editable
 `data/identity/USER.md` stores a small durable profile,
@@ -350,6 +353,7 @@ Common secret and integration variables:
 | `CORAX_SECURITY_ADMIN_IDS` | Remote actors allowed to change policy or resolve approvals. |
 | `CORAX_WEBSEARCH_TOKEN` | Optional bearer token for the configured SearXNG proxy. |
 | `UAM_API_KEY` | Universal Agent Memory credential. |
+| `MNEMONIC_VAULT_URL` | Mnemonic Vault API, default `http://127.0.0.1:8765`. |
 | `MNEMONIC_VAULT_API_TOKEN` | Mnemonic Vault credential. |
 | `CORAX_MCP_SERVERS_JSON` | MCP server definitions. |
 | `CORAX_SKILLS_PATHS` | Trusted Skill roots separated by the OS path separator. |
@@ -439,9 +443,9 @@ Memory, state, and context:
 
 | Repository | Role |
 | --- | --- |
-| [`corax-memory-loop`](https://github.com/Alex12571333/corax-memory-loop) | Bounded recall and privacy-aware retention around every turn. |
+| [`corax-memory-loop`](https://github.com/Alex12571333/corax-memory-loop) | Generic bounded recall and privacy-aware retention for providers without a native loop. |
 | [`universal-agent-memory`](https://github.com/Alex12571333/universal-agent-memory) | Durable self-hosted memory backend and typed Corax adapter. |
-| [`mnemonic-vault`](https://github.com/Alex12571333/mnemonic-vault) | File-first memory backend and typed Corax adapter. |
+| [`mnemonic-vault`](https://github.com/Alex12571333/mnemonic-vault) | File-first backend with a lossless provider-owned Corax loop. |
 | [`corax-state-store`](https://github.com/Alex12571333/corax-state-store) | Atomic local checkpoints. |
 | [`corax-context-manager`](https://github.com/Alex12571333/corax-context-manager) | Deterministic compaction driven by the discovered model window with provider-calibrated reporting. |
 | [`corax-prompt-runtime`](https://github.com/Alex12571333/corax-prompt-runtime) | Layered Markdown prompt assembly, validation, hot reload, and cache-stable RAM replay. |

@@ -73,6 +73,12 @@ extensions:
 entrypoint, and verifies that the instance implements the declared role.
 `ExtensionCatalog` then registers it in the corresponding role registry.
 
+A memory provider may additionally declare `agent.memoryloop/v1` and implement
+`handle(ExtensionRequest)` for `before_turn`, `after_turn`, and `status`. Corax
+then uses that provider-owned lifecycle instead of the generic `memory.loop`.
+Do this only when the backend needs its own capture, replay, or recall
+semantics; ordinary providers should implement only `agent.memory/v1`.
+
 ## Runtime use
 
 Tools run through the Agent Core policy/execution kernel:

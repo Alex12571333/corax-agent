@@ -1103,6 +1103,90 @@ class TestRuntime(unittest.TestCase):
         self.assertTrue(before["degraded"])
         self.assertFalse(after["stored"])
 
+    def test_native_memory_provider_owns_turn_loop(self) -> None:
+        from agent_core import ExtensionKind, Result
+
+        class NativeMemory:
+            id = "memory.native"
+            kind = ExtensionKind.MEMORY_PROVIDER
+            interfaces = {"agent.memory/v1", "agent.memoryloop/v1"}
+
+            def __init__(self) -> None:
+                self.requests = []
+
+            async def handle(self, request):
+                self.requests.append(request)
+                if request.operation == "before_turn":
+                    return Result.ok(
+                        {
+                            "context": "native recall",
+                            "records": [],
+                            "provider": self.id,
+                        },
+                        session_id=request.session_id,
+                    )
+                if request.operation == "status":
+                    return Result.ok(
+                        {"provider": self.id, "write_mode": "native"},
+                        session_id=request.session_id,
+                    )
+                return Result.ok(
+                    {"stored": False, "captured": True},
+                    session_id=request.session_id,
+                )
+
+        class GenericLoop:
+            id = "memory.generic"
+            kind = ExtensionKind.RUNTIME_SERVICE
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def handle(self, request):
+                self.calls += 1
+                raise AssertionError("generic loop must not run")
+
+        native = NativeMemory()
+        generic = GenericLoop()
+        self.runtime.memories.register(native.id, native)
+        self.runtime.services.register(generic.id, generic)
+        self.config.extensions.bindings["memory"] = native.id
+        self.config.extensions.bindings["memory_loop"] = generic.id
+
+        with mock.patch.object(
+            self.runtime.tool_routing,
+            "current_turn",
+            return_value=SimpleNamespace(turn_id="turn-7"),
+        ):
+            before = asyncio.run(
+                self.runtime.memory_before_turn("hello", session_id="chat-1")
+            )
+            after = asyncio.run(
+                self.runtime.memory_after_turn(
+                    "hello",
+                    "world",
+                    session_id="chat-1",
+                    scope={"channel": "console"},
+                )
+            )
+        status = asyncio.run(
+            self.runtime.invoke_extension(
+                native.id,
+                {"operation": "status"},
+                session_id="console-control",
+            )
+        )
+
+        self.assertIs(self.runtime.active_memory_loop(), native)
+        self.assertEqual(before["context"], "native recall")
+        self.assertTrue(after["captured"])
+        self.assertEqual(
+            native.requests[1].payload["scope"]["turn_id"],
+            "turn-7",
+        )
+        self.assertEqual(status["write_mode"], "native")
+        self.assertEqual(generic.calls, 0)
+
     def test_start_exports_llm_environment(self) -> None:
         import os
 

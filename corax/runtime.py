@@ -447,8 +447,15 @@ class CoraxRuntime:
         return None
 
     def active_memory_loop(self) -> Any | None:
-        """Return the selected host-only memory orchestration service."""
+        """Return a provider-owned loop or the selected generic service."""
 
+        memory = self.active_memory()
+        if (
+            memory is not None
+            and "agent.memoryloop/v1" in getattr(memory, "interfaces", ())
+            and hasattr(memory, "handle")
+        ):
+            return memory
         service_id = self.config.extensions.bindings.get(
             "memory_loop", "memory.loop"
         )
@@ -1267,6 +1274,8 @@ class CoraxRuntime:
             or getattr(turn, "turn_id", "")
             or ""
         )
+        if turn_id:
+            scope_data["turn_id"] = turn_id
         key = (channel, session_id, turn_id)
         prompt_metadata = self._prompt_turn_metadata.get(key, {})
         if prompt_metadata.get("retraction_mode"):
@@ -1413,10 +1422,11 @@ class CoraxRuntime:
                 )
             except Exception as exc:  # noqa: BLE001 - startup isolates bad prompts
                 raise RuntimeError("failed wiring prompt runtime") from exc
+        memory = self.active_memory()
         loop = self.active_memory_loop()
-        if loop is not None and hasattr(loop, "bind"):
+        if loop is not None and loop is not memory and hasattr(loop, "bind"):
             try:
-                loop.bind(self.active_memory())
+                loop.bind(memory)
             except Exception as exc:  # noqa: BLE001 - optional integration
                 self.log.warning("failed wiring memory loop: %s", exc)
         router = self.active_model_router()
@@ -1886,7 +1896,19 @@ class CoraxRuntime:
                 },
             )
         elif kind is ExtensionKind.MEMORY_PROVIDER:
-            if operation == "remember":
+            if (
+                operation in {"before_turn", "after_turn", "status"}
+                and "agent.memoryloop/v1" in getattr(item, "interfaces", ())
+                and hasattr(item, "handle")
+            ):
+                result = await item.handle(
+                    ExtensionRequest(
+                        operation=operation,
+                        payload=data,
+                        session_id=session_id,
+                    )
+                )
+            elif operation == "remember":
                 result = await item.remember(
                     MemoryRecord(
                         content=str(data.pop("content", "")),
@@ -2146,6 +2168,10 @@ class CoraxRuntime:
         )
 
     def _apply_state_environment(self) -> None:
+        self._set_default_environment(
+            "CORAX_DATA_PATH",
+            str(self.data_path),
+        )
         self._set_default_environment(
             "CORAX_STATE_PATH",
             str(self.data_path / "state"),

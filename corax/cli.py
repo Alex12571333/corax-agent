@@ -800,9 +800,7 @@ async def _run_console_chat(
                 if loop is None:
                     return {"ok": False, "message": "memory loop is unavailable"}
                 result = await runtime.invoke_extension(
-                    app.config.extensions.bindings.get(
-                        "memory_loop", "memory.loop"
-                    ),
+                    loop.id,
                     {"operation": "status"},
                     session_id="console-control",
                 )

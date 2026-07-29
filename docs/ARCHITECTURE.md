@@ -114,10 +114,12 @@ called by `runtime.invoke_extension()` (or model streaming) through their own
 contracts and are selected through config bindings such as `primary_model` and
 `memory`.
 
-`memory.loop` is a runtime service bound to the selected `memory_provider`.
-Conversation channels call it before and after each turn. Recall is bounded and
-injected as untrusted context; retention is conservative and excludes secrets
-and assistant-authored claims.
+Conversation channels call the selected memory loop before and after each turn.
+If the active `memory_provider` implements `agent.memoryloop/v1`, it owns that
+lifecycle; otherwise Corax binds the generic `memory.loop` runtime service.
+Recall is always bounded and injected as untrusted context. The generic loop
+retains conservative user facts, while native providers may durably capture a
+complete transcript according to their documented storage policy.
 
 `state.file` implements the core `StorageProvider` port. The console uses it
 for bounded restart-safe checkpoints; it is runtime-only and never model-callable.
