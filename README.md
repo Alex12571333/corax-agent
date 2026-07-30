@@ -177,7 +177,9 @@ at `192.168.0.10:8080`. The provider always sees the same two native schemas,
 `tool_search` and `tool_call`; selected real schemas are appended as bounded
 turn data. This keeps vLLM's prefix cache stable across ordinary new queries.
 Console, TUI, and Telegram share this path. Routing makes no generation-LLM
-call; an embedding outage fails closed to a narrow lexical fallback.
+call. Policy metadata is filtered separately and never dilutes the semantic
+index. A low-confidence embedding match is accepted only when exact lexical
+evidence corroborates it; an embedding outage uses the same narrow fallback.
 `tool.search` can activate additional tools within the same turn, while Agent
 Core still validates the selected real capability and policy before execution.
 

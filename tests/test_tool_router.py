@@ -1,4 +1,4 @@
-"""Embedding-only tool catalog, selection and per-turn activation."""
+"""Embedding-first tool catalog, selection and per-turn activation."""
 
 from __future__ import annotations
 
@@ -155,6 +155,35 @@ class ToolRoutingTests(unittest.IsolatedAsyncioTestCase):
             turn.active_ids,
             [TOOL_SEARCH_ID, "filesystem", "web.search"],
         )
+
+    async def test_search_rescues_low_embedding_score_with_lexical_evidence(self):
+        class LowScoreEmbeddings(FakeEmbeddings):
+            async def embed(self, texts, *, input_type):
+                if input_type == "query":
+                    return [(1.0, 0.0, 0.0) for _ in texts]
+                return [
+                    (0.15, 0.99, 0.0)
+                    if "Tool: web.search" in text
+                    else (0.0, 1.0, 0.0)
+                    for text in texts
+                ]
+
+        host = _host(LowScoreEmbeddings())
+        await host.begin_turn(
+            "привет",
+            session_id="s1",
+            turn_id="t1",
+            channel="console",
+        )
+        result = await host.search(
+            "последние новости Украина",
+            session_id="s1",
+            turn_id="t1",
+            channel="console",
+        )
+
+        self.assertEqual(result["activated"], ["web.search"])
+        self.assertEqual(host.router.last_route["fallback"], "lexical")
 
     async def test_search_tells_model_when_no_tool_matches(self):
         class NoMatchEmbeddings(FakeEmbeddings):
@@ -324,6 +353,20 @@ class ToolRoutingTests(unittest.IsolatedAsyncioTestCase):
             {item["id"] for item in host.all_specs()},
             {TOOL_SEARCH_ID, TOOL_CALL_ID, "filesystem", "web.search"},
         )
+
+    def test_embedding_passage_contains_only_semantic_metadata(self):
+        passage = _host().catalog.get("web.search").routing_text
+        self.assertIn("Summary: Search current information on the web", passage)
+        self.assertIn("Intents: internet research and current news", passage)
+        for label in (
+            "Permission:",
+            "Risk:",
+            "Side effects:",
+            "Required scopes:",
+            "Channels:",
+            "Cost:",
+        ):
+            self.assertNotIn(label, passage)
 
     def test_trivial_filter_is_conservative(self):
         for text in ("привет", "thanks!", "👍", "ok"):

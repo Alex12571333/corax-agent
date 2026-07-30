@@ -1,4 +1,4 @@
-"""Host-owned tool catalog and embedding-only per-turn selection."""
+"""Host-owned tool catalog and embedding-first per-turn selection."""
 
 from __future__ import annotations
 
@@ -316,12 +316,6 @@ class ToolCatalog:
                     f"Intents: {'; '.join(intents)}",
                     f"Examples: {'; '.join(examples)}",
                     f"Operations: {', '.join(operations)}",
-                    f"Permission: {permission_level}",
-                    f"Risk: {risk_level}",
-                    f"Side effects: {', '.join(side_effects)}",
-                    f"Required scopes: {', '.join(required_scopes)}",
-                    f"Channels: {', '.join(channels)}",
-                    f"Cost: {cost_hint}",
                 )
             )
             schema_hash = _json_hash(input_schema)
@@ -483,6 +477,7 @@ class EmbeddingToolRouter:
                 "latency_ms": round((time.monotonic() - started) * 1000, 2),
             }
             return []
+        limit = max(1, top_k)
         try:
             await self._ensure_index(records)
             query_vector = (
@@ -496,14 +491,28 @@ class EmbeddingToolRouter:
                     if min_similarity is None
                     else min_similarity
                 ),
-            )[: max(1, top_k)]
+            )[:limit]
             fallback = ""
+            if not ranked:
+                lexical_ids = {
+                    record.id for record, _ in self._lexical_rank(query, records)
+                }
+                ranked = [
+                    item
+                    for item in self._embedding_rank(
+                        query_vector,
+                        records,
+                        min_similarity=0.0,
+                    )
+                    if item[1] > 0 and item[0].id in lexical_ids
+                ][:limit]
+                fallback = "lexical" if ranked else ""
         except Exception as exc:  # noqa: BLE001 - routing is fail-closed
             self.log.warning(
                 "embedding tool routing unavailable (%s); using lexical fallback",
                 type(exc).__name__,
             )
-            ranked = self._lexical_rank(query, records)[: max(1, top_k)]
+            ranked = self._lexical_rank(query, records)[:limit]
             fallback = type(exc).__name__
         self.last_route = {
             "fallback": fallback,
