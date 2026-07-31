@@ -166,6 +166,126 @@ class TestCoreEngine(unittest.TestCase):
         self.assertIn("capability_called", stages)
         self.assertIn("capability_completed", stages)
 
+    def test_result_transform_runs_after_schema_validation_before_core_size_guard(self) -> None:
+        from agent_core import (
+            Capability,
+            CapabilityRequest,
+            HealthStatus,
+            PermissionLevel,
+            Result,
+            RiskLevel,
+        )
+
+        class _Blob(Capability):
+            id = "blob"
+            name = "Blob"
+            description = "Returns a typed large result."
+            version = "1.0.0"
+            tags = {"test"}
+            permission_level = PermissionLevel.SAFE
+            required_scopes: set[str] = set()
+            risk_level = RiskLevel.LOW
+            side_effects: set = set()
+            input_schema: dict = {}
+            output_schema = {
+                "type": "object",
+                "properties": {"text": {"type": "string"}},
+                "required": ["text"],
+            }
+
+            async def execute(self, request: CapabilityRequest) -> Result:
+                payload = {"text": "x" * 2_000_000}
+                return Result.ok(
+                    payload,
+                    session_id=request.session_id,
+                    task_id=request.task_id,
+                    state_patch={request.input["state_key"]: payload},
+                )
+
+            async def health_check(self) -> HealthStatus:
+                return HealthStatus.HEALTHY
+
+        self.engine.config.limits.max_payload_mb = 1
+        seen: list[int] = []
+
+        async def transform(value, *, session_id):
+            seen.append(len(value["text"]))
+            return {"object_ref": "obj_" + "a" * 32, "session": session_id}
+
+        async def go():
+            async with self.engine.session(
+                [("blob", _Blob())],
+                result_transform=transform,
+            ) as kernel:
+                return await kernel.invoke("blob", session_id="large-result")
+
+        self.assertEqual(
+            asyncio.run(go()),
+            {
+                "object_ref": "obj_" + "a" * 32,
+                "session": "large-result",
+            },
+        )
+        self.assertEqual(seen, [2_000_000])
+
+    def test_concurrent_invocations_use_distinct_result_slots(self) -> None:
+        from agent_core import (
+            Capability,
+            CapabilityRequest,
+            HealthStatus,
+            PermissionLevel,
+            Result,
+            RiskLevel,
+        )
+
+        class _Delayed(Capability):
+            id = "delayed"
+            name = "Delayed"
+            description = "Returns one marker after a delay."
+            version = "1.0.0"
+            tags = {"test"}
+            permission_level = PermissionLevel.SAFE
+            required_scopes: set[str] = set()
+            risk_level = RiskLevel.LOW
+            side_effects: set = set()
+            input_schema: dict = {}
+            output_schema: dict = {}
+
+            async def execute(self, request: CapabilityRequest) -> Result:
+                await asyncio.sleep(float(request.input["delay"]))
+                return Result.ok(
+                    {"marker": request.input["marker"]},
+                    session_id=request.session_id,
+                    task_id=request.task_id,
+                )
+
+            async def health_check(self) -> HealthStatus:
+                return HealthStatus.HEALTHY
+
+        async def go():
+            async with self.engine.session([("delayed", _Delayed())]) as kernel:
+                results = await asyncio.gather(
+                    kernel.invoke(
+                        "delayed",
+                        {"marker": "slow", "delay": 0.03},
+                        session_id="shared",
+                    ),
+                    kernel.invoke(
+                        "delayed",
+                        {"marker": "fast", "delay": 0.0},
+                        session_id="shared",
+                    ),
+                )
+                state = await kernel.get_state("shared")
+                return results, dict(state.temporary_context)
+
+        results, temporary = asyncio.run(go())
+        self.assertEqual(
+            results,
+            [{"marker": "slow"}, {"marker": "fast"}],
+        )
+        self.assertEqual(temporary, {})
+
     def test_invoke_parks_and_resumes_after_confirmation(self) -> None:
         writer = _make_confirmed_writer()
 
@@ -336,6 +456,55 @@ class TestRuntimeCore(unittest.TestCase):
         task = asyncio.run(go())
         self.assertEqual(task.status, TaskStatus.COMPLETED)
         self.assertEqual(adder.calls, [10])
+
+    def test_runtime_execute_validates_output_without_result_slot(self) -> None:
+        from agent_core import (
+            Capability,
+            CapabilityRequest,
+            HealthStatus,
+            PermissionLevel,
+            Result,
+            RiskLevel,
+            TaskStatus,
+        )
+
+        class InvalidOutput(Capability):
+            id = "invalid-output"
+            name = "Invalid output"
+            description = "Returns a payload that violates its declaration."
+            version = "1.0.0"
+            tags = {"test"}
+            permission_level = PermissionLevel.SAFE
+            required_scopes: set[str] = set()
+            risk_level = RiskLevel.LOW
+            side_effects: set = set()
+            input_schema: dict = {}
+            output_schema = {
+                "type": "object",
+                "properties": {"value": {"type": "string"}},
+                "required": ["value"],
+            }
+
+            async def execute(self, request: CapabilityRequest) -> Result:
+                return Result.ok(
+                    {"value": 42},
+                    session_id=request.session_id,
+                    task_id=request.task_id,
+                )
+
+            async def health_check(self) -> HealthStatus:
+                return HealthStatus.HEALTHY
+
+        runtime = CoraxRuntime(cfg.default_config())
+
+        async def go():
+            await runtime.start()
+            runtime.capabilities.register("invalid-output", InvalidOutput())
+            task = await runtime.execute("invalid-output")
+            await runtime.stop()
+            return task
+
+        self.assertEqual(asyncio.run(go()).status, TaskStatus.FAILED)
 
     def test_snapshot_reports_core(self) -> None:
         runtime = CoraxRuntime(cfg.default_config())

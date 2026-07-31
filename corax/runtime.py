@@ -14,6 +14,8 @@ import inspect
 import json
 import logging
 import os
+import textwrap
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -34,11 +36,16 @@ from agent_core import (
 from .capabilities import EchoCapability
 from .config import AgentConfig, ExtensionSpec, validate_config
 from .connectors import TerminalConnector
-from .loader import CoreEngine, ExtensionLoader
+from .loader import ConfirmationRequired, CoreEngine, ExtensionLoader
 from .memory import NullMemory
 from .planner import StubPlanner
 from .registry import ExtensionCatalog
-from .tool_router import TOOL_CALL_ID, TOOL_SEARCH_ID, ToolRoutingHost
+from .tool_router import (
+    OBJECT_RUN_ID,
+    TOOL_CALL_ID,
+    TOOL_SEARCH_ID,
+    ToolRoutingHost,
+)
 
 _BUILTIN_FACTORIES: dict[str, Callable[[], Any]] = {
     "stub": StubPlanner,
@@ -46,6 +53,36 @@ _BUILTIN_FACTORIES: dict[str, Callable[[], Any]] = {
     "terminal": TerminalConnector,
     "echo": EchoCapability,
 }
+
+
+def _object_program(code: str) -> str:
+    body = textwrap.dedent(code).strip()
+    if not body or "\0" in body:
+        raise ValueError("object_run code must be a non-empty Python task body")
+    return (
+        "class _CoraxGroup:\n"
+        "    def __init__(self, env, group):\n"
+        "        self._env = env\n"
+        "        self._group = group\n"
+        "    def __getattr__(self, method):\n"
+        "        if method.startswith('_'):\n"
+        "            raise AttributeError(method)\n"
+        "        async def call(**arguments):\n"
+        "            return await self._env.call(\n"
+        "                self._group + '.' + method, arguments\n"
+        "            )\n"
+        "        return call\n"
+        "class _CoraxFacade:\n"
+        "    def __init__(self, env):\n"
+        "        self._env = env\n"
+        "    def __getattr__(self, group):\n"
+        "        if group.startswith('_'):\n"
+        "            raise AttributeError(group)\n"
+        "        return _CoraxGroup(self._env, group)\n"
+        "async def main(env):\n"
+        "    self = _CoraxFacade(env)\n"
+        f"{textwrap.indent(body, '    ')}\n"
+    )
 
 _TEMPORAL_CONTEXT_HEADER = "Trusted Corax runtime context for this model request:"
 _CONTEXT_DEFAULT_OUTPUT_TOKENS = 4_096
@@ -176,7 +213,7 @@ class CoraxRuntime:
         *,
         root_path: str | Path | None = None,
         workspace_path: str | Path | None = None,
-        core_version: str = "0.2.0",
+        core_version: str = "0.2.1",
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.config = config
@@ -233,6 +270,7 @@ class CoraxRuntime:
         self._prompt_provider_messages: dict[
             tuple[str, str, str], list[dict[str, Any]]
         ] = {}
+        self._object_continuations: dict[str, dict[str, Any]] = {}
 
     async def start(self) -> None:
         if self._running:
@@ -307,6 +345,7 @@ class CoraxRuntime:
         self._prompt_turn_inputs.clear()
         self._prompt_turn_metadata.clear()
         self._prompt_provider_messages.clear()
+        self._object_continuations.clear()
         self._mcp_tool_ids.clear()
         self._running = False
         self._started_at = None
@@ -422,6 +461,7 @@ class CoraxRuntime:
             self.tools,
             policy=self.active_policy(),
             observability=self.active_observability(),
+            result_transform=self.compact_tool_result,
         ) as kernel:
             return await kernel.run_task(
                 required_capability=required_capability,
@@ -479,6 +519,14 @@ class CoraxRuntime:
             return self.services.get(service_id)
         return None
 
+    def active_object_runtime(self) -> Any | None:
+        """Return the selected host-side object and task workspace service."""
+
+        service_id = self.config.extensions.bindings.get("object_runtime", "")
+        if service_id and self.services.has(service_id):
+            return self.services.get(service_id)
+        return None
+
     def active_prompt_runtime(self) -> Any | None:
         """Return the selected layered prompt assembly service."""
 
@@ -531,6 +579,47 @@ class CoraxRuntime:
         if service_id and self.services.has(service_id):
             return self.services.get(service_id)
         return None
+
+    def object_execution_available(self, channel: str) -> bool:
+        """Enable generated Python only with the bounded Docker backend."""
+
+        sandbox = self.active_sandbox_executor()
+        objects = self.active_object_runtime()
+        prompts = self.active_prompt_runtime()
+        sandbox_status = (
+            sandbox.status()
+            if sandbox is not None and callable(getattr(sandbox, "status", None))
+            else {}
+        )
+        try:
+            object_ready = bool(
+                objects is not None
+                and callable(getattr(objects, "ready", None))
+                and objects.ready()
+            )
+        except Exception:  # noqa: BLE001 - readiness must fail closed
+            object_ready = False
+        facade_budget = getattr(prompts, "object_facade_max_chars", None)
+        try:
+            prompt_ready = bool(
+                prompts is not None
+                and callable(facade_budget)
+                and int(facade_budget())
+                >= self.tool_routing.object_facade_min_chars()
+            )
+        except Exception:  # noqa: BLE001 - readiness must fail closed
+            prompt_ready = False
+        return bool(
+            self.config.runtime.execution_mode == "object"
+            and channel in {"console", "tui"}
+            and prompt_ready
+            and objects is not None
+            and self.active_state_store() is not None
+            and object_ready
+            and sandbox is not None
+            and sandbox_status.get("python_production_ready")
+            and callable(getattr(sandbox, "execute_python", None))
+        )
 
     def active_model_router(self) -> Any | None:
         """Return the provider-agnostic model router when loaded."""
@@ -782,6 +871,7 @@ class CoraxRuntime:
             ]
 
         inputs = {
+            "task_goal": user_text,
             "runtime_context": self._runtime_prompt_context(),
             "recalled_records": list(recalled.get("records") or []),
             "recalled_memory": str(recalled.get("context") or ""),
@@ -1382,6 +1472,15 @@ class CoraxRuntime:
         self._prompt_turn_inputs.pop(key, None)
         self._prompt_turn_metadata.pop(key, None)
         self._prompt_provider_messages.pop(key, None)
+        self._object_continuations = {
+            task_id: continuation
+            for task_id, continuation in self._object_continuations.items()
+            if not (
+                continuation["session_id"] == session_id
+                and continuation["channel"] == channel
+                and continuation["turn_id"] == resolved_turn_id
+            )
+        }
         self.tool_routing.end_turn(session_id=session_id, channel=channel)
         return {
             "aborted": bool(resolved_turn_id),
@@ -1471,6 +1570,27 @@ class CoraxRuntime:
                         self.tools.register(proxy.id, proxy)
             except Exception as exc:  # noqa: BLE001 - optional integration
                 self.log.warning("failed wiring subagents: %s", exc)
+        objects = self.active_object_runtime()
+        if objects is not None:
+            try:
+                if hasattr(objects, "bind"):
+                    objects.bind(
+                        self.active_state_store(),
+                        data_root=os.getenv(
+                            "CORAX_OBJECT_PATH",
+                            str(self.data_path / "objects"),
+                        ),
+                    )
+                if hasattr(objects, "tool_proxies"):
+                    for proxy in objects.tool_proxies():
+                        if self.extensions.has(proxy.id):
+                            self.log.warning(
+                                "object tool id collision: %s", proxy.id
+                            )
+                            continue
+                        self.tools.register(proxy.id, proxy)
+            except Exception as exc:  # noqa: BLE001 - optional integration
+                self.log.warning("failed wiring object runtime: %s", exc)
         sandbox = self.active_sandbox_executor()
         if self.tools.has("shell") and hasattr(
             self.tools.get("shell"), "bind_executor"
@@ -1583,25 +1703,56 @@ class CoraxRuntime:
             data["tool_choice"] = "auto"
             return data
 
-        descriptors = self.tool_routing.active_descriptors(
-            session_id=session_id,
-            turn_id=turn_id,
-            channel=channel,
-        )
-        data["_corax_prompt_context"] = {
+        prompt_context = {
             "channel": channel,
             "session_id": session_id,
             "turn_id": turn_id,
             "user_text": hinted_text or self._last_user_text(data),
             "tool_failure": tool_failure,
-            "tool_descriptors": descriptors,
             "recent_files": (
                 [str(path)[:1024] for path in recent_files[:20]]
                 if isinstance(recent_files, list)
                 else []
             ),
         }
-        data["tools"] = self.tool_routing.model_schemas()
+        if self.object_execution_available(channel):
+            facade_budget = getattr(
+                prompt_runtime,
+                "object_facade_max_chars",
+                None,
+            )
+            facade, _ = self.tool_routing.object_facade(
+                session_id=session_id,
+                turn_id=turn_id,
+                channel=channel,
+                max_chars=(
+                    facade_budget()
+                    if callable(facade_budget)
+                    else 16_000
+                ),
+                publish=True,
+            )
+            prompt_context.update(
+                {
+                    "execution_mode": "object",
+                    "object_facade": facade,
+                    "tool_descriptors": [],
+                }
+            )
+            data["tools"] = self.tool_routing.object_model_schema()
+        else:
+            prompt_context.update(
+                {
+                    "execution_mode": "legacy",
+                    "tool_descriptors": self.tool_routing.active_descriptors(
+                        session_id=session_id,
+                        turn_id=turn_id,
+                        channel=channel,
+                    ),
+                }
+            )
+            data["tools"] = self.tool_routing.model_schemas()
+        data["_corax_prompt_context"] = prompt_context
         data["tool_choice"] = "auto"
         return data
 
@@ -1615,11 +1766,23 @@ class CoraxRuntime:
         turn_id: str,
         channel: str,
         policy_metadata: dict[str, str] | None = None,
+        event_sink: Any | None = None,
+        preserve_object_marker: bool = False,
     ) -> dict[str, Any]:
         """Validate one routed model tool call, then cross the core boundary."""
 
         data = dict(payload)
         target = extension_id
+        if extension_id == OBJECT_RUN_ID:
+            return await self.execute_object_code(
+                data,
+                kernel=kernel,
+                session_id=session_id,
+                turn_id=turn_id,
+                channel=channel,
+                policy_metadata=policy_metadata,
+                event_sink=event_sink,
+            )
         if extension_id == TOOL_CALL_ID:
             unknown = set(data) - {"capability", "input"}
             if unknown:
@@ -1645,20 +1808,739 @@ class CoraxRuntime:
             channel=channel,
         )
         if target == TOOL_SEARCH_ID:
-            return await self.search_tools(
-                data,
+            return self._without_object_marker(await self.compact_tool_result(
+                await self.search_tools(
+                    data,
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    channel=channel,
+                ),
                 session_id=session_id,
-                turn_id=turn_id,
-                channel=channel,
-            )
+            ))
         if not self.tools.has(target):
             raise KeyError(f"unknown tool: {target}")
-        return await kernel.invoke(
+        result = await kernel.invoke(
             target,
             data,
             session_id=session_id,
             policy_metadata=policy_metadata,
         )
+        return (
+            result
+            if preserve_object_marker
+            else self._without_object_marker(result)
+        )
+
+    async def execute_object_code(
+        self,
+        payload: dict[str, Any],
+        *,
+        kernel: Any,
+        session_id: str,
+        turn_id: str,
+        channel: str,
+        policy_metadata: dict[str, str] | None = None,
+        event_sink: Any | None = None,
+        _replay: list[dict[str, Any]] | None = None,
+        _attempt: int | None = None,
+    ) -> dict[str, Any]:
+        """Run one model-written task body in the isolated Python backend."""
+
+        if not self.object_execution_available(channel):
+            raise PermissionError(
+                "object execution requires the production Docker runner"
+            )
+        if set(payload) != {"code"} or not isinstance(payload.get("code"), str):
+            raise ValueError("object_run requires only a string code field")
+        code = payload["code"]
+        if len(code.encode("utf-8")) > 32_000:
+            raise ValueError("object_run code exceeds 32000 bytes")
+        objects = self.active_object_runtime()
+        sandbox = self.active_sandbox_executor()
+        if objects is None or sandbox is None:
+            raise RuntimeError("object execution services are unavailable")
+
+        task_id = "object_" + hashlib.sha256(
+            f"{channel}\0{session_id}\0{turn_id}".encode("utf-8")
+        ).hexdigest()[:32]
+        if _attempt is None:
+            task_goal = str(
+                self._prompt_turn_inputs.get(
+                    (channel, session_id, turn_id),
+                    {},
+                ).get("task_goal")
+                or f"Complete Corax turn {turn_id}"
+            )
+            try:
+                await objects.create_workspace(
+                    session_id=session_id,
+                    goal=task_goal,
+                    task_id=task_id,
+                )
+            except ValueError as exc:
+                if str(exc) != "task workspace already exists":
+                    raise
+        workspace = await objects.get_workspace(task_id, session_id=session_id)
+        remaining = workspace.budget.remaining()
+        if (
+            (_attempt is None and int(remaining["model_calls"]) < 1)
+            or int(remaining["python_executions"]) < 1
+            or float(remaining["wall_time_seconds"]) <= 0
+        ):
+            raise RuntimeError("object task budget is exhausted")
+        attempt = (
+            int(workspace.facts.get("attempts", 0)) + 1
+            if _attempt is None
+            else _attempt
+        )
+        usage = {"python_executions": 1}
+        if _attempt is None:
+            usage["model_calls"] = 1
+        await objects.update_workspace(
+            task_id,
+            session_id=session_id,
+            patch={
+                "status": "running",
+                "facts": {"attempts": attempt},
+                "usage": usage,
+            },
+        )
+
+        records = list(_replay or ())
+        call_index = 0
+        pending_call: dict[str, Any] | None = None
+        unavailable_outputs = 0
+
+        async def call(method: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            nonlocal call_index, pending_call, unavailable_outputs
+            call_index += 1
+            if call_index <= len(records):
+                recorded = records[call_index - 1]
+                if (
+                    recorded.get("method") != method
+                    or recorded.get("arguments") != arguments
+                ):
+                    raise RuntimeError("object continuation replay diverged")
+                replayed = dict(recorded["result"])
+                if replayed.get("output_unavailable") is True:
+                    unavailable_outputs += 1
+                return replayed
+            capability, tool_input = self.tool_routing.resolve_object_method(
+                method,
+                arguments,
+                session_id=session_id,
+                turn_id=turn_id,
+                channel=channel,
+            )
+            await objects.update_workspace(
+                task_id,
+                session_id=session_id,
+                patch={"usage": {"tool_calls": 1}},
+            )
+            event = {
+                "type": "tool_started",
+                "name": capability,
+                "call_id": f"object-{call_index}",
+            }
+            await self._emit_runtime_event(event_sink, event)
+            started = time.monotonic()
+            try:
+                result = await self.invoke_turn_tool(
+                    capability,
+                    tool_input,
+                    kernel=kernel,
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    channel=channel,
+                    policy_metadata=policy_metadata,
+                    preserve_object_marker=True,
+                )
+            except Exception as exc:
+                waiting = isinstance(getattr(exc, "task_id", None), str)
+                if waiting:
+                    pending_call = {
+                        "method": method,
+                        "arguments": dict(arguments),
+                        "capability": capability,
+                        "call_index": call_index,
+                        "approval": (
+                            dict(getattr(exc, "approval", {}))
+                            if isinstance(getattr(exc, "approval", None), dict)
+                            else {}
+                        ),
+                    }
+                else:
+                    await self._emit_runtime_event(
+                        event_sink,
+                        {
+                            "type": "tool_finished",
+                            "name": capability,
+                            "call_id": f"object-{call_index}",
+                            "ok": False,
+                        },
+                    )
+                raise
+            await self._remove_released_workspace_object(
+                objects,
+                task_id=task_id,
+                session_id=session_id,
+                capability=capability,
+                result=result,
+            )
+            result = await self._retain_workspace_result(
+                objects,
+                task_id=task_id,
+                session_id=session_id,
+                name=f"attempt_{attempt}_tool_{call_index}",
+                value=result,
+            )
+            if result.get("output_unavailable") is True:
+                unavailable_outputs += 1
+            records.append(
+                {
+                    "method": method,
+                    "arguments": dict(arguments),
+                    "result": dict(result),
+                }
+            )
+            await self._emit_runtime_event(
+                event_sink,
+                {
+                    "type": "tool_finished",
+                    "name": capability,
+                    "call_id": f"object-{call_index}",
+                    "ok": not self._tool_payload_failed(result),
+                    "duration_ms": max(
+                        0,
+                        round((time.monotonic() - started) * 1000),
+                    ),
+                },
+            )
+            return result
+
+        workspace = await objects.get_workspace(task_id, session_id=session_id)
+        remaining = workspace.budget.remaining()
+        remaining_calls = int(remaining["tool_calls"])
+        remaining_time = float(remaining["wall_time_seconds"])
+        if remaining_time <= 0:
+            raise RuntimeError("object task budget is exhausted")
+        started = time.monotonic()
+        try:
+            result = await sandbox.execute_python(
+                _object_program(code),
+                tool_handler=call,
+                timeout=min(
+                    float(self.config.limits.task_timeout_seconds),
+                    remaining_time,
+                    600.0,
+                ),
+                max_calls=max(1, min(100, len(records) + remaining_calls)),
+            )
+        except Exception as exc:
+            elapsed = max(0.0, time.monotonic() - started)
+            await objects.update_workspace(
+                task_id,
+                session_id=session_id,
+                patch={
+                    "status": "failed",
+                    "failures": [
+                        {
+                            "attempt": attempt,
+                            "type": type(exc).__name__[:128],
+                        }
+                    ],
+                    "usage": {
+                        "wall_time_seconds": min(elapsed, remaining_time),
+                    },
+                },
+            )
+            raise
+        elapsed = max(0.0, time.monotonic() - started)
+        if result.get("approval_required"):
+            approval_task_id = result.get("task_id")
+            if (
+                not isinstance(approval_task_id, str)
+                or pending_call is None
+                or pending_call["capability"] != result.get("capability_id")
+            ):
+                raise RuntimeError("object runner returned an invalid approval")
+            await objects.update_workspace(
+                task_id,
+                session_id=session_id,
+                patch={
+                    "usage": {
+                        "wall_time_seconds": min(elapsed, remaining_time),
+                    },
+                },
+            )
+            self._object_continuations[approval_task_id] = {
+                "code": code,
+                "session_id": session_id,
+                "turn_id": turn_id,
+                "channel": channel,
+                "policy_metadata": dict(policy_metadata or {}),
+                "records": records,
+                "pending_call": pending_call,
+                "attempt": attempt,
+            }
+            raise ConfirmationRequired(
+                approval_task_id,
+                pending_call["capability"],
+                approval=pending_call["approval"],
+            )
+        result["task_id"] = task_id
+        bounded = await self.compact_tool_result(
+            result,
+            session_id=session_id,
+        )
+        bounded = await self._retain_workspace_result(
+            objects,
+            task_id=task_id,
+            session_id=session_id,
+            name=f"attempt_{attempt}_result",
+            value=bounded,
+        )
+        retained = not bool(bounded.get("output_unavailable"))
+        succeeded = bool(result.get("ok")) and retained and not unavailable_outputs
+        patch: dict[str, Any] = {
+            "status": "completed" if succeeded else "failed",
+            "facts": {
+                "runner_calls": int(result.get("calls", 0)),
+                "result_retained": retained,
+                "unavailable_tool_outputs": unavailable_outputs,
+            },
+            "usage": {
+                "wall_time_seconds": min(elapsed, remaining_time),
+            },
+        }
+        if succeeded:
+            patch["resolve_failures"] = True
+        else:
+            raw_error = result.get("error")
+            error_type = (
+                "tool_output_unavailable"
+                if unavailable_outputs
+                else raw_error.get("type", "runner_error")
+                if isinstance(raw_error, dict)
+                else (
+                    "result_unavailable"
+                    if not retained
+                    else "runner_error"
+                )
+            )
+            patch["failures"] = [
+                {
+                    "attempt": attempt,
+                    "type": str(error_type)[:128]
+                }
+            ]
+        await objects.update_workspace(
+            task_id,
+            session_id=session_id,
+            patch=patch,
+        )
+        report = await objects.verify_workspace(
+            task_id,
+            session_id=session_id,
+        )
+        bounded["verification"] = report.to_dict()
+        bounded["integrity_verified"] = report.integrity_passed
+        bounded["verified"] = report.goal_verified
+        if unavailable_outputs:
+            if bounded.get("ok") is True:
+                bounded["execution_ok"] = True
+            bounded["ok"] = False
+            bounded["status"] = "tool_output_unavailable"
+            bounded["retry_safe"] = False
+        if not report.integrity_passed:
+            if bounded.get("ok") is True:
+                bounded["execution_ok"] = True
+            bounded["ok"] = False
+            bounded["status"] = "verification_failed"
+            bounded["retry_safe"] = False
+        return bounded
+
+    async def resolve_confirmation(
+        self,
+        kernel: Any,
+        task_id: str,
+        resolution: str,
+        *,
+        actor: str,
+        transport: str,
+    ) -> dict[str, Any]:
+        """Resolve Core approval with the pending object task's byte budget."""
+
+        result = await kernel.resolve_confirmation(
+            task_id,
+            resolution=resolution,
+            actor=actor,
+            transport=transport,
+        )
+        if task_id not in self._object_continuations:
+            inner = result.get("result")
+            if isinstance(inner, dict):
+                result = {
+                    **result,
+                    "result": self._without_object_marker(inner),
+                }
+        return result
+
+    async def resume_object_confirmation(
+        self,
+        task_id: str,
+        resolution_result: dict[str, Any],
+        *,
+        kernel: Any,
+        event_sink: Any | None = None,
+    ) -> dict[str, Any]:
+        """Resume a one-shot object program by replaying only cached tool results."""
+
+        continuation = self._object_continuations.pop(task_id, None)
+        if continuation is None:
+            return resolution_result
+        objects = self.active_object_runtime()
+        if objects is None:
+            raise RuntimeError("object runtime is unavailable")
+        session_id = continuation["session_id"]
+        turn_id = continuation["turn_id"]
+        channel = continuation["channel"]
+        attempt = int(continuation["attempt"])
+        workspace_id = "object_" + hashlib.sha256(
+            f"{channel}\0{session_id}\0{turn_id}".encode("utf-8")
+        ).hexdigest()[:32]
+        pending = continuation["pending_call"]
+        approved = (
+            str(resolution_result.get("resolution", "")).startswith("allow_")
+            and resolution_result.get("status") == "completed"
+        )
+        if not approved:
+            await objects.update_workspace(
+                workspace_id,
+                session_id=session_id,
+                patch={
+                    "status": "failed",
+                    "failures": [
+                        {
+                            "attempt": attempt,
+                            "type": "approval_denied",
+                        }
+                    ],
+                },
+            )
+            await self._emit_runtime_event(
+                event_sink,
+                {
+                    "type": "tool_finished",
+                    "name": pending["capability"],
+                    "call_id": f"object-{pending['call_index']}",
+                    "ok": False,
+                },
+            )
+            return resolution_result
+
+        inner_result = resolution_result.get("result")
+        if not isinstance(inner_result, dict):
+            inner_result = self._unavailable_tool_output(
+                {},
+                "approved tool returned no result",
+            )
+        await self._remove_released_workspace_object(
+            objects,
+            task_id=workspace_id,
+            session_id=session_id,
+            capability=pending["capability"],
+            result=inner_result,
+        )
+        inner_result = await self._retain_workspace_result(
+            objects,
+            task_id=workspace_id,
+            session_id=session_id,
+            name=f"attempt_{attempt}_tool_{pending['call_index']}",
+            value=inner_result,
+        )
+        records = list(continuation["records"])
+        records.append(
+            {
+                "method": pending["method"],
+                "arguments": dict(pending["arguments"]),
+                "result": dict(inner_result),
+            }
+        )
+        await self._emit_runtime_event(
+            event_sink,
+            {
+                "type": "tool_finished",
+                "name": pending["capability"],
+                "call_id": f"object-{pending['call_index']}",
+                "ok": not self._tool_payload_failed(inner_result),
+            },
+        )
+        try:
+            final = await self.execute_object_code(
+                {"code": continuation["code"]},
+                kernel=kernel,
+                session_id=session_id,
+                turn_id=turn_id,
+                channel=channel,
+                policy_metadata=continuation["policy_metadata"],
+                event_sink=event_sink,
+                _replay=records,
+                _attempt=attempt,
+            )
+        except ConfirmationRequired as exc:
+            return {
+                **resolution_result,
+                "status": "waiting_confirmation",
+                "result": None,
+                "message": "object task needs another approval",
+                "next_approval": {
+                    "task_id": exc.task_id,
+                    "capability": exc.capability_id,
+                    "approval": dict(exc.approval),
+                    "choices": list(exc.choices),
+                },
+            }
+        except Exception as exc:  # noqa: BLE001 - return failure to parked outer call
+            return {
+                **resolution_result,
+                "ok": False,
+                "status": "failed",
+                "result": {
+                    "ok": False,
+                    "error": f"{type(exc).__name__}: {exc}",
+                },
+                "message": "object task failed after approval",
+            }
+        return {
+            **resolution_result,
+            "ok": True,
+            "status": "completed",
+            "result": final,
+            "message": "object task resumed after approval",
+        }
+
+    async def _remove_released_workspace_object(
+        self,
+        objects: Any,
+        *,
+        task_id: str,
+        session_id: str,
+        capability: str,
+        result: dict[str, Any],
+    ) -> None:
+        if capability != "objects.release" or result.get("released") is not True:
+            return
+        released_ref = result.get("object_ref")
+        workspace = await objects.get_workspace(task_id, session_id=session_id)
+        remove = [
+            name
+            for name, ref in workspace.objects.items()
+            if ref.id == released_ref
+        ]
+        if remove:
+            await objects.update_workspace(
+                task_id,
+                session_id=session_id,
+                patch={"remove_objects": remove},
+            )
+
+    async def _retain_workspace_result(
+        self,
+        objects: Any,
+        *,
+        task_id: str,
+        session_id: str,
+        name: str,
+        value: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Charge one new object reference or withhold it without retrying work."""
+
+        created = value.get("_corax_new_object") is True
+        value = {
+            key: item
+            for key, item in value.items()
+            if key != "_corax_new_object"
+        }
+        object_ref = value.get("object_ref")
+        size_bytes = value.get("size_bytes")
+        if not (
+            isinstance(object_ref, str)
+            and isinstance(value.get("type"), str)
+            and isinstance(value.get("preview"), str)
+            and isinstance(size_bytes, int)
+            and not isinstance(size_bytes, bool)
+        ):
+            return value
+        workspace = await objects.get_workspace(task_id, session_id=session_id)
+        if any(ref.id == object_ref for ref in workspace.objects.values()):
+            return value
+        remaining = int(workspace.budget.remaining()["object_bytes"])
+        if (
+            isinstance(size_bytes, bool)
+            or not isinstance(size_bytes, int)
+            or size_bytes < 0
+            or size_bytes > remaining
+        ):
+            if created:
+                await self._discard_created_object(
+                    objects,
+                    object_ref=object_ref,
+                    session_id=session_id,
+                )
+            return self._unavailable_tool_output(
+                value,
+                "task object budget is exhausted",
+                size_bytes=size_bytes if isinstance(size_bytes, int) else None,
+            )
+        try:
+            await objects.update_workspace(
+                task_id,
+                session_id=session_id,
+                patch={
+                    "objects": {name: value},
+                    "usage": {"object_bytes": size_bytes},
+                },
+            )
+        except Exception:  # noqa: BLE001 - never invite replay of side effects
+            if created:
+                await self._discard_created_object(
+                    objects,
+                    object_ref=object_ref,
+                    session_id=session_id,
+                )
+            return self._unavailable_tool_output(
+                value,
+                "tool result could not be attached to the task",
+                size_bytes=size_bytes,
+            )
+        return value
+
+    async def _discard_created_object(
+        self,
+        objects: Any,
+        *,
+        object_ref: str,
+        session_id: str,
+    ) -> None:
+        try:
+            released = objects.release(object_ref, session_id=session_id)
+            if inspect.isawaitable(released):
+                await released
+        except Exception as exc:  # noqa: BLE001 - quota cleanup is best effort
+            self.log.warning("failed discarding unattached object: %s", exc)
+
+    async def _emit_runtime_event(
+        self,
+        sink: Any | None,
+        event: dict[str, Any],
+    ) -> None:
+        if not callable(sink):
+            return
+        try:
+            emitted = sink(event)
+            if inspect.isawaitable(emitted):
+                await emitted
+        except Exception as exc:  # noqa: BLE001 - presentation is fail-soft
+            self.log.debug("runtime event sink failed: %s", exc)
+
+    @staticmethod
+    def _tool_payload_failed(value: Any) -> bool:
+        return bool(
+            isinstance(value, dict)
+            and (
+                value.get("ok") is False
+                or value.get("success") is False
+                or value.get("output_unavailable") is True
+                or any(
+                    value.get(key)
+                    for key in ("error", "_error", "errors", "exception")
+                )
+                or str(value.get("status", "")).lower()
+                in {"failed", "error", "denied"}
+            )
+        )
+
+    async def compact_tool_result(
+        self,
+        value: dict[str, Any],
+        *,
+        session_id: str,
+    ) -> dict[str, Any]:
+        """Keep large tool payloads host-side and return a bounded model view."""
+
+        objects = self.active_object_runtime()
+        compact = getattr(objects, "compact_result", None)
+        if not callable(compact):
+            return value
+        try:
+            result = compact(value, session_id=session_id)
+            if inspect.isawaitable(result):
+                result = await result
+        except Exception as exc:  # noqa: BLE001 - optimization remains fail-soft
+            self.log.warning("tool result objectification failed: %s", exc)
+            try:
+                encoded = json.dumps(
+                    value,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ).encode("utf-8")
+            except (TypeError, ValueError, RecursionError):
+                return self._unavailable_tool_output(
+                    value,
+                    "tool result could not be represented safely",
+                )
+            if len(encoded) > int(getattr(objects, "inline_bytes", 0)):
+                return self._unavailable_tool_output(
+                    value,
+                    "tool result could not be stored safely",
+                    size_bytes=len(encoded),
+                )
+            return value
+        return result if isinstance(result, dict) else value
+
+    @staticmethod
+    def _without_object_marker(value: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: item
+            for key, item in value.items()
+            if key != "_corax_new_object"
+        }
+
+    @staticmethod
+    def _unavailable_tool_output(
+        value: Any,
+        message: str,
+        *,
+        size_bytes: int | None = None,
+    ) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "ok": False,
+            "status": "error",
+            "output_unavailable": True,
+            "externalization_error": message,
+            "retry_safe": False,
+        }
+        if isinstance(value, dict):
+            if value.get("ok") is True or value.get("success") is True:
+                result["execution_ok"] = True
+            for key in ("exit_code", "changed"):
+                item = value.get(key)
+                if isinstance(item, (str, int, float, bool)) and len(str(item)) <= 512:
+                    result[key] = item
+            failure_fields = [
+                key
+                for key in ("error", "_error", "errors", "exception")
+                if value.get(key)
+            ]
+            if failure_fields:
+                result.setdefault("status", "error")
+                result["error"] = "tool reported an error; output is unavailable"
+                result["source_error_fields"] = failure_fields
+        if size_bytes is not None:
+            result["size_bytes"] = size_bytes
+        return result
 
     async def search_tools(
         self,
@@ -2186,6 +3068,10 @@ class CoraxRuntime:
         self._set_default_environment(
             "CORAX_STATE_PATH",
             str(self.data_path / "state"),
+        )
+        self._set_default_environment(
+            "CORAX_OBJECT_PATH",
+            str(self.data_path / "objects"),
         )
 
     def _apply_security_environment(self) -> None:

@@ -7,6 +7,7 @@ agent:
 runtime:
   autostart: false
   log_level: INFO
+  execution_mode: object
   workspace_path: ./workspace
   data_path: ./data
   logs_path: ./logs
@@ -35,6 +36,7 @@ extensions:
       - gateway
       - prompts.runtime
       - memory.loop
+      - object.runtime
       - context.manager
       - mcp.manager
       - skills.runtime
@@ -54,6 +56,7 @@ extensions:
     policy: security.policy
     state: state.file
     prompts: prompts.runtime
+    object_runtime: object.runtime
     context: context.manager
     mcp: mcp.manager
     skills: skills.runtime
@@ -90,6 +93,11 @@ extensions:
       enabled: true
       description: "Layered Markdown prompt assembly"
       path: ../corax-prompt-runtime
+    object.runtime:
+      kind: runtime_service
+      enabled: true
+      description: "Session-scoped object references and task workspaces"
+      path: ../corax-object-runtime
     context.manager:
       kind: runtime_service
       enabled: true

@@ -19,7 +19,7 @@ defaults to `corax.yaml` (or `corax.json` when PyYAML is absent).
 | Section        | Key fields                                                                 |
 |----------------|----------------------------------------------------------------------------|
 | `agent`        | `name`, `profile`, `mode`, `first_run`                                      |
-| `runtime`      | `autostart`, `log_level`, `workspace_path`, `data_path`, `logs_path`        |
+| `runtime`      | `autostart`, `execution_mode`, `log_level`, `workspace_path`, `data_path`, `logs_path` |
 | `extensions`   | `active{kind: ids[]}`, `bindings{role:id}`, `available{id:spec}`              |
 | `security`     | `mode` (initial policy mode), `blocked_paths[]`                              |
 | `limits`       | `max_parallel_tasks`, `max_plan_tasks`, `max_tasks_per_correlation`, `task_timeout_seconds`, `max_payload_mb` |
@@ -41,6 +41,26 @@ file. No LLM reranker is used.
 operator overrides and `USER.md` / `MEMORY.md` live under the configured
 runtime/data roots. `corax prompts validate` checks required UTF-8 layers and
 budgets without printing private content.
+
+`runtime.execution_mode` accepts `object` (default) or `legacy`. Object mode is
+effective only for console/TUI when its prompt runtime, state binding, object
+store, and Docker Python runner are healthy; otherwise Corax uses the legacy
+tool loop. `corax doctor` reports this gate.
+
+`object.runtime` is enabled and bound as a host-only runtime service. JSON tool
+results larger than `CORAX_OBJECT_INLINE_BYTES` (default `3000`) are stored
+under `CORAX_OBJECT_PATH` and represented in model history by a bounded
+session-owned reference. `CORAX_OBJECT_MAX_BYTES` limits one object,
+`CORAX_OBJECT_STORE_MAX_BYTES` limits the store,
+`CORAX_OBJECT_TTL_SECONDS` controls expiry, and
+`CORAX_OBJECT_PREVIEW_CHARS` bounds redacted previews. Task workspaces use the
+selected `state` binding. The runner uses only an already installed Docker
+image named by `CORAX_SANDBOX_DOCKER_IMAGE`; Corax resolves it to a digest and
+never pulls it implicitly.
+
+Set standard Docker `DOCKER_HOST=ssh://user@host` to run the isolated Python
+container on a Docker daemon reachable directly over the LAN. No Docker TCP
+API or host bind mount is required.
 
 Tool extensions may add an optional `routing` object to `extension.json`.
 Useful fields are `title`, `summary`, `domains`, `tags`, `intents`,

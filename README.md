@@ -4,7 +4,7 @@
 
 Corax is a local-first agent runtime with an inline terminal interface,
 typed extensions, persistent sessions, optional long-term memory, Telegram
-access, and a policy-enforced execution kernel.
+access, object-backed tool results, and a policy-enforced execution kernel.
 
 The project is intentionally split across small repositories. `agent-core`
 remains the universal execution kernel; Corax composes it with tools, model and
@@ -26,7 +26,8 @@ Current runtime requirements:
 - Python 3.12 or newer;
 - Git;
 - an OpenAI-compatible model endpoint;
-- Docker, or macOS Seatbelt, when the shell tool is enabled.
+- Docker with a preloaded runner image for object execution;
+- Docker or macOS Seatbelt when only the shell tool is enabled.
 
 Telegram, SearXNG, MCP servers, and durable memory services are optional.
 
@@ -48,6 +49,13 @@ python3 -m corax_distribution --prefix ~/.corax
 # Configure and verify the agent.
 ~/.corax/bin/corax setup
 ~/.corax/bin/corax doctor
+```
+
+Object execution never pulls a container image implicitly. Start Docker and
+preload the reviewed default once:
+
+```bash
+docker pull python:3.13-slim
 ```
 
 The installed configuration is stored at `~/.corax/runtime/corax.yaml`.
@@ -172,16 +180,48 @@ calls automatically, while `full` still respects immutable denials and
 sandbox boundaries.
 
 The complete tool registry and full schemas stay in the host. Before each user
-turn Corax ranks compact tool metadata with the local Nemotron embedding model
-at `192.168.0.10:8080`. The provider always sees the same two native schemas,
-`tool_search` and `tool_call`; selected real schemas are appended as bounded
-turn data. This keeps vLLM's prefix cache stable across ordinary new queries.
-Console, TUI, and Telegram share this path. Routing makes no generation-LLM
-call. Policy metadata is filtered separately and never dilutes the semantic
-index. A low-confidence embedding match is accepted only when exact lexical
-evidence corroborates it; an embedding outage uses the same narrow fallback.
-`tool.search` can activate additional tools within the same turn, while Agent
-Core still validates the selected real capability and policy before execution.
+turn Corax ranks compact capability metadata with the local Nemotron embedding
+model at `192.168.0.10:8080`. In the default object mode, console and TUI expose
+one stable native tool, `object_run(code)`, plus a compact Python facade such as
+`self.files.read(...)`, `self.web.search(...)`, and
+`self.objects.search(...)`. Capability IDs, full schemas, policy metadata, and
+execution remain host-side. New methods are appended to the current turn
+without rewriting the cached prompt prefix.
+
+Generated Python runs once in a fresh non-root Docker container pinned to an
+already installed image digest. The runner has no host bind mounts or network,
+uses bounded tmpfs storage, CPU, memory, process, call, output, and wall-time
+limits, and is destroyed after the attempt. Every facade call crosses the
+runner RPC boundary and then follows the unchanged chain:
+
+```text
+Python facade → TurnToolSet → Agent Core → policy/approval → sandbox → tool
+```
+
+An approval stops that runner. After `/approve`, Corax executes the parked Core
+task once and starts a clean runner that deterministically replays only cached
+successful results before continuing. This supports multiple approvals without
+repeating completed side effects.
+
+Large JSON tool results never enter conversation history. `object.runtime`
+stores values above 3,000 bytes as session-owned objects and returns only an
+opaque `object_ref`, type, byte size, and redacted preview. Policy-gated
+`objects.inspect`, `objects.slice`, `objects.search`, and `objects.release`
+provide bounded metadata, byte-fitted paging, literal host-side text search,
+and deletion. Task workspaces persist the goal, plan, facts, decisions,
+artifacts, failures, object references, and remaining model/tool/Python/time/
+byte budgets through `state.file`. A deterministic integrity check covers
+retained results, references, failures, plans, and budgets. It does not claim
+the user's semantic goal was achieved: `goal_verified` remains false until a
+goal-specific verifier exists.
+
+Object mode is offered only when the prompt runtime, object store, state
+provider, and production Docker runner are all healthy. `corax doctor` reports
+the effective readiness. If that boundary is unavailable—or for Telegram—the
+fixed `tool_search` → `tool_call` ReAct loop remains the compatibility and
+recovery path. A direct model answer remains available when no capability is
+needed. Neither path gives the model direct access to tools, memory, channels,
+or host state.
 
 Telegram document delivery is currently host-controlled. The direct
 `telegram_send_document` pseudo-tool is deliberately absent from the model
@@ -367,6 +407,11 @@ Common secret and integration variables:
 | `CORAX_HOOKS_JSON` | Lifecycle hook definitions. |
 | `CORAX_HOOK_APPROVALS_JSON` | Approved hook fingerprints. |
 | `CORAX_SANDBOX_BACKEND` | `auto`, `seatbelt`, or `docker`. |
+| `DOCKER_HOST` | Optional Docker transport, for example `ssh://alex1257@192.168.0.14`. |
+| `CORAX_OBJECT_PATH` | Optional host-side object-store root. |
+| `CORAX_OBJECT_INLINE_BYTES` | Maximum JSON result size kept inline; default `3000`. |
+| `CORAX_OBJECT_MAX_BYTES` | Maximum size of one stored JSON object. |
+| `CORAX_OBJECT_PREVIEW_CHARS` | Maximum redacted preview length. |
 | `CORAX_COLOR` | Terminal color policy: `auto`, `always`, or `never`. |
 | `NO_COLOR` | Disable terminal color when `CORAX_COLOR` is not explicit. |
 
@@ -386,7 +431,8 @@ flowchart LR
     Core --> Policy["Policy checkpoint"]
     Policy --> Tool["Typed tool"]
     Tool --> Sandbox["Tool boundary or OS sandbox"]
-    Tool --> Core
+    Tool --> Objects["Session-scoped Object Store"]
+    Objects -->|"bounded ref / preview"| Core
     Core --> Model
     Model --> Channel
 ```
@@ -455,6 +501,7 @@ Memory, state, and context:
 | [`universal-agent-memory`](https://github.com/Alex12571333/universal-agent-memory) | Durable self-hosted memory backend and typed Corax adapter. |
 | [`mnemonic-vault`](https://github.com/Alex12571333/mnemonic-vault) | File-first backend with a lossless provider-owned Corax loop. |
 | [`corax-state-store`](https://github.com/Alex12571333/corax-state-store) | Atomic local checkpoints. |
+| [`corax-object-runtime`](https://github.com/Alex12571333/corax-object-runtime) | Session-scoped object references, durable task workspaces, budgets, and deterministic integrity checks. |
 | [`corax-context-manager`](https://github.com/Alex12571333/corax-context-manager) | Deterministic compaction driven by the discovered model window with provider-calibrated reporting. |
 | [`corax-prompt-runtime`](https://github.com/Alex12571333/corax-prompt-runtime) | Layered Markdown prompt assembly, validation, hot reload, and cache-stable RAM replay. |
 
