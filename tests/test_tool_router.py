@@ -629,6 +629,122 @@ class ToolRoutingTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
+    async def test_generated_facade_respects_signature_and_char_budgets(self):
+        host = ToolRoutingHost(
+            ToolRoutingConfig(dimension=3),
+            client=FakeEmbeddings(),
+        )
+        plugin = _tool(
+            "mcp.long.describe",
+            summary="Long MCP schema",
+            intents=["long schema"],
+            examples=["long schema"],
+            output_schema={
+                "type": "object",
+                "properties": {
+                    f"result_{index}_{'y' * 48}": {"type": "string"}
+                    for index in range(8)
+                },
+            },
+        )
+        plugin.input_schema = {
+            "type": "object",
+            "properties": {
+                f"argument_{index}_{'x' * 48}": {"type": "string"}
+                for index in range(5)
+            },
+            "required": [
+                f"argument_{index}_{'x' * 48}"
+                for index in range(5)
+            ],
+        }
+        host.sync([("mcp.long.describe", plugin)])
+        turn = await host.begin_turn(
+            "long schema",
+            session_id="long-facade",
+            turn_id="long-facade-1",
+            channel="console",
+        )
+        turn.activate(
+            ["mcp.long.describe"],
+            host.schemas,
+            max_tools=4,
+            max_schema_bytes=20_000,
+        )
+        facade, mapping = host.object_facade(
+            session_id="long-facade",
+            turn_id="long-facade-1",
+            channel="console",
+            max_chars=600,
+        )
+
+        self.assertTrue(all(len(item) <= 512 for items in facade.values() for item in items))
+        rendered = [
+            f"async self.{group}.{signature}"
+            for group, signatures in sorted(facade.items())
+            for signature in signatures
+        ]
+        self.assertLessEqual(len("\n".join(rendered)), 600)
+        self.assertEqual(set(mapping), {
+            "tools.search",
+            *(
+                key
+                for key, descriptor in mapping.items()
+                if descriptor["capability"] == "mcp.long.describe"
+            ),
+        })
+
+    async def test_generated_facade_respects_group_and_method_caps(self):
+        host = ToolRoutingHost(
+            ToolRoutingConfig(dimension=3),
+            client=FakeEmbeddings(),
+        )
+        plugins = []
+        for server in range(20):
+            capability_id = f"mcp.server{server}.action"
+            plugin = _tool(
+                capability_id,
+                summary=f"Server {server}",
+                intents=[f"server {server}"],
+                examples=[f"server {server}"],
+            )
+            plugin.input_schema = {
+                "type": "object",
+                "properties": {
+                    "operation": {
+                        "type": "string",
+                        "enum": [f"op{index}" for index in range(32)],
+                    },
+                },
+                "required": ["operation"],
+            }
+            plugins.append((capability_id, plugin))
+        host.sync(plugins)
+        turn = await host.begin_turn(
+            "server 0",
+            session_id="facade-caps",
+            turn_id="facade-caps-1",
+            channel="console",
+        )
+        turn.activate(
+            [capability_id for capability_id, _ in plugins],
+            host.schemas,
+            max_tools=64,
+            max_schema_bytes=1_000_000,
+        )
+
+        facade, mapping = host.object_facade(
+            session_id="facade-caps",
+            turn_id="facade-caps-1",
+            channel="console",
+            max_chars=100_000,
+        )
+
+        self.assertLessEqual(len(facade), 16)
+        self.assertLessEqual(max(map(len, facade.values())), 32)
+        self.assertEqual(sum(map(len, facade.values())), 128)
+        self.assertEqual(len(mapping), 128)
+
     async def test_search_expands_monotonically_and_returns_activated_schemas(self):
         host = _host()
         await host.begin_turn(

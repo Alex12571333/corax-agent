@@ -1705,10 +1705,20 @@ class CoraxRuntime:
             ),
         }
         if self.object_execution_available(channel):
+            facade_budget = getattr(
+                prompt_runtime,
+                "object_facade_max_chars",
+                None,
+            )
             facade, _ = self.tool_routing.object_facade(
                 session_id=session_id,
                 turn_id=turn_id,
                 channel=channel,
+                max_chars=(
+                    facade_budget()
+                    if callable(facade_budget)
+                    else 16_000
+                ),
             )
             prompt_context.update(
                 {

@@ -153,6 +153,11 @@ _PYTHON_TYPES = {
 }
 _MAX_FACADE_OUTPUT_FIELDS = 12
 _MAX_FACADE_OUTPUT_CHARS = 224
+_MAX_OBJECT_FACADE_GROUPS = 16
+_MAX_OBJECT_FACADE_METHODS = 128
+_MAX_OBJECT_FACADE_METHODS_PER_GROUP = 32
+_MAX_OBJECT_SIGNATURE_CHARS = 512
+_DEFAULT_OBJECT_FACADE_CHARS = 16_000
 _RESERVED_OBJECT_METHODS = frozenset({"tools.search"})
 
 
@@ -244,10 +249,15 @@ def _python_type(value: Any) -> str:
     )
 
 
-def _output_contract(value: Any) -> str:
+def _output_contract(value: Any, *, max_chars: int) -> str:
     """Render only bounded field names/types, never the full output schema."""
 
-    if not isinstance(value, Mapping):
+    prefix = "  # keys: "
+    budget = min(
+        max_chars,
+        len(prefix) + _MAX_FACADE_OUTPUT_CHARS + len(", ..."),
+    )
+    if not isinstance(value, Mapping) or budget <= 0:
         return ""
     properties = value.get("properties")
     if not isinstance(properties, Mapping):
@@ -268,17 +278,23 @@ def _output_contract(value: Any) -> str:
             f"{json.dumps(name)}{'' if name in required else '?'}: "
             f"{_python_type(schema)}"
         )
-        candidate = ", ".join((*fields, field))
-        if (
-            len(fields) >= _MAX_FACADE_OUTPUT_FIELDS
-            or len(candidate) > _MAX_FACADE_OUTPUT_CHARS
-        ):
+        if len(fields) >= _MAX_FACADE_OUTPUT_FIELDS:
             omitted = True
             break
         fields.append(field)
     if not fields:
         return ""
-    return "  # keys: " + ", ".join(fields) + (", ..." if omitted else "")
+    while fields:
+        contract = (
+            prefix
+            + ", ".join(fields)
+            + (", ..." if omitted else "")
+        )
+        if len(contract) <= budget:
+            return contract
+        fields.pop()
+        omitted = True
+    return ""
 
 
 def _argument_aliases(
@@ -990,19 +1006,25 @@ class ToolRoutingHost:
         session_id: str,
         turn_id: str,
         channel: str,
+        max_chars: int = _DEFAULT_OBJECT_FACADE_CHARS,
     ) -> tuple[dict[str, list[str]], dict[str, dict[str, Any]]]:
         """Build bounded Python signatures plus a host-only method map."""
 
         turn = self._turn(session_id=session_id, channel=channel)
         if turn.turn_id != turn_id:
             return {}, {}
+        max_chars = max(0, int(max_chars))
+        search_signature = (
+            "search(query: str, top_k: int | None) -> dict"
+            "  # fields: activated: list, active_count: int, "
+            "catalog_version: str, found: bool, matches: list, "
+            "message: str, ok: bool"
+        )
+        search_rendered = f"async self.tools.{search_signature}"
+        if len(search_rendered) > max_chars:
+            return {}, {}
         facade: dict[str, list[str]] = {
-            "tools": [
-                "search(query: str, top_k: int | None) -> dict"
-                "  # fields: activated: list, active_count: int, "
-                "catalog_version: str, found: bool, matches: list, "
-                "message: str, ok: bool"
-            ]
+            "tools": [search_signature]
         }
         methods: dict[str, dict[str, Any]] = {
             "tools.search": {
@@ -1012,6 +1034,8 @@ class ToolRoutingHost:
                 "required": ["query"],
             }
         }
+        method_count = 1
+        rendered_chars = len(search_rendered)
         for capability_id in sorted(turn.active_ids):
             if capability_id == TOOL_SEARCH_ID or not self.schemas.has(capability_id):
                 continue
@@ -1067,10 +1091,38 @@ class ToolRoutingHost:
                     f"{name}: {_python_type(properties.get(arguments[name]))} | None"
                     for name in optional_args
                 )
-                facade.setdefault(group, []).append(
+                declaration = (
                     f"{method}({', '.join(signature_parts)}) -> dict"
-                    + _output_contract(spec.get("output_schema"))
                 )
+                if len(declaration) > _MAX_OBJECT_SIGNATURE_CHARS:
+                    continue
+                signature = (
+                    declaration
+                    + _output_contract(
+                        spec.get("output_schema"),
+                        max_chars=_MAX_OBJECT_SIGNATURE_CHARS - len(declaration),
+                    )
+                )
+                group_methods = facade.get(group)
+                if (
+                    method_count >= _MAX_OBJECT_FACADE_METHODS
+                    or (
+                        group_methods is None
+                        and len(facade) >= _MAX_OBJECT_FACADE_GROUPS
+                    )
+                    or (
+                        group_methods is not None
+                        and len(group_methods) >= _MAX_OBJECT_FACADE_METHODS_PER_GROUP
+                    )
+                ):
+                    continue
+                rendered = f"async self.{group}.{signature}"
+                added_chars = len(rendered) + (1 if method_count else 0)
+                if rendered_chars + added_chars > max_chars:
+                    continue
+                facade.setdefault(group, []).append(signature)
+                method_count += 1
+                rendered_chars += added_chars
                 methods[key] = {
                     "capability": capability_id,
                     "inject": inject,
