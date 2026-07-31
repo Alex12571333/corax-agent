@@ -513,6 +513,14 @@ async def _run_doctor(app: "CoraxApp") -> int:
     runtime = app.runtime
     config_errors = config_mod.validate_config(app.config)
     model_id = runtime.active_generation_model_id()
+    sandbox = runtime.active_sandbox_executor()
+    sandbox_status = (
+        sandbox.status()
+        if sandbox is not None and callable(getattr(sandbox, "status", None))
+        else {}
+    )
+    object_requested = app.config.runtime.execution_mode == "object"
+    object_ready = runtime.object_execution_available("console")
     checks = [
         ("config", not config_errors, "; ".join(config_errors) or "valid"),
         (
@@ -532,8 +540,21 @@ async def _run_doctor(app: "CoraxApp") -> int:
         ),
         (
             "sandbox",
-            runtime.active_sandbox_executor() is not None,
+            sandbox is not None,
             app.config.extensions.bindings.get("sandbox", "not configured"),
+        ),
+        (
+            "object execution",
+            not object_requested or object_ready,
+            (
+                f"ready via {sandbox_status.get('python_backend', 'unknown')}"
+                if object_ready
+                else (
+                    "legacy selected"
+                    if not object_requested
+                    else "inactive: start Docker and preload the configured image"
+                )
+            ),
         ),
         (
             "state",
@@ -713,6 +734,7 @@ async def _run_console_chat(
         runtime.tools,
         policy=runtime.active_policy(),
         observability=runtime.active_observability(),
+        result_transform=runtime.compact_tool_result,
     ) as kernel:
         chat: Any | None = None
 
@@ -763,6 +785,7 @@ async def _run_console_chat(
                 turn_id=turn_id,
                 channel=local_channel,
                 policy_metadata=policy_metadata,
+                event_sink=getattr(chat, "emit_runtime_event", None),
             )
 
         async def status_control(_command: str) -> dict:
@@ -779,11 +802,18 @@ async def _run_console_chat(
                         "ok": False,
                         "message": resolution,
                     }
-                return await kernel.resolve_confirmation(
+                resolved = await runtime.resolve_confirmation(
+                    kernel,
                     task_id,
-                    resolution=resolution,
+                    resolution,
                     actor="local-console",
                     transport="local",
+                )
+                return await runtime.resume_object_confirmation(
+                    task_id,
+                    resolved,
+                    kernel=kernel,
+                    event_sink=getattr(chat, "emit_runtime_event", None),
                 )
             return await runtime.security_control(
                 command,
@@ -1012,6 +1042,7 @@ async def _run_chat(app: "CoraxApp", config_path: Path) -> int:
             runtime.tools,
             policy=runtime.active_policy(),
             observability=runtime.active_observability(),
+            result_transform=runtime.compact_tool_result,
         ) as kernel:
             async def invoke_component(
                 extension_id: str,
@@ -1124,9 +1155,10 @@ async def _run_chat(app: "CoraxApp", config_path: Path) -> int:
                             "message": resolution,
                             "mode": runtime.security_mode(),
                         }
-                    return await kernel.resolve_confirmation(
+                    return await runtime.resolve_confirmation(
+                        kernel,
                         task_id,
-                        resolution=resolution,
+                        resolution,
                         actor=actor,
                         transport=transport,
                     )

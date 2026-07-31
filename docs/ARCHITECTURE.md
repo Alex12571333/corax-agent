@@ -152,9 +152,11 @@ cards; removed tools disappear from the catalog and the live Agent Core
 registry.
 At each user turn the host filters blocked/channel-incompatible tools, embeds
 the request with `Nemotron-3-Embed-1B` on the configured `.10:8080` endpoint,
-and creates a bounded `TurnToolSet`. The set's schemas enter the turn envelope,
-while the provider's top-level tool list is the fixed `tool_search` +
-`tool_call` pair. Console, TUI, and Telegram use the same runtime method.
+and creates a bounded `TurnToolSet`. Object mode maps that set to stable,
+collision-safe Python facade methods and exposes only `object_run(code)` at the
+provider tool boundary. Legacy mode exposes the fixed `tool_search` +
+`tool_call` pair and appends only the selected schemas. Telegram currently uses
+that compatibility path.
 
 Routing never calls a generation LLM. If embeddings are unavailable, a small
 deterministic lexical fallback may select matching tools, but failure never
@@ -162,6 +164,55 @@ reveals the full catalog. The host-managed `tool.search` meta-tool can add
 matches and their bounded schemas to the current turn. `tool.call` unwraps the
 chosen id only in the host. Agent Core remains the execution boundary and
 rejects calls to tools outside the active turn before policy and execution.
+
+## Object-backed results and task state
+
+`object.runtime` is a host-only `runtime_service`; it is not a new extension
+kind and is never directly model-callable. After a real tool crosses Agent
+Core, policy, schema validation, and audit, JSON results above the inline
+threshold are stored under an opaque session-owned handle. Conversation
+history receives only the result's control fields, type, byte size, redacted
+preview, and `object_ref`.
+
+The service registers `objects.inspect`, `objects.slice`, `objects.search`, and
+`objects.release` as real `ToolCapability` proxies. They therefore re-enter
+Agent Core and policy. Reads enforce session ownership; nested reads use a
+strict RFC 6901 JSON Pointer rather than expressions, reflection, or `eval`.
+Text paging is byte-fitted below the inline result threshold, while literal
+search selects relevant excerpts host-side. The object store uses atomic
+`0600` files below a `0700` directory. Task workspaces and budgets reuse the
+selected `StorageProvider`; large objects do not enter checkpoint storage.
+
+## Object execution
+
+Console and TUI use object execution only when `object.runtime`, its bound
+state provider, the prompt runtime, and the production Python sandbox all
+report ready. Otherwise the host fails closed to the legacy tool loop. The
+model returns an async task body to `object_run`; Corax launches it in a fresh
+Docker container pinned to a locally installed image ID. The container is
+non-root, networkless, read-only, has no host bind mounts, and is bounded by
+tmpfs, memory, CPU, process, call, output, and wall-time limits.
+
+The child receives a tiny JSON RPC facade. Each method resolves through the
+current `TurnToolSet`, then invokes the existing Agent Core kernel. Policy,
+approval leases, schema validation, capability sandboxing, audit, and result
+externalization therefore remain unchanged. The child never holds real tool
+objects or host credentials.
+
+An approval terminates the one-shot child. Corax retains prior successful
+results host-side, resolves the parked Core task once, and restarts the same
+program with deterministic replay records. Divergent replay aborts. This
+supports sequential approvals without repeating already completed side
+effects.
+
+Each logical turn owns a durable `TaskWorkspace` containing goal, plan, facts,
+artifacts, decisions, failures, object refs, and a `TaskBudget`. Model calls,
+tool calls, Python attempts, elapsed time, and retained object bytes are
+charged before use. A deterministic integrity check rejects structurally
+incomplete workspaces when the result was not retained, references are
+missing, failures remain unresolved, the plan is incomplete, or a budget is
+exceeded. It does not verify semantic goal completion; `goal_verified` remains
+false pending a goal-specific verifier.
 
 `skills.runtime` implements progressive disclosure for portable Agent Skills.
 It reads metadata from bounded, trusted roots and injects only selected

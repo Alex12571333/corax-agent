@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta, timezone
+import hashlib
 import io
 import logging
 import os
@@ -30,6 +31,7 @@ except ImportError:  # pragma: no cover
 from corax import config as cfg
 from corax.capabilities import EchoCapability
 from corax.connectors import TerminalConnector
+from corax.loader import ConfirmationRequired
 from corax.memory import NullMemory
 from corax.planner import StubPlanner
 from corax.runtime import CoraxRuntime
@@ -44,6 +46,7 @@ CAPABILITY_ROOTS = {
     "gateway": REPO_ROOT.parent / "corax-gateway-capability",
     "security.policy": REPO_ROOT.parent / "corax-security-policy",
     "prompts.runtime": REPO_ROOT.parent / "corax-prompt-runtime",
+    "object.runtime": REPO_ROOT.parent / "corax-object-runtime",
     "memory.loop": REPO_ROOT.parent / "corax-memory-loop",
     "console.connector": REPO_ROOT.parent / "corax-console",
     "state.file": REPO_ROOT.parent / "corax-state-store",
@@ -65,6 +68,55 @@ class TestRuntime(unittest.TestCase):
 
     def tearDown(self) -> None:
         asyncio.run(self.runtime.stop())
+
+    def test_object_execution_fails_closed_without_bound_state(self) -> None:
+        self.assertEqual(self.runtime.core_version, "0.2.1")
+        objects = SimpleNamespace(
+            ready=lambda: True,
+        )
+        sandbox = SimpleNamespace(
+            status=lambda: {"python_production_ready": True},
+            execute_python=lambda: None,
+        )
+        with (
+            mock.patch.object(
+                self.runtime,
+                "active_prompt_runtime",
+                return_value=object(),
+            ),
+            mock.patch.object(
+                self.runtime,
+                "active_object_runtime",
+                return_value=objects,
+            ),
+            mock.patch.object(
+                self.runtime,
+                "active_sandbox_executor",
+                return_value=sandbox,
+            ),
+            mock.patch.object(
+                self.runtime,
+                "active_state_store",
+                return_value=object(),
+            ) as state_store,
+        ):
+            self.assertTrue(self.runtime.object_execution_available("console"))
+            state_store.return_value = None
+            self.assertFalse(self.runtime.object_execution_available("console"))
+            state_store.return_value = object()
+            objects.ready = lambda: False
+            self.assertFalse(self.runtime.object_execution_available("console"))
+
+    def test_unavailable_tool_output_is_not_retry_safe(self) -> None:
+        result = self.runtime._unavailable_tool_output(
+            {"ok": True, "changed": True},
+            "store failed",
+            size_bytes=4_000,
+        )
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["execution_ok"])
+        self.assertFalse(result["retry_safe"])
+        self.assertTrue(self.runtime._tool_payload_failed(result))
 
     def test_model_tool_prefix_is_fixed_and_selected_schemas_are_context(self) -> None:
         class OfflineEmbeddings:
@@ -134,6 +186,706 @@ class TestRuntime(unittest.TestCase):
             [item["function"]["name"] for item in prepared["tools"]],
         )
         self.assertNotIn("_corax_prompt_context", prepared)
+
+    def test_large_tool_results_use_the_bound_object_runtime(self) -> None:
+        service = SimpleNamespace(
+            compact_result=lambda value, *, session_id: {
+                "object_ref": "obj_" + "a" * 32,
+                "type": "object",
+                "preview": value["text"][:8],
+                "size_bytes": len(value["text"]),
+                "session": session_id,
+            }
+        )
+        with mock.patch.object(
+            self.runtime,
+            "active_object_runtime",
+            return_value=service,
+        ):
+            result = asyncio.run(
+                self.runtime.compact_tool_result(
+                    {"text": "x" * 9_000},
+                    session_id="session-1",
+                )
+            )
+        self.assertEqual(result["object_ref"], "obj_" + "a" * 32)
+        self.assertEqual(result["session"], "session-1")
+
+    def test_turn_tool_returns_the_core_result_without_reprocessing(self) -> None:
+        class Kernel:
+            async def invoke(self, *_args, **_kwargs):
+                return {"text": "x" * 9_000}
+
+        class OfflineEmbeddings:
+            async def embed(self, _texts, *, input_type):
+                raise OSError("offline")
+
+        async def run() -> None:
+            self.runtime.tools.register("echo", EchoCapability())
+            self.runtime.sync_tool_catalog()
+            self.runtime.tool_routing.router.client = OfflineEmbeddings()
+            await self.runtime.tool_routing.begin_turn(
+                "echo this",
+                session_id="session-1",
+                turn_id="turn-1",
+                channel="console",
+            )
+            service = SimpleNamespace(compact_result=mock.Mock())
+            with mock.patch.object(
+                self.runtime,
+                "active_object_runtime",
+                return_value=service,
+            ):
+                result = await self.runtime.invoke_turn_tool(
+                    "echo",
+                    {"text": "x" * 9_000},
+                    kernel=Kernel(),
+                    session_id="session-1",
+                    turn_id="turn-1",
+                    channel="console",
+                )
+            self.assertEqual(result, {"text": "x" * 9_000})
+            service.compact_result.assert_not_called()
+
+        asyncio.run(run())
+
+    @unittest.skipUnless(HAS_AGENT_CORE and HAS_AGENT_SDK, "agent runtime unavailable")
+    def test_object_slice_proxy_crosses_core_with_a_valid_output_shape(self) -> None:
+        if not all(
+            CAPABILITY_ROOTS[name].is_dir()
+            for name in ("object.runtime", "state.file")
+        ):
+            self.skipTest("object runtime repositories are unavailable")
+
+        async def run(root: Path) -> None:
+            config = cfg.default_config()
+            config.extensions.active = {
+                "tool": ["echo"],
+                "runtime_service": ["object.runtime"],
+                "storage_provider": ["state.file"],
+            }
+            config.extensions.bindings = {
+                "object_runtime": "object.runtime",
+                "state": "state.file",
+            }
+            for name in ("object.runtime", "state.file"):
+                config.extensions.available[name].path = str(CAPABILITY_ROOTS[name])
+            workspace = root / "workspace"
+            workspace.mkdir()
+            runtime = CoraxRuntime(
+                config,
+                root_path=root,
+                workspace_path=workspace,
+            )
+            environment = mock.patch.dict(
+                os.environ,
+                {
+                    "CORAX_STATE_PATH": str(root / "state"),
+                    "CORAX_OBJECT_PATH": str(root / "objects"),
+                },
+            )
+            environment.start()
+            await runtime.start()
+            try:
+                await runtime.tool_routing.begin_turn(
+                    "echo and inspect the referenced result",
+                    session_id="session-1",
+                    turn_id="turn-1",
+                    channel="console",
+                )
+                async with runtime.core.session(
+                    runtime.tools,
+                    result_transform=runtime.compact_tool_result,
+                ) as kernel:
+                    compact = await runtime.invoke_turn_tool(
+                        "echo",
+                        {"results": list(range(2_000))},
+                        kernel=kernel,
+                        session_id="session-1",
+                        turn_id="turn-1",
+                        channel="console",
+                    )
+                    self.assertRegex(
+                        compact["object_ref"],
+                        r"^obj_[0-9a-f]{32}$",
+                    )
+                    result = await runtime.invoke_turn_tool(
+                        "objects.slice",
+                        {
+                            "object_ref": compact["object_ref"],
+                            "pointer": "/results",
+                            "start": 10,
+                            "limit": 2,
+                        },
+                        kernel=kernel,
+                        session_id="session-1",
+                        turn_id="turn-1",
+                        channel="console",
+                    )
+                    text = await runtime.invoke_turn_tool(
+                        "echo",
+                        {"content": "x" * 5_000 + "Needle"},
+                        kernel=kernel,
+                        session_id="session-1",
+                        turn_id="turn-1",
+                        channel="console",
+                    )
+                    searched = await runtime.invoke_turn_tool(
+                        "objects.search",
+                        {
+                            "object_ref": text["object_ref"],
+                            "pointer": "/content",
+                            "query": "needle",
+                        },
+                        kernel=kernel,
+                        session_id="session-1",
+                        turn_id="turn-1",
+                        channel="console",
+                    )
+                self.assertEqual(
+                    result,
+                    {
+                        "value": [10, 11],
+                        "start": 10,
+                        "next_start": 12,
+                        "total": 2_000,
+                        "truncated": True,
+                    },
+                )
+                self.assertIn("Needle", searched["matches"][0]["text"])
+            finally:
+                await runtime.stop()
+                environment.stop()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            asyncio.run(run(Path(tmp)))
+
+    @unittest.skipUnless(HAS_AGENT_CORE and HAS_AGENT_SDK, "agent runtime unavailable")
+    def test_object_program_emits_inner_tools_and_recovers_retry(self) -> None:
+        if not all(
+            CAPABILITY_ROOTS[name].is_dir()
+            for name in ("object.runtime", "state.file")
+        ):
+            self.skipTest("object runtime repositories are unavailable")
+
+        async def run(root: Path) -> None:
+            config = cfg.default_config()
+            config.extensions.active = {
+                "tool": ["echo"],
+                "runtime_service": ["object.runtime"],
+                "storage_provider": ["state.file"],
+            }
+            config.extensions.bindings = {
+                "object_runtime": "object.runtime",
+                "state": "state.file",
+            }
+            for name in ("object.runtime", "state.file"):
+                config.extensions.available[name].path = str(CAPABILITY_ROOTS[name])
+            workspace = root / "workspace"
+            workspace.mkdir()
+            runtime = CoraxRuntime(
+                config,
+                root_path=root,
+                workspace_path=workspace,
+            )
+            environment = mock.patch.dict(
+                os.environ,
+                {
+                    "CORAX_STATE_PATH": str(root / "state"),
+                    "CORAX_OBJECT_PATH": str(root / "objects"),
+                },
+            )
+            environment.start()
+            await runtime.start()
+            try:
+                await runtime.tool_routing.begin_turn(
+                    "echo twice",
+                    session_id="session-1",
+                    turn_id="turn-1",
+                    channel="console",
+                )
+                turn = runtime.tool_routing.current_turn(
+                    session_id="session-1",
+                    channel="console",
+                )
+                turn.activate(
+                    ["echo"],
+                    runtime.tool_routing.schemas,
+                    max_tools=20,
+                    max_schema_bytes=10_000,
+                )
+                events = []
+
+                def broken_event_sink(event):
+                    events.append(event)
+                    if event["type"] == "tool_finished":
+                        raise RuntimeError("renderer failed")
+
+                class Sandbox:
+                    backend = "test"
+                    runs = 0
+
+                    async def execute_python(
+                        self,
+                        _code,
+                        *,
+                        tool_handler,
+                        timeout,
+                        max_calls,
+                    ):
+                        del timeout, max_calls
+                        self.runs += 1
+                        await tool_handler("tools.echo", {})
+                        await tool_handler("tools.echo", {})
+                        if self.runs == 1:
+                            return {
+                                "ok": False,
+                                "calls": 2,
+                                "error": {"type": "FirstAttempt"},
+                            }
+                        return {"ok": True, "calls": 2, "value": {"done": True}}
+
+                sandbox = Sandbox()
+                with (
+                    mock.patch.object(
+                        runtime,
+                        "object_execution_available",
+                        return_value=True,
+                    ),
+                    mock.patch.object(
+                        runtime,
+                        "active_sandbox_executor",
+                        return_value=sandbox,
+                    ),
+                    mock.patch.object(
+                        runtime.tool_routing,
+                        "resolve_object_method",
+                        return_value=("echo", {}),
+                    ),
+                ):
+                    async with runtime.core.session(
+                        runtime.tools,
+                        result_transform=runtime.compact_tool_result,
+                    ) as kernel:
+                        first = await runtime.execute_object_code(
+                            {"code": "return {'done': True}"},
+                            kernel=kernel,
+                            session_id="session-1",
+                            turn_id="turn-1",
+                            channel="console",
+                            event_sink=broken_event_sink,
+                        )
+                        self.assertFalse(
+                            first["verification"]["integrity_passed"]
+                        )
+                        self.assertEqual(
+                            [
+                                event["name"]
+                                for event in events
+                                if event["type"] == "tool_started"
+                            ],
+                            ["echo", "echo"],
+                        )
+                        second = await runtime.execute_object_code(
+                            {"code": "return {'done': True}"},
+                            kernel=kernel,
+                            session_id="session-1",
+                            turn_id="turn-1",
+                            channel="console",
+                            event_sink=broken_event_sink,
+                        )
+                self.assertTrue(second["verification"]["integrity_passed"])
+                self.assertTrue(second["integrity_verified"])
+                self.assertFalse(second["verified"])
+                task = await runtime.active_object_runtime().get_workspace(
+                    second["task_id"],
+                    session_id="session-1",
+                )
+                self.assertTrue(task.failures[0]["resolved"])
+
+                await runtime.tool_routing.begin_turn(
+                    "run three approved steps",
+                    session_id="session-1",
+                    turn_id="turn-2",
+                    channel="console",
+                )
+                turn = runtime.tool_routing.current_turn(
+                    session_id="session-1",
+                    channel="console",
+                )
+                turn.activate(
+                    ["echo"],
+                    runtime.tool_routing.schemas,
+                    max_tools=20,
+                    max_schema_bytes=10_000,
+                )
+
+                class ApprovalKernel:
+                    calls = 0
+
+                    async def invoke(self, *_args, **_kwargs):
+                        self.calls += 1
+                        if self.calls < 3:
+                            raise ConfirmationRequired(
+                                f"approval-{self.calls}",
+                                "echo",
+                                approval={
+                                    "summary": f"step {self.calls}",
+                                    "operation": "echo",
+                                    "resource": f"item-{self.calls}",
+                                    "choices": ["allow_once", "deny_once"],
+                                },
+                            )
+                        return {"ok": True, "step": self.calls}
+
+                class ApprovalSandbox:
+                    limits = []
+
+                    async def execute_python(
+                        self,
+                        _code,
+                        *,
+                        tool_handler,
+                        timeout,
+                        max_calls,
+                    ):
+                        del timeout
+                        self.limits.append(max_calls)
+                        calls = 0
+                        for method in ("tools.one", "tools.two", "tools.three"):
+                            calls += 1
+                            try:
+                                await tool_handler(method, {})
+                            except ConfirmationRequired as exc:
+                                return {
+                                    "ok": False,
+                                    "approval_required": True,
+                                    "task_id": exc.task_id,
+                                    "capability_id": exc.capability_id,
+                                    "approval": {
+                                        "summary": exc.approval["summary"],
+                                        "choices": list(exc.choices),
+                                    },
+                                    "calls": calls,
+                                }
+                        return {"ok": True, "calls": calls, "value": {"done": True}}
+
+                approval_kernel = ApprovalKernel()
+                approval_sandbox = ApprovalSandbox()
+                object_service = runtime.active_object_runtime()
+                original_update = object_service.update_workspace
+                tool_usage = []
+
+                async def tracked_update(task_id, *, session_id, patch):
+                    if (patch.get("usage") or {}).get("tool_calls"):
+                        tool_usage.append(dict(patch["usage"]))
+                    return await original_update(
+                        task_id,
+                        session_id=session_id,
+                        patch=patch,
+                    )
+
+                with (
+                    mock.patch.object(
+                        runtime,
+                        "object_execution_available",
+                        return_value=True,
+                    ),
+                    mock.patch.object(
+                        runtime,
+                        "active_sandbox_executor",
+                        return_value=approval_sandbox,
+                    ),
+                    mock.patch.object(
+                        runtime.tool_routing,
+                        "resolve_object_method",
+                        return_value=("echo", {}),
+                    ),
+                    mock.patch.object(
+                        object_service,
+                        "update_workspace",
+                        side_effect=tracked_update,
+                    ),
+                ):
+                    with self.assertRaises(ConfirmationRequired) as first_wait:
+                        await runtime.execute_object_code(
+                            {"code": "return {'done': True}"},
+                            kernel=approval_kernel,
+                            session_id="session-1",
+                            turn_id="turn-2",
+                            channel="console",
+                        )
+                    self.assertEqual(
+                        first_wait.exception.approval["resource"],
+                        "item-1",
+                    )
+                    next_wait = await runtime.resume_object_confirmation(
+                        "approval-1",
+                        {
+                            "ok": True,
+                            "task_id": "approval-1",
+                            "status": "completed",
+                            "resolution": "allow_once",
+                            "result": {"ok": True, "step": 1},
+                        },
+                        kernel=approval_kernel,
+                    )
+                    self.assertEqual(
+                        next_wait["next_approval"]["task_id"],
+                        "approval-2",
+                    )
+                    final = await runtime.resume_object_confirmation(
+                        "approval-2",
+                        {
+                            "ok": True,
+                            "task_id": "approval-2",
+                            "status": "completed",
+                            "resolution": "allow_once",
+                            "result": {"ok": True, "step": 2},
+                        },
+                        kernel=approval_kernel,
+                    )
+                self.assertTrue(
+                    final["result"]["verification"]["integrity_passed"]
+                )
+                continued = await runtime.active_object_runtime().get_workspace(
+                    final["result"]["task_id"],
+                    session_id="session-1",
+                )
+                self.assertEqual(continued.budget.used_tool_calls, 3)
+                self.assertEqual(tool_usage, [{"tool_calls": 1}] * 3)
+                self.assertEqual(continued.budget.used_python_executions, 3)
+                self.assertEqual(approval_sandbox.limits, [40, 40, 40])
+
+                await runtime.tool_routing.begin_turn(
+                    "release retained object",
+                    session_id="session-1",
+                    turn_id="turn-3",
+                    channel="console",
+                )
+                released = object_service.objects.put(
+                    {"payload": "temporary"},
+                    session_id="session-1",
+                )
+
+                class ReleaseKernel:
+                    async def invoke(self, *_args, **_kwargs):
+                        raise ConfirmationRequired(
+                            "approval-release",
+                            "objects.release",
+                            approval={
+                                "summary": "release object",
+                                "operation": "delete",
+                                "resource": released.id,
+                                "choices": ["allow_once", "deny_once"],
+                            },
+                        )
+
+                class ReleaseSandbox:
+                    async def execute_python(
+                        self,
+                        _code,
+                        *,
+                        tool_handler,
+                        timeout,
+                        max_calls,
+                    ):
+                        del timeout, max_calls
+                        try:
+                            result = await tool_handler(
+                                "objects.release",
+                                {"object_ref": released.id},
+                            )
+                        except ConfirmationRequired as exc:
+                            return {
+                                "ok": False,
+                                "approval_required": True,
+                                "task_id": exc.task_id,
+                                "capability_id": exc.capability_id,
+                            }
+                        return {"ok": True, "calls": 1, "value": result}
+
+                release_kernel = ReleaseKernel()
+                with (
+                    mock.patch.object(
+                        runtime,
+                        "object_execution_available",
+                        return_value=True,
+                    ),
+                    mock.patch.object(
+                        runtime,
+                        "active_sandbox_executor",
+                        return_value=ReleaseSandbox(),
+                    ),
+                    mock.patch.object(
+                        runtime.tool_routing,
+                        "resolve_object_method",
+                        return_value=(
+                            "objects.release",
+                            {"object_ref": released.id},
+                        ),
+                    ),
+                ):
+                    with self.assertRaises(ConfirmationRequired):
+                        await runtime.execute_object_code(
+                            {"code": "return {'done': True}"},
+                            kernel=release_kernel,
+                            session_id="session-1",
+                            turn_id="turn-3",
+                            channel="console",
+                        )
+                    release_workspace = "object_" + hashlib.sha256(
+                        b"console\0session-1\0turn-3"
+                    ).hexdigest()[:32]
+                    await object_service.update_workspace(
+                        release_workspace,
+                        session_id="session-1",
+                        patch={
+                            "objects": {"release_target": released.to_dict()},
+                            "usage": {"object_bytes": released.size_bytes},
+                        },
+                    )
+                    self.assertTrue(
+                        object_service.release(
+                            released.id,
+                            session_id="session-1",
+                        )
+                    )
+                    release_final = await runtime.resume_object_confirmation(
+                        "approval-release",
+                        {
+                            "ok": True,
+                            "task_id": "approval-release",
+                            "status": "completed",
+                            "resolution": "allow_once",
+                            "result": {
+                                "object_ref": released.id,
+                                "released": True,
+                            },
+                        },
+                        kernel=release_kernel,
+                    )
+                self.assertTrue(
+                    release_final["result"]["verification"][
+                        "integrity_passed"
+                    ]
+                )
+                released_workspace = await object_service.get_workspace(
+                    release_workspace,
+                    session_id="session-1",
+                )
+                self.assertEqual(released_workspace.objects, {})
+
+                await runtime.tool_routing.begin_turn(
+                    "return an oversized result",
+                    session_id="session-1",
+                    turn_id="turn-4",
+                    channel="console",
+                )
+                budget_workspace = "object_" + hashlib.sha256(
+                    b"console\0session-1\0turn-4"
+                ).hexdigest()[:32]
+                protected = object_service.objects.put(
+                    {"payload": "must survive"},
+                    session_id="session-1",
+                )
+                forged = {
+                    **protected.envelope(),
+                    "preview": "mismatch",
+                    "size_bytes": 100_000_001,
+                    "_corax_new_object": True,
+                }
+
+                class BudgetSandbox:
+                    tool_result = None
+                    forged_result = None
+
+                    async def execute_python(
+                        self,
+                        _code,
+                        *,
+                        tool_handler,
+                        timeout,
+                        max_calls,
+                    ):
+                        del timeout, max_calls
+                        await object_service.update_workspace(
+                            budget_workspace,
+                            session_id="session-1",
+                            patch={
+                                "usage": {"object_bytes": 100_000_000},
+                            },
+                        )
+                        self.forged_result = await tool_handler(
+                            "tools.forged",
+                            {},
+                        )
+                        self.tool_result = await tool_handler("tools.echo", {})
+                        return {
+                            "ok": True,
+                            "calls": 1,
+                            "value": {"done": True},
+                        }
+
+                budget_sandbox = BudgetSandbox()
+                before_objects = object_service.objects.count()
+                with (
+                    mock.patch.object(
+                        runtime,
+                        "object_execution_available",
+                        return_value=True,
+                    ),
+                    mock.patch.object(
+                        runtime,
+                        "active_sandbox_executor",
+                        return_value=budget_sandbox,
+                    ),
+                    mock.patch.object(
+                        runtime.tool_routing,
+                        "resolve_object_method",
+                        side_effect=lambda method, *_args, **_kwargs: (
+                            ("echo", forged)
+                            if method == "tools.forged"
+                            else ("echo", {"data": "x" * 4_000})
+                        ),
+                    ),
+                ):
+                    async with runtime.core.session(
+                        runtime.tools,
+                        result_transform=runtime.compact_tool_result,
+                    ) as kernel:
+                        budget_result = await runtime.execute_object_code(
+                            {"code": "return {'done': True}"},
+                            kernel=kernel,
+                            session_id="session-1",
+                            turn_id="turn-4",
+                            channel="console",
+                        )
+                self.assertEqual(
+                    object_service.objects.count(),
+                    before_objects,
+                )
+                self.assertEqual(
+                    object_service.get(protected.id, session_id="session-1"),
+                    {"payload": "must survive"},
+                )
+                self.assertTrue(
+                    budget_sandbox.forged_result["output_unavailable"]
+                )
+                self.assertTrue(
+                    budget_sandbox.tool_result["output_unavailable"]
+                )
+                self.assertFalse(budget_sandbox.tool_result["retry_safe"])
+                self.assertFalse(budget_result["ok"])
+                self.assertFalse(
+                    budget_result["verification"]["integrity_passed"]
+                )
+            finally:
+                await runtime.stop()
+                environment.stop()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            asyncio.run(run(Path(tmp)))
 
     def test_new_turn_extends_provider_prefix_without_changing_meta_tools(self) -> None:
         from agent_core import ExtensionKind
@@ -666,6 +1418,13 @@ class TestRuntime(unittest.TestCase):
             if CAPABILITY_ROOTS["prompts.runtime"].is_dir():
                 self.assertTrue(self.runtime.services.has("prompts.runtime"))
                 self.assertIsNotNone(self.runtime.active_prompt_runtime())
+            if CAPABILITY_ROOTS["object.runtime"].is_dir():
+                self.assertTrue(self.runtime.services.has("object.runtime"))
+                self.assertIsNotNone(self.runtime.active_object_runtime())
+                self.assertTrue(self.runtime.tools.has("objects.inspect"))
+                self.assertTrue(self.runtime.tools.has("objects.slice"))
+                self.assertTrue(self.runtime.tools.has("objects.search"))
+                self.assertTrue(self.runtime.tools.has("objects.release"))
             if CAPABILITY_ROOTS["state.file"].is_dir():
                 self.assertTrue(self.runtime.storage.has("state.file"))
                 self.assertIsNotNone(self.runtime.active_state_store())
@@ -699,6 +1458,53 @@ class TestRuntime(unittest.TestCase):
         self.assertFalse(self.runtime.capabilities.has("llm.local"))
         self.assertFalse(self.runtime.capabilities.has("telegram.connector"))
         self.assertFalse(self.runtime.capabilities.has("gateway"))
+
+    @unittest.skipUnless(HAS_AGENT_SDK, "agent-sdk not installed")
+    def test_real_object_facade_exposes_composable_result_fields(self) -> None:
+        required = ("filesystem", "editor", "web.search", "web.fetch")
+        if any(not CAPABILITY_ROOTS[item].is_dir() for item in required):
+            self.skipTest("capability repositories are unavailable")
+
+        async def run() -> dict[str, list[str]]:
+            await self.runtime.start()
+            turn = await self.runtime.tool_routing.begin_turn(
+                "inspect edit and research",
+                session_id="facade-real",
+                turn_id="facade-real-1",
+                channel="console",
+            )
+            turn.activate(
+                required,
+                self.runtime.tool_routing.schemas,
+                max_tools=20,
+                max_schema_bytes=20_000,
+            )
+            facade, _ = self.runtime.tool_routing.object_facade(
+                session_id="facade-real",
+                turn_id="facade-real-1",
+                channel="console",
+            )
+            return facade
+
+        facade = asyncio.run(run())
+        read = next(item for item in facade["files"] if item.startswith("read("))
+        listing = next(item for item in facade["files"] if item.startswith("list("))
+        edit = next(item for item in facade["files"] if item.startswith("replace("))
+        search = next(item for item in facade["web"] if item.startswith("search("))
+        fetch = next(item for item in facade["web"] if item.startswith("fetch("))
+
+        self.assertIn('"content"?: str', read)
+        self.assertIn('"entries"?: list', listing)
+        self.assertIn('"changed": bool', edit)
+        self.assertIn('"diff": str', edit)
+        self.assertIn('"results"?: list', search)
+        for field in (
+            '"title": str',
+            '"text": str',
+            '"source": str',
+            '"truncated": bool',
+        ):
+            self.assertIn(field, fetch)
 
     def test_info_logging_does_not_print_startup_extension_inventory(self) -> None:
         output = io.StringIO()
@@ -737,6 +1543,10 @@ class TestRuntime(unittest.TestCase):
                 "web.search",
                 "web.fetch",
                 "subagents.delegate",
+                "objects.inspect",
+                "objects.slice",
+                "objects.search",
+                "objects.release",
             ],
         )
         self.assertEqual(status.registry_counts["model_provider"], 3)
@@ -746,6 +1556,7 @@ class TestRuntime(unittest.TestCase):
                 "gateway",
                 "prompts.runtime",
                 "memory.loop",
+                "object.runtime",
                 "context.manager",
                 "mcp.manager",
                 "skills.runtime",

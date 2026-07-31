@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "corax-agent"
-version = "0.3.23"
+version = "0.3.24"
 description = "Corax Agent — typed extension runtime with strict tool and infrastructure boundaries."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -12,7 +12,7 @@ license = { text = "MIT" }
 authors = [{ name = "Corax" }]
 keywords = ["agent", "runtime", "cli"]
 dependencies = [
-    "agent-core>=0.2,<0.3",
+    "agent-core>=0.2.1,<0.3",
     "agent-sdk>=0.2,<0.3",
     "corax-ui>=0.2,<0.3",
 ]

@@ -19,7 +19,7 @@ class ExtensionLoader:
         *,
         root_path: str | Path,
         workspace_path: str | Path,
-        core_version: str = "0.2.0",
+        core_version: str = "0.2.1",
         log: logging.Logger | None = None,
     ) -> None:
         self.root_path = Path(root_path)

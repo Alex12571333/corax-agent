@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import keyword
 import logging
 import math
 import os
@@ -18,7 +19,10 @@ from .config import ToolRoutingConfig
 
 TOOL_SEARCH_ID = "tool.search"
 TOOL_CALL_ID = "tool.call"
+OBJECT_RUN_ID = "object.run"
 _SAFE_TOOL_NAME = re.compile(r"[^a-zA-Z0-9_-]")
+_PYTHON_NAME = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_RESULT_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]{0,63}$")
 _WORD_RE = re.compile(r"[^\W_]+", re.UNICODE)
 _TRIVIAL_WORDS = frozenset(
     {
@@ -110,6 +114,47 @@ _CALL_SPEC = {
     },
 }
 
+_OBJECT_RUN_SPEC = {
+    "id": OBJECT_RUN_ID,
+    "model_name": "object_run",
+    "description": (
+        "Execute one bounded async Python task against the available "
+        "Corax object facade."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "code": {
+                "type": "string",
+                "maxLength": 32_000,
+                "description": (
+                    "Body of an async function using self.<group>.<method>"
+                ),
+            }
+        },
+        "required": ["code"],
+        "additionalProperties": False,
+    },
+}
+
+_FACADE_GROUPS = {
+    "filesystem": "files",
+    "editor": "files",
+    "shell": "shell",
+    "subagents": "agents",
+}
+_PYTHON_TYPES = {
+    "string": "str",
+    "integer": "int",
+    "number": "float",
+    "boolean": "bool",
+    "object": "dict",
+    "array": "list",
+}
+_MAX_FACADE_OUTPUT_FIELDS = 12
+_MAX_FACADE_OUTPUT_CHARS = 224
+_RESERVED_OBJECT_METHODS = frozenset({"tools.search"})
+
 
 class EmbeddingError(RuntimeError):
     """The configured embedding service returned an unusable response."""
@@ -138,12 +183,17 @@ def _json_hash(value: Any) -> str:
 def _strings(value: Any) -> tuple[str, ...]:
     if not isinstance(value, (list, tuple, set, frozenset)):
         return ()
+    source = (
+        sorted(value, key=lambda item: str(item))
+        if isinstance(value, (set, frozenset))
+        else value
+    )
     items = tuple(
-        clean
-        for item in value
+        clean[:512]
+        for item in list(source)[:32]
         if isinstance(item, str) and (clean := " ".join(item.split()))
     )
-    return tuple(sorted(items)) if isinstance(value, (set, frozenset)) else items
+    return items
 
 
 def _value(value: Any) -> str:
@@ -159,6 +209,141 @@ def _operations(schema: Mapping[str, Any]) -> tuple[str, ...]:
         return ()
     values = operation.get("enum")
     return _strings(values)
+
+
+def _facade_group(capability_id: str) -> str:
+    parts = capability_id.split(".")
+    head = parts[0]
+    if head == "mcp" and len(parts) > 2:
+        return _python_identifier(f"mcp_{parts[1]}")
+    return _python_identifier(
+        _FACADE_GROUPS.get(head, head if len(parts) > 1 else "tools")
+    )
+
+
+def _facade_method(capability_id: str) -> str:
+    return _python_identifier(
+        capability_id.rsplit(".", 1)[-1]
+        if "." in capability_id
+        else capability_id
+    )
+
+
+def _python_identifier(value: str) -> str:
+    snake = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(value))
+    clean = re.sub(r"[^a-z0-9_]", "_", snake.lower())
+    clean = clean[:64] if clean and clean[0].isalpha() else f"x_{clean[:62]}"
+    return f"{clean[:63]}_" if keyword.iskeyword(clean) else clean
+
+
+def _python_type(value: Any) -> str:
+    return (
+        _PYTHON_TYPES.get(str(value.get("type", "")), "Any")
+        if isinstance(value, Mapping)
+        else "Any"
+    )
+
+
+def _output_contract(value: Any) -> str:
+    """Render only bounded field names/types, never the full output schema."""
+
+    if not isinstance(value, Mapping):
+        return ""
+    properties = value.get("properties")
+    if not isinstance(properties, Mapping):
+        return ""
+    required = {
+        str(name)
+        for name in value.get("required", ())
+        if isinstance(name, str)
+    }
+    fields: list[str] = []
+    omitted = False
+    for name, schema in properties.items():
+        name = str(name)
+        if not _RESULT_KEY.fullmatch(name):
+            omitted = True
+            continue
+        field = (
+            f"{json.dumps(name)}{'' if name in required else '?'}: "
+            f"{_python_type(schema)}"
+        )
+        candidate = ", ".join((*fields, field))
+        if (
+            len(fields) >= _MAX_FACADE_OUTPUT_FIELDS
+            or len(candidate) > _MAX_FACADE_OUTPUT_CHARS
+        ):
+            omitted = True
+            break
+        fields.append(field)
+    if not fields:
+        return ""
+    return "  # keys: " + ", ".join(fields) + (", ..." if omitted else "")
+
+
+def _argument_aliases(
+    properties: Mapping[str, Any],
+    *,
+    hidden: set[str],
+) -> dict[str, str]:
+    aliases: dict[str, str] = {}
+    for raw_name in properties:
+        raw_name = str(raw_name)
+        if raw_name in hidden:
+            continue
+        base = _python_identifier(raw_name)
+        alias = base
+        nonce = 0
+        while alias in aliases:
+            material = raw_name if not nonce else f"{raw_name}\0{nonce}"
+            suffix = hashlib.sha256(material.encode()).hexdigest()[:8]
+            alias = f"{base[:55]}_{suffix}"
+            nonce += 1
+        aliases[alias] = raw_name
+    return aliases
+
+
+def _allocate_object_methods(
+    extension_ids: Iterable[str],
+    schemas: "SchemaStore",
+    *,
+    preferred: Iterable[str] = (),
+) -> dict[str, str]:
+    priority = {extension_id: index for index, extension_id in enumerate(preferred)}
+    buckets: dict[str, list[tuple[str, str]]] = {}
+    for capability_id in sorted(set(extension_ids)):
+        if not schemas.has(capability_id):
+            continue
+        schema = schemas.raw(capability_id).get("input_schema")
+        operations = _operations(schema) if isinstance(schema, Mapping) else ()
+        for raw_method in operations or (_facade_method(capability_id),):
+            base = f"{_facade_group(capability_id)}.{_python_identifier(raw_method)}"
+            buckets.setdefault(base, []).append((capability_id, raw_method))
+    result: dict[str, str] = {}
+    used = set(buckets) | _RESERVED_OBJECT_METHODS
+    for base in sorted(buckets):
+        candidates = buckets[base]
+        group, method = base.split(".", 1)
+        ordered = sorted(
+            candidates,
+            key=lambda item: (priority.get(item[0], len(priority)), item),
+        )
+        for index, (capability_id, raw_method) in enumerate(ordered):
+            alias = base
+            if index or base in _RESERVED_OBJECT_METHODS:
+                nonce = 0
+                while True:
+                    material = f"{capability_id}\0{raw_method}"
+                    if nonce:
+                        material += f"\0{nonce}"
+                    suffix = hashlib.sha256(material.encode()).hexdigest()[:8]
+                    alias = f"{group}.{method[:55]}_{suffix}"
+                    if alias not in used:
+                        break
+                    nonce += 1
+                used.add(alias)
+            result[f"{capability_id}\0{raw_method}"] = alias
+    return result
 
 
 def _model_name(extension_id: str, used: set[str]) -> str:
@@ -203,6 +388,7 @@ class SchemaStore:
         self._names: dict[str, str] = {
             TOOL_SEARCH_ID: "tool_search",
             TOOL_CALL_ID: "tool_call",
+            OBJECT_RUN_ID: "object_run",
         }
 
     def sync(self, tools: Iterable[tuple[str, Any]]) -> None:
@@ -217,9 +403,11 @@ class SchemaStore:
                 "model_name": self._names[extension_id],
                 "description": str(getattr(item, "description", "") or extension_id),
                 "input_schema": dict(getattr(item, "input_schema", {}) or {}),
+                "output_schema": dict(getattr(item, "output_schema", {}) or {}),
             }
         current[TOOL_SEARCH_ID] = dict(_SEARCH_SPEC)
         current[TOOL_CALL_ID] = dict(_CALL_SPEC)
+        current[OBJECT_RUN_ID] = dict(_OBJECT_RUN_SPEC)
         self._specs = current
 
     def raw(self, extension_id: str) -> dict[str, Any]:
@@ -282,12 +470,14 @@ class ToolCatalog:
 
             schema = schemas.raw(extension_id)
             input_schema = schema["input_schema"]
-            title = str(routing.get("title") or getattr(item, "name", "") or extension_id)
+            title = str(
+                routing.get("title") or getattr(item, "name", "") or extension_id
+            )[:128]
             summary = str(
                 routing.get("summary")
                 or getattr(item, "description", "")
                 or extension_id
-            )
+            )[:512]
             intents = _strings(routing.get("intents"))
             examples = _strings(routing.get("examples"))
             anti_examples = _strings(routing.get("anti_examples"))
@@ -305,7 +495,7 @@ class ToolCatalog:
             side_effects = tuple(
                 sorted(_value(effect) for effect in getattr(item, "side_effects", ()))
             )
-            cost_hint = str(routing.get("cost") or "")
+            cost_hint = str(routing.get("cost") or "")[:128]
             routing_text = "\n".join(
                 (
                     f"Tool: {extension_id}",
@@ -623,6 +813,7 @@ class TurnToolSet:
     catalog_version: str
     active_ids: list[str] = field(default_factory=list)
     schema_bytes: int = 0
+    object_methods: dict[str, str] = field(default_factory=dict)
 
     def activate(
         self,
@@ -685,6 +876,9 @@ class ToolRoutingHost:
             self.schemas.openai(TOOL_CALL_ID),
         ]
 
+    def object_model_schema(self) -> list[dict[str, Any]]:
+        return [self.schemas.openai(OBJECT_RUN_ID)]
+
     async def begin_turn(
         self,
         user_text: str,
@@ -723,6 +917,11 @@ class ToolRoutingHost:
             self.schemas,
             max_tools=self.config.max_active_tools,
             max_schema_bytes=self.config.max_schema_bytes,
+        )
+        turn.object_methods = _allocate_object_methods(
+            [record.id for record in visible],
+            self.schemas,
+            preferred=turn.active_ids,
         )
         self._turns[(channel, session_id)] = turn
         self.log.info(
@@ -784,6 +983,149 @@ class ToolRoutingHost:
                 }
             )
         return result
+
+    def object_facade(
+        self,
+        *,
+        session_id: str,
+        turn_id: str,
+        channel: str,
+    ) -> tuple[dict[str, list[str]], dict[str, dict[str, Any]]]:
+        """Build bounded Python signatures plus a host-only method map."""
+
+        turn = self._turn(session_id=session_id, channel=channel)
+        if turn.turn_id != turn_id:
+            return {}, {}
+        facade: dict[str, list[str]] = {
+            "tools": [
+                "search(query: str, top_k: int | None) -> dict"
+                "  # fields: activated: list, active_count: int, "
+                "catalog_version: str, found: bool, matches: list, "
+                "message: str, ok: bool"
+            ]
+        }
+        methods: dict[str, dict[str, Any]] = {
+            "tools.search": {
+                "capability": TOOL_SEARCH_ID,
+                "inject": {},
+                "allowed": ["query", "top_k"],
+                "required": ["query"],
+            }
+        }
+        for capability_id in sorted(turn.active_ids):
+            if capability_id == TOOL_SEARCH_ID or not self.schemas.has(capability_id):
+                continue
+            spec = self.schemas.raw(capability_id)
+            schema = spec.get("input_schema")
+            properties = (
+                schema.get("properties", {})
+                if isinstance(schema, Mapping)
+                else {}
+            )
+            if not isinstance(properties, Mapping):
+                properties = {}
+            required = {
+                str(name)
+                for name in (
+                    schema.get("required", ())
+                    if isinstance(schema, Mapping)
+                    else ()
+                )
+            }
+            operations = _operations(schema) if isinstance(schema, Mapping) else ()
+            group = _facade_group(capability_id)
+            method_names = operations or (_facade_method(capability_id),)
+            for raw_method in method_names:
+                key = turn.object_methods.get(f"{capability_id}\0{raw_method}")
+                if not key:
+                    continue
+                group, method = key.split(".", 1)
+                if not _PYTHON_NAME.fullmatch(group) or not _PYTHON_NAME.fullmatch(method):
+                    continue
+                inject = {"operation": raw_method} if operations else {}
+                hidden = {"state_key"}
+                if operations:
+                    hidden.add("operation")
+                arguments = _argument_aliases(properties, hidden=hidden)
+                required_args = [
+                    alias
+                    for alias, raw_name in arguments.items()
+                    if raw_name in required
+                ]
+                if required - hidden - set(arguments.values()):
+                    continue
+                optional_args = [
+                    alias
+                    for alias in arguments
+                    if alias not in required_args
+                ]
+                signature_parts = [
+                    f"{name}: {_python_type(properties.get(arguments[name]))}"
+                    for name in required_args
+                ]
+                signature_parts.extend(
+                    f"{name}: {_python_type(properties.get(arguments[name]))} | None"
+                    for name in optional_args
+                )
+                facade.setdefault(group, []).append(
+                    f"{method}({', '.join(signature_parts)}) -> dict"
+                    + _output_contract(spec.get("output_schema"))
+                )
+                methods[key] = {
+                    "capability": capability_id,
+                    "inject": inject,
+                    "allowed": sorted(arguments),
+                    "required": required_args,
+                    "arguments": arguments,
+                }
+        return (
+            {group: sorted(signatures) for group, signatures in sorted(facade.items())},
+            methods,
+        )
+
+    def resolve_object_method(
+        self,
+        method: str,
+        arguments: dict[str, Any],
+        *,
+        session_id: str,
+        turn_id: str,
+        channel: str,
+    ) -> tuple[str, dict[str, Any]]:
+        _, methods = self.object_facade(
+            session_id=session_id,
+            turn_id=turn_id,
+            channel=channel,
+        )
+        descriptor = methods.get(method)
+        if descriptor is None:
+            raise KeyError(f"object method is unavailable: {method}")
+        if not isinstance(arguments, dict):
+            raise ValueError("object method arguments must be an object")
+        allowed = set(descriptor["allowed"])
+        unknown = set(arguments) - allowed
+        required = set(descriptor["required"])
+        clean_arguments = {
+            name: value
+            for name, value in arguments.items()
+            if value is not None or name in required
+        }
+        missing = required - set(clean_arguments)
+        if unknown:
+            raise ValueError(
+                "unknown object method arguments: " + ", ".join(sorted(unknown))
+            )
+        if missing:
+            raise ValueError(
+                "missing object method arguments: " + ", ".join(sorted(missing))
+            )
+        return str(descriptor["capability"]), {
+            **descriptor["inject"],
+            **{
+                descriptor.get("arguments", {}).get(name, name): value
+                for name, value in clean_arguments.items()
+            },
+        }
 
     def current_turn(
         self,
@@ -874,15 +1216,6 @@ class ToolRoutingHost:
                 for record, score in ranked
             ],
             "activated": activated,
-            "tools": [
-                descriptor
-                for descriptor in self.active_descriptors(
-                    session_id=session_id,
-                    turn_id=turn_id,
-                    channel=channel,
-                )
-                if descriptor["id"] in {record.id for record, _ in ranked}
-            ],
             "active_count": len(turn.active_ids),
             "catalog_version": turn.catalog_version,
         }

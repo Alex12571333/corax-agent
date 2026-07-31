@@ -61,6 +61,17 @@ class TestValidation(unittest.TestCase):
         errors = cfg.validate_config(config)
         self.assertTrue(any("log_level" in e for e in errors))
 
+    def test_object_execution_is_default_and_mode_is_validated(self) -> None:
+        config = cfg.default_config()
+        self.assertEqual(config.runtime.execution_mode, "object")
+        config.runtime.execution_mode = "unknown"
+        self.assertTrue(
+            any(
+                "runtime.execution_mode" in error
+                for error in cfg.validate_config(config)
+            )
+        )
+
     def test_missing_active_planner_flagged(self) -> None:
         config = cfg.default_config()
         config.extensions.bindings["planner"] = "ghost"
@@ -239,6 +250,37 @@ class TestGatewayConfig(unittest.TestCase):
         self.assertEqual(
             config.extensions.available["gateway"].path,
             "../corax-gateway-capability",
+        )
+
+
+class TestObjectRuntimeConfig(unittest.TestCase):
+    def test_default_and_old_configs_activate_object_runtime(self) -> None:
+        config = cfg.default_config()
+        self.assertEqual(
+            config.extensions.bindings["object_runtime"],
+            "object.runtime",
+        )
+        self.assertIn(
+            "object.runtime",
+            config.extensions.active["runtime_service"],
+        )
+        self.assertEqual(
+            config.extensions.available["object.runtime"].path,
+            "../corax-object-runtime",
+        )
+
+        data = config.to_dict()
+        data["extensions"]["available"].pop("object.runtime")
+        data["extensions"]["active"]["runtime_service"].remove("object.runtime")
+        data["extensions"]["bindings"].pop("object_runtime")
+        upgraded = cfg.config_from_dict(data)
+        self.assertEqual(
+            upgraded.extensions.bindings["object_runtime"],
+            "object.runtime",
+        )
+        self.assertIn(
+            "object.runtime",
+            upgraded.extensions.active["runtime_service"],
         )
 
 

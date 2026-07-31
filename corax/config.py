@@ -70,6 +70,7 @@ class AgentMeta:
 class RuntimeConfig:
     autostart: bool = False
     log_level: str = "INFO"
+    execution_mode: str = "object"
     workspace_path: str = "./workspace"
     data_path: str = "./data"
     logs_path: str = "./logs"
@@ -243,6 +244,7 @@ def default_config() -> AgentConfig:
         runtime=RuntimeConfig(
             autostart=False,
             log_level="INFO",
+            execution_mode="object",
             workspace_path="./workspace",
             data_path="./data",
             logs_path="./logs",
@@ -268,6 +270,7 @@ def default_config() -> AgentConfig:
                     "gateway",
                     "prompts.runtime",
                     "memory.loop",
+                    "object.runtime",
                     "context.manager",
                     "mcp.manager",
                     "skills.runtime",
@@ -287,6 +290,7 @@ def default_config() -> AgentConfig:
                 "policy": "security.policy",
                 "state": "state.file",
                 "prompts": "prompts.runtime",
+                "object_runtime": "object.runtime",
                 "context": "context.manager",
                 "mcp": "mcp.manager",
                 "skills": "skills.runtime",
@@ -325,6 +329,11 @@ def default_config() -> AgentConfig:
                     kind="runtime_service",
                     description="Layered Markdown prompt assembly",
                     path="../corax-prompt-runtime",
+                ),
+                "object.runtime": ExtensionSpec(
+                    kind="runtime_service",
+                    description="Session-scoped object references and task workspaces",
+                    path="../corax-object-runtime",
                 ),
                 "context.manager": ExtensionSpec(
                     kind="runtime_service",
@@ -585,6 +594,7 @@ def config_to_dict(config: AgentConfig) -> dict[str, Any]:
         "runtime": {
             "autostart": config.runtime.autostart,
             "log_level": config.runtime.log_level,
+            "execution_mode": config.runtime.execution_mode,
             "workspace_path": config.runtime.workspace_path,
             "data_path": config.runtime.data_path,
             "logs_path": config.runtime.logs_path,
@@ -677,6 +687,14 @@ def config_from_dict(data: dict[str, Any]) -> AgentConfig:
             "prompts.runtime"
         )
         extensions.bindings.setdefault("prompts", "prompts.runtime")
+    if "object.runtime" not in extensions.available:
+        extensions.available["object.runtime"] = defaults.extensions.available[
+            "object.runtime"
+        ]
+        active_services = extensions.active.setdefault("runtime_service", [])
+        if "object.runtime" not in active_services:
+            active_services.append("object.runtime")
+        extensions.bindings.setdefault("object_runtime", "object.runtime")
     config = AgentConfig(
         agent=AgentMeta(
             name=agent.get("name", defaults.agent.name),
@@ -687,6 +705,9 @@ def config_from_dict(data: dict[str, Any]) -> AgentConfig:
         runtime=RuntimeConfig(
             autostart=bool(runtime.get("autostart", defaults.runtime.autostart)),
             log_level=str(runtime.get("log_level", defaults.runtime.log_level)),
+            execution_mode=str(
+                runtime.get("execution_mode", defaults.runtime.execution_mode)
+            ),
             workspace_path=str(runtime.get("workspace_path", defaults.runtime.workspace_path)),
             data_path=str(runtime.get("data_path", defaults.runtime.data_path)),
             logs_path=str(runtime.get("logs_path", defaults.runtime.logs_path)),
@@ -915,6 +936,7 @@ def validate_config(config: AgentConfig) -> list[str]:
         "policy": "policy_provider",
         "state": "storage_provider",
         "prompts": "runtime_service",
+        "object_runtime": "runtime_service",
         "context": "runtime_service",
         "mcp": "runtime_service",
         "skills": "runtime_service",
@@ -946,6 +968,11 @@ def validate_config(config: AgentConfig) -> list[str]:
             )
 
     # Limits must be positive.
+    if config.runtime.execution_mode not in {"object", "legacy"}:
+        errors.append(
+            "runtime.execution_mode must be 'object' or 'legacy'"
+        )
+
     for name in (
         "max_parallel_tasks",
         "max_plan_tasks",

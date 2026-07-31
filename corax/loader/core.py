@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import logging
 import uuid
 from typing import Any, AsyncIterator, Iterable
@@ -95,23 +96,62 @@ def _echo_wrapper_class(ac: Any) -> type:
         return cached
 
     class _StateEchoCapability(ac.Capability):
-        def __init__(self, inner: Any) -> None:
+        def __init__(self, inner: Any, result_transform: Any | None = None) -> None:
             self._inner = inner
+            self._result_transform = result_transform
             for attr in _DECLARATION_ATTRS:
                 setattr(self, attr, getattr(inner, attr))
+            if result_transform is not None:
+                # The original output is validated below before the host
+                # replaces it with a bounded reference envelope.
+                self.output_schema = {}
 
         async def execute(self, request: Any) -> Any:
             result = await self._inner.execute(request)
             key = request.input.get("state_key")
-            if isinstance(key, str) and key and not result.state_patch:
+            if (
+                self._result_transform is not None
+                and result.is_success
+            ):
+                from agent_core import schema  # noqa: PLC0415 - optional core
+
+                errors = schema.validate(result.payload, self._inner.output_schema)
+                if errors:
+                    return ac.Result.fail(
+                        ac.CoreError(
+                            ac.ErrorCode.CAPABILITY_FAILED,
+                            "capability output failed schema validation",
+                            details={"errors": errors},
+                        ),
+                        session_id=request.session_id,
+                        task_id=request.task_id,
+                    )
+                if isinstance(key, str) and key:
+                    try:
+                        transformed = self._result_transform(
+                            result.payload,
+                            session_id=request.session_id,
+                        )
+                        if inspect.isawaitable(transformed):
+                            transformed = await transformed
+                        result.payload = transformed
+                    except Exception as exc:  # noqa: BLE001 - trust boundary
+                        return ac.Result.fail(
+                            ac.CoreError(
+                                ac.ErrorCode.CAPABILITY_FAILED,
+                                "capability result externalization failed",
+                                details={"type": type(exc).__name__},
+                            ),
+                            session_id=request.session_id,
+                            task_id=request.task_id,
+                        )
+            if isinstance(key, str) and key:
                 if result.is_success:
-                    result.state_patch = {key: result.payload}
+                    result.state_patch[key] = result.payload
                 elif result.error is not None:
-                    result.state_patch = {
-                        key: {
-                            "_error": result.error.message,
-                            "_details": result.error.details,
-                        }
+                    result.state_patch[key] = {
+                        "_error": result.error.message,
+                        "_details": result.error.details,
                     }
             return result
 
@@ -160,6 +200,7 @@ class RunningCore:
         registry: Any | None = None,
         echo_cls: type | None = None,
         items: dict[str, Any] | None = None,
+        result_transform: Any | None = None,
     ) -> None:
         self._ac = agent_core
         self.executor = executor
@@ -170,6 +211,7 @@ class RunningCore:
         self._registry = registry
         self._echo_cls = echo_cls
         self._items = dict(items or {})
+        self._result_transform = result_transform
 
     async def sync_capabilities(self, capabilities: Any) -> None:
         """Apply add/change/remove updates to the live Agent Core registry."""
@@ -190,7 +232,9 @@ class RunningCore:
                 continue
             if cap_id in self._items:
                 await self._registry.unregister(cap_id)
-            await self._registry.register(self._echo_cls(item))
+            await self._registry.register(
+                self._echo_cls(item, self._result_transform)
+            )
             self._items[cap_id] = item
             if hasattr(item, "stream_generate_events"):
                 self._streamers[cap_id] = item
@@ -284,6 +328,10 @@ class RunningCore:
         if isinstance(state_key, str) and state_key and self.state_manager is not None:
             state = await self.state_manager.get_state(task.session_id)
             payload = state.temporary_context.get(state_key)
+            await self.state_manager.patch_state(
+                task.session_id,
+                {"remove_temporary_context": state_key},
+            )
         return {
             "ok": task.status is self._ac.TaskStatus.COMPLETED,
             "task_id": task_id,
@@ -319,7 +367,7 @@ class RunningCore:
         input: dict | None = None,
         *,
         session_id: str | None = None,
-        state_key: str = "_invoke_output",
+        state_key: str | None = None,
         task_type: str = "generic",
         wait_timeout: float = 60.0,
         policy_metadata: dict[str, str] | None = None,
@@ -337,8 +385,13 @@ class RunningCore:
         """
         sid = session_id or f"inv-{uuid.uuid4().hex[:8]}"
         payload = dict(input or {})
-        if state_key:
-            payload["state_key"] = state_key
+        output_key = (
+            f"_invoke_{uuid.uuid4().hex}"
+            if state_key is None
+            else state_key
+        )
+        if output_key:
+            payload["state_key"] = output_key
         task = await self.run_task(
             required_capability=capability_id,
             input=payload,
@@ -348,9 +401,13 @@ class RunningCore:
             policy_metadata=policy_metadata,
         )
         echoed = None
-        if state_key and self.state_manager is not None:
+        if output_key and self.state_manager is not None:
             state = await self.state_manager.get_state(sid)
-            echoed = state.temporary_context.get(state_key)
+            echoed = state.temporary_context.get(output_key)
+            await self.state_manager.patch_state(
+                sid,
+                {"remove_temporary_context": output_key},
+            )
 
         if task.status is self._ac.TaskStatus.WAITING_CONFIRMATION:
             approval = self.executor.confirmation_descriptor(task)
@@ -436,6 +493,7 @@ class CoreEngine:
         *,
         policy: Any | None = None,
         observability: Any | None = None,
+        result_transform: Any | None = None,
     ) -> AsyncIterator[RunningCore]:
         """Build, start, yield and tear down a fresh kernel in the current loop.
 
@@ -479,7 +537,7 @@ class CoreEngine:
             try:
                 # Register a wrapper that auto-echoes the result to session state,
                 # so every capability's output round-trips through the core.
-                await registry.register(echo_cls(item))
+                await registry.register(echo_cls(item, result_transform))
             except Exception as exc:  # noqa: BLE001 - one bad cap must not abort the kernel
                 self.log.warning("core rejected capability '%s': %s", cap_id, exc)
             else:
@@ -516,6 +574,7 @@ class CoreEngine:
                     for cap_id, item in _as_pairs(capabilities)
                     if cap_id in adopted
                 },
+                result_transform,
             )
         finally:
             await lifecycle.stop_all()
