@@ -155,6 +155,7 @@ class ToolRoutingTests(unittest.IsolatedAsyncioTestCase):
             session_id="s1",
             turn_id="t1",
             channel="console",
+            publish=True,
         )
 
         self.assertIn("run(value: str | None) -> dict", facade["files"])
@@ -523,6 +524,7 @@ class ToolRoutingTests(unittest.IsolatedAsyncioTestCase):
             session_id="aliases",
             turn_id="aliases-1",
             channel="console",
+            publish=True,
         )
         method = next(
             alias
@@ -607,6 +609,7 @@ class ToolRoutingTests(unittest.IsolatedAsyncioTestCase):
             session_id="raw-operation",
             turn_id="raw-operation-1",
             channel="console",
+            publish=True,
         )
         method = next(
             alias
@@ -715,6 +718,10 @@ class ToolRoutingTests(unittest.IsolatedAsyncioTestCase):
                         "type": "string",
                         "enum": [f"op{index}" for index in range(32)],
                     },
+                    **{
+                        f"argument_{index}_{'x' * 40}": {"type": "string"}
+                        for index in range(5)
+                    },
                 },
                 "required": ["operation"],
             }
@@ -744,6 +751,117 @@ class ToolRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(max(map(len, facade.values())), 32)
         self.assertEqual(sum(map(len, facade.values())), 128)
         self.assertEqual(len(mapping), 128)
+        _, published = host.object_facade(
+            session_id="facade-caps",
+            turn_id="facade-caps-1",
+            channel="console",
+            max_chars=20_000,
+            publish=True,
+        )
+        _, default_budget = host.object_facade(
+            session_id="facade-caps",
+            turn_id="facade-caps-1",
+            channel="console",
+        )
+        extra = sorted(set(published) - set(default_budget))
+        self.assertTrue(extra)
+        self.assertEqual(
+            host.resolve_object_method(
+                extra[0],
+                {},
+                session_id="facade-caps",
+                turn_id="facade-caps-1",
+                channel="console",
+            )[0],
+            published[extra[0]]["capability"],
+        )
+
+    async def test_published_facade_is_fixed_budget_monotonic_snapshot(self):
+        host = ToolRoutingHost(
+            ToolRoutingConfig(dimension=3),
+            client=FakeEmbeddings(),
+        )
+        plugins = [
+            (
+                capability_id,
+                _tool(
+                    capability_id,
+                    summary=capability_id,
+                    intents=[capability_id],
+                    examples=[capability_id],
+                ),
+            )
+            for capability_id in ("mcp.zed.run", "mcp.aaa.run")
+        ]
+        host.sync(plugins)
+        turn = await host.begin_turn(
+            "mcp.zed.run",
+            session_id="snapshot",
+            turn_id="snapshot-1",
+            channel="console",
+        )
+        turn.active_ids = [TOOL_SEARCH_ID, "mcp.zed.run"]
+        candidate, _ = host.object_facade(
+            session_id="snapshot",
+            turn_id="snapshot-1",
+            channel="console",
+            max_chars=10_000,
+        )
+        budget = len(
+            "\n".join(
+                f"async self.{group}.{signature}"
+                for group, signatures in candidate.items()
+                for signature in signatures
+            )
+        )
+        with self.assertRaises(KeyError):
+            host.resolve_object_method(
+                "tools.search",
+                {"query": "files"},
+                session_id="snapshot",
+                turn_id="snapshot-1",
+                channel="console",
+            )
+        _, first = host.object_facade(
+            session_id="snapshot",
+            turn_id="snapshot-1",
+            channel="console",
+            max_chars=budget,
+            publish=True,
+        )
+        turn.activate(
+            ["mcp.aaa.run"],
+            host.schemas,
+            max_tools=4,
+            max_schema_bytes=20_000,
+        )
+        _, second = host.object_facade(
+            session_id="snapshot",
+            turn_id="snapshot-1",
+            channel="console",
+            max_chars=100_000,
+            publish=True,
+        )
+
+        self.assertEqual(second, first)
+        self.assertEqual(
+            host.resolve_object_method(
+                "mcp_zed.run",
+                {},
+                session_id="snapshot",
+                turn_id="snapshot-1",
+                channel="console",
+            ),
+            ("mcp.zed.run", {"operation": "run"}),
+        )
+        with self.assertRaises(KeyError):
+            host.resolve_object_method(
+                "mcp_aaa.run",
+                {},
+                session_id="snapshot",
+                turn_id="snapshot-1",
+                channel="console",
+            )
 
     async def test_search_expands_monotonically_and_returns_activated_schemas(self):
         host = _host()

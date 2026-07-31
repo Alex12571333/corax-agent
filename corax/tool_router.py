@@ -159,6 +159,13 @@ _MAX_OBJECT_FACADE_METHODS_PER_GROUP = 32
 _MAX_OBJECT_SIGNATURE_CHARS = 512
 _DEFAULT_OBJECT_FACADE_CHARS = 16_000
 _RESERVED_OBJECT_METHODS = frozenset({"tools.search"})
+_OBJECT_SEARCH_SIGNATURE = (
+    "search(query: str, top_k: int | None) -> dict"
+    "  # fields: activated: list, active_count: int, "
+    "catalog_version: str, found: bool, matches: list, "
+    "message: str, ok: bool"
+)
+_MIN_OBJECT_FACADE_CHARS = len(f"async self.tools.{_OBJECT_SEARCH_SIGNATURE}")
 
 
 class EmbeddingError(RuntimeError):
@@ -830,6 +837,9 @@ class TurnToolSet:
     active_ids: list[str] = field(default_factory=list)
     schema_bytes: int = 0
     object_methods: dict[str, str] = field(default_factory=dict)
+    exposed_object_facade: dict[str, list[str]] = field(default_factory=dict)
+    exposed_object_methods: dict[str, dict[str, Any]] = field(default_factory=dict)
+    object_facade_max_chars: int | None = None
 
     def activate(
         self,
@@ -894,6 +904,10 @@ class ToolRoutingHost:
 
     def object_model_schema(self) -> list[dict[str, Any]]:
         return [self.schemas.openai(OBJECT_RUN_ID)]
+
+    @staticmethod
+    def object_facade_min_chars() -> int:
+        return _MIN_OBJECT_FACADE_CHARS
 
     async def begin_turn(
         self,
@@ -1007,6 +1021,7 @@ class ToolRoutingHost:
         turn_id: str,
         channel: str,
         max_chars: int = _DEFAULT_OBJECT_FACADE_CHARS,
+        publish: bool = False,
     ) -> tuple[dict[str, list[str]], dict[str, dict[str, Any]]]:
         """Build bounded Python signatures plus a host-only method map."""
 
@@ -1014,28 +1029,43 @@ class ToolRoutingHost:
         if turn.turn_id != turn_id:
             return {}, {}
         max_chars = max(0, int(max_chars))
-        search_signature = (
-            "search(query: str, top_k: int | None) -> dict"
-            "  # fields: activated: list, active_count: int, "
-            "catalog_version: str, found: bool, matches: list, "
-            "message: str, ok: bool"
-        )
+        if publish:
+            if turn.object_facade_max_chars is None:
+                turn.object_facade_max_chars = max_chars
+            max_chars = turn.object_facade_max_chars
+        search_signature = _OBJECT_SEARCH_SIGNATURE
         search_rendered = f"async self.tools.{search_signature}"
-        if len(search_rendered) > max_chars:
-            return {}, {}
-        facade: dict[str, list[str]] = {
-            "tools": [search_signature]
-        }
-        methods: dict[str, dict[str, Any]] = {
-            "tools.search": {
-                "capability": TOOL_SEARCH_ID,
-                "inject": {},
-                "allowed": ["query", "top_k"],
-                "required": ["query"],
+        if publish and turn.exposed_object_facade:
+            facade = {
+                group: list(signatures)
+                for group, signatures in turn.exposed_object_facade.items()
             }
-        }
-        method_count = 1
-        rendered_chars = len(search_rendered)
+            methods = {
+                key: dict(descriptor)
+                for key, descriptor in turn.exposed_object_methods.items()
+            }
+        else:
+            if len(search_rendered) > max_chars:
+                if publish:
+                    turn.exposed_object_facade = {}
+                    turn.exposed_object_methods = {}
+                return {}, {}
+            facade = {"tools": [search_signature]}
+            methods = {
+                "tools.search": {
+                    "capability": TOOL_SEARCH_ID,
+                    "inject": {},
+                    "allowed": ["query", "top_k"],
+                    "required": ["query"],
+                }
+            }
+        rendered_signatures = [
+            f"async self.{group}.{signature}"
+            for group, signatures in facade.items()
+            for signature in signatures
+        ]
+        method_count = len(rendered_signatures)
+        rendered_chars = len("\n".join(rendered_signatures))
         for capability_id in sorted(turn.active_ids):
             if capability_id == TOOL_SEARCH_ID or not self.schemas.has(capability_id):
                 continue
@@ -1061,7 +1091,7 @@ class ToolRoutingHost:
             method_names = operations or (_facade_method(capability_id),)
             for raw_method in method_names:
                 key = turn.object_methods.get(f"{capability_id}\0{raw_method}")
-                if not key:
+                if not key or key in methods:
                     continue
                 group, method = key.split(".", 1)
                 if not _PYTHON_NAME.fullmatch(group) or not _PYTHON_NAME.fullmatch(method):
@@ -1130,10 +1160,14 @@ class ToolRoutingHost:
                     "required": required_args,
                     "arguments": arguments,
                 }
-        return (
-            {group: sorted(signatures) for group, signatures in sorted(facade.items())},
-            methods,
-        )
+        result_facade = {
+            group: sorted(signatures)
+            for group, signatures in sorted(facade.items())
+        }
+        if publish:
+            turn.exposed_object_facade = result_facade
+            turn.exposed_object_methods = methods
+        return result_facade, methods
 
     def resolve_object_method(
         self,
@@ -1144,12 +1178,10 @@ class ToolRoutingHost:
         turn_id: str,
         channel: str,
     ) -> tuple[str, dict[str, Any]]:
-        _, methods = self.object_facade(
-            session_id=session_id,
-            turn_id=turn_id,
-            channel=channel,
-        )
-        descriptor = methods.get(method)
+        turn = self._turn(session_id=session_id, channel=channel)
+        if turn.turn_id != turn_id:
+            raise KeyError(f"object method is unavailable: {method}")
+        descriptor = turn.exposed_object_methods.get(method)
         if descriptor is None:
             raise KeyError(f"object method is unavailable: {method}")
         if not isinstance(arguments, dict):

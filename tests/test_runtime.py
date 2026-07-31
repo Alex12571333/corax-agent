@@ -82,8 +82,12 @@ class TestRuntime(unittest.TestCase):
             mock.patch.object(
                 self.runtime,
                 "active_prompt_runtime",
-                return_value=object(),
-            ),
+                return_value=SimpleNamespace(
+                    object_facade_max_chars=lambda: (
+                        self.runtime.tool_routing.object_facade_min_chars()
+                    )
+                ),
+            ) as prompt_runtime,
             mock.patch.object(
                 self.runtime,
                 "active_object_runtime",
@@ -101,6 +105,19 @@ class TestRuntime(unittest.TestCase):
             ) as state_store,
         ):
             self.assertTrue(self.runtime.object_execution_available("console"))
+            prompt_runtime.return_value = object()
+            self.assertFalse(self.runtime.object_execution_available("console"))
+            prompt_runtime.return_value = SimpleNamespace(
+                object_facade_max_chars=lambda: (
+                    self.runtime.tool_routing.object_facade_min_chars() - 1
+                )
+            )
+            self.assertFalse(self.runtime.object_execution_available("console"))
+            prompt_runtime.return_value = SimpleNamespace(
+                object_facade_max_chars=lambda: (
+                    self.runtime.tool_routing.object_facade_min_chars()
+                )
+            )
             state_store.return_value = None
             self.assertFalse(self.runtime.object_execution_available("console"))
             state_store.return_value = object()

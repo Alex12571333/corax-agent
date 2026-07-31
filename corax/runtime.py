@@ -585,6 +585,7 @@ class CoraxRuntime:
 
         sandbox = self.active_sandbox_executor()
         objects = self.active_object_runtime()
+        prompts = self.active_prompt_runtime()
         sandbox_status = (
             sandbox.status()
             if sandbox is not None and callable(getattr(sandbox, "status", None))
@@ -598,10 +599,20 @@ class CoraxRuntime:
             )
         except Exception:  # noqa: BLE001 - readiness must fail closed
             object_ready = False
+        facade_budget = getattr(prompts, "object_facade_max_chars", None)
+        try:
+            prompt_ready = bool(
+                prompts is not None
+                and callable(facade_budget)
+                and int(facade_budget())
+                >= self.tool_routing.object_facade_min_chars()
+            )
+        except Exception:  # noqa: BLE001 - readiness must fail closed
+            prompt_ready = False
         return bool(
             self.config.runtime.execution_mode == "object"
             and channel in {"console", "tui"}
-            and self.active_prompt_runtime() is not None
+            and prompt_ready
             and objects is not None
             and self.active_state_store() is not None
             and object_ready
@@ -1719,6 +1730,7 @@ class CoraxRuntime:
                     if callable(facade_budget)
                     else 16_000
                 ),
+                publish=True,
             )
             prompt_context.update(
                 {
