@@ -181,12 +181,16 @@ sandbox boundaries.
 
 The complete tool registry and full schemas stay in the host. Before each user
 turn Corax ranks compact capability metadata with the local Nemotron embedding
-model at `192.168.0.10:8080`. In the default object mode, console and TUI expose
-one stable native tool, `object_run(code)`, plus a compact Python facade such as
+model at `192.168.0.10:8080`; this is prefetch only, not a permission or an
+action. In the default object mode, console and TUI expose one stable native
+tool, `object_run(code)`, plus a compact Python facade such as
 `self.files.read(...)`, `self.web.search(...)`, and
-`self.objects.search(...)`. Capability IDs, full schemas, policy metadata, and
-execution remain host-side. New methods are appended to the current turn
-without rewriting the cached prompt prefix.
+`self.objects.search(...)`. A bounded, policy-filtered namespace list advertises
+deferred capability families without exposing their schemas. For compound
+requests the model searches separately for each absent operation, and the host
+appends only the discovered methods. Capability IDs, full schemas, policy
+metadata, and execution remain host-side; the cached prompt prefix is never
+rewritten.
 
 Generated Python runs once in a fresh non-root Docker container pinned to an
 already installed image digest. The runner has no host bind mounts or network,
@@ -423,7 +427,7 @@ Do not store tokens in `corax.yaml`, prompts, extension manifests, or Git.
 flowchart LR
     Channel["Console, TUI, or Telegram"] --> Host["Corax runtime host"]
     Host --> Catalog["ToolCatalog + SchemaStore"]
-    Catalog --> Embed["Embedding top-K + TurnToolSet"]
+    Catalog --> Embed["Dense prefetch + JIT namespaces + TurnToolSet"]
     Embed --> Model
     Host --> Memory["Memory and context services"]
     Memory --> Model["Model provider or router"]

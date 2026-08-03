@@ -142,94 +142,138 @@ class ToolRoutingTests(unittest.IsolatedAsyncioTestCase):
             {spec["id"] for spec in host.all_specs()},
         )
 
-    async def test_mixed_web_and_absolute_file_write_exposes_both_facades(self):
-        class WebDominantEmbeddings(FakeEmbeddings):
+    async def test_compound_task_discovers_each_missing_namespace_on_demand(self):
+        class IntentEmbeddings(FakeEmbeddings):
             async def embed(self, texts, *, input_type):
                 if input_type == "query":
-                    return [(0.0, 1.0, 0.0) for _ in texts]
+                    return [
+                        (
+                            (1.0, 0.0, 0.0, 0.0)
+                            if "встреч" in text.lower()
+                            or "meeting" in text.lower()
+                            else (0.0, 1.0, 0.0, 0.0)
+                            if "email" in text.lower()
+                            or "почт" in text.lower()
+                            else (0.0, 0.0, 1.0, 0.0)
+                            if "file" in text.lower()
+                            or "файл" in text.lower()
+                            else (0.0, 0.0, 0.0, 1.0)
+                        )
+                        for text in texts
+                    ]
                 return [
-                    (0.0, 1.0, 0.0)
-                    if "Tool: web.search" in text
-                    else (1.0, 0.0, 0.0)
+                    (1.0, 0.0, 0.0, 0.0)
+                    if "Tool: calendar.events" in text
+                    else (0.0, 1.0, 0.0, 0.0)
+                    if "Tool: mail.send" in text
+                    else (0.0, 0.0, 1.0, 0.0)
+                    if "Tool: filesystem" in text
+                    else (0.0, 0.0, 0.0, 1.0)
                     for text in texts
                 ]
 
-        filesystem = _tool(
-            "filesystem",
-            summary="Read and write workspace files",
-            intents=["local file operations"],
-            examples=["create /Users/me/Desktop/report.md"],
-        )
-        filesystem.input_schema = {
-            "type": "object",
-            "properties": {
-                "operation": {"type": "string", "enum": ["write"]},
-                "path": {"type": "string"},
-                "content": {"type": "string"},
-            },
-            "required": ["operation", "path", "content"],
-        }
-        web = _tool(
-            "web.search",
-            summary="Search current information on the web",
-            intents=["internet research and current news"],
-            examples=["найди последние новости"],
-        )
-        web.input_schema = {
-            "type": "object",
-            "properties": {"query": {"type": "string"}},
-            "required": ["query"],
-        }
         host = ToolRoutingHost(
             ToolRoutingConfig(
-                dimension=3,
+                dimension=4,
                 top_k=4,
                 max_active_tools=6,
                 max_schema_bytes=20_000,
                 min_similarity=0.2,
             ),
-            client=WebDominantEmbeddings(),
+            client=IntentEmbeddings(),
         )
         host.sync(
             [
-                ("filesystem", filesystem),
-                ("web.search", web),
                 (
-                    "weak.export",
+                    "calendar.events",
                     _tool(
-                        "weak.export",
-                        summary="Export a Desktop md artifact",
-                        intents=[],
-                        examples=[],
+                        "calendar.events",
+                        summary="Schedule calendar meetings",
+                        intents=["plan a meeting"],
+                        examples=["запланируй встречу"],
+                    ),
+                ),
+                (
+                    "mail.send",
+                    _tool(
+                        "mail.send",
+                        summary="Send email messages",
+                        intents=["send email"],
+                        examples=["отправь подтверждение по email"],
+                    ),
+                ),
+                (
+                    "filesystem",
+                    _tool(
+                        "filesystem",
+                        summary="Read and write files",
+                        intents=["local file operations"],
+                        examples=["write a file"],
+                    ),
+                ),
+                (
+                    "web.search",
+                    _tool(
+                        "web.search",
+                        summary="Search current information on the web",
+                        intents=["internet research"],
+                        examples=["search the web"],
                     ),
                 ),
             ]
         )
 
         turn = await host.begin_turn(
-            "Найди через web.search последнюю новость и запиши сводку в "
-            "/Users/aleksandrbogdanov/Desktop/corax-smoke.md",
+            "Запланируй встречу и отправь подтверждение по email",
             session_id="mixed",
             turn_id="mixed-1",
             channel="console",
         )
-        facade, mapping = host.object_facade(
+        initial, _ = host.object_facade(
             session_id="mixed",
             turn_id="mixed-1",
             channel="console",
             publish=True,
         )
 
+        self.assertEqual(turn.active_ids, [TOOL_SEARCH_ID, "calendar.events"])
+        self.assertIn("calendar", initial)
+        self.assertNotIn("mail", initial)
+        self.assertNotIn("filesystem", turn.active_ids)
+        self.assertNotIn("web.search", turn.active_ids)
+
+        found = await host.search(
+            "send an email confirmation",
+            session_id="mixed",
+            turn_id="mixed-1",
+            channel="console",
+            top_k=4,
+        )
+        updated, mapping = host.object_facade(
+            session_id="mixed",
+            turn_id="mixed-1",
+            channel="console",
+            publish=True,
+        )
+
+        self.assertEqual(found["activated"], ["mail.send"])
         self.assertEqual(
             turn.active_ids,
-            [TOOL_SEARCH_ID, "web.search", "filesystem"],
+            [TOOL_SEARCH_ID, "calendar.events", "mail.send"],
         )
-        self.assertIn("search(query: str) -> dict", facade["web"])
-        self.assertIn("write(path: str, content: str) -> dict", facade["files"])
-        self.assertNotIn("weak.export", turn.active_ids)
-        self.assertNotIn("weak", facade)
-        self.assertEqual(mapping["files.write"]["capability"], "filesystem")
-        self.assertEqual(host.router.last_route["fallback"], "hybrid")
+        self.assertIn("mail", updated)
+        self.assertEqual(mapping["mail.run"]["capability"], "mail.send")
+        self.assertNotIn("files", updated)
+        self.assertNotIn("web", updated)
+        self.assertEqual(host.router.last_route["fallback"], "")
+        self.assertIn(
+            "Namespace: mail",
+            host.catalog.get("mail.send").routing_text,
+        )
+        self.assertIn(
+            "Arguments: operation; value",
+            host.catalog.get("mail.send").routing_text,
+        )
 
     async def test_object_facade_keeps_capability_ids_in_host_mapping(self):
         host = _host()
@@ -425,7 +469,18 @@ class ToolRoutingTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_object_method_bindings_do_not_change_when_turn_expands(self):
-        host = _host()
+        class OperationEmbeddings(FakeEmbeddings):
+            async def embed(self, texts, *, input_type):
+                if input_type == "query":
+                    return [(1.0, 0.0, 0.0) for _ in texts]
+                return [
+                    (1.0, 0.0, 0.0)
+                    if "Tool: filesystem" in text
+                    else (0.0, 1.0, 0.0)
+                    for text in texts
+                ]
+
+        host = _host(OperationEmbeddings())
         host.sync(
             [
                 (
@@ -972,6 +1027,7 @@ class ToolRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("input_schema", result["matches"][0])
         self.assertNotIn("tools", result)
         self.assertEqual(result["matches"][0]["id"], "web.search")
+        self.assertIn("every other missing capability", result["message"])
         turn = host.current_turn(session_id="s1", channel="telegram")
         self.assertEqual(
             turn.active_ids,
@@ -1033,6 +1089,48 @@ class ToolRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["activated"], [])
         self.assertEqual(result["matches"], [])
         self.assertIn("Tell the user", result["message"])
+
+    async def test_search_does_not_claim_budget_blocked_tool_is_active(self):
+        host = ToolRoutingHost(
+            ToolRoutingConfig(
+                dimension=3,
+                top_k=1,
+                max_active_tools=1,
+                max_schema_bytes=20_000,
+                min_similarity=0.2,
+            ),
+            client=FakeEmbeddings(),
+        )
+        host.sync(
+            [
+                (
+                    "web.search",
+                    _tool(
+                        "web.search",
+                        summary="Search current web news",
+                        intents=["internet research"],
+                        examples=["find news"],
+                    ),
+                )
+            ]
+        )
+        await host.begin_turn(
+            "hello",
+            session_id="budget",
+            turn_id="budget-1",
+            channel="console",
+        )
+
+        result = await host.search(
+            "find web news",
+            session_id="budget",
+            turn_id="budget-1",
+            channel="console",
+        )
+
+        self.assertTrue(result["found"])
+        self.assertEqual(result["activated"], [])
+        self.assertIn("could not be activated", result["message"])
 
     async def test_new_turn_drops_previous_expansion_and_reuses_index(self):
         client = FakeEmbeddings()
@@ -1104,7 +1202,7 @@ class ToolRoutingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_channel_and_policy_prefilter(self):
         host = ToolRoutingHost(
-            ToolRoutingConfig(dimension=3, top_k=3),
+            ToolRoutingConfig(dimension=3, top_k=3, min_similarity=0.9),
             client=FakeEmbeddings(),
         )
         telegram_only = _tool(
@@ -1120,7 +1218,19 @@ class ToolRoutingTests(unittest.IsolatedAsyncioTestCase):
             intents=["news"],
             examples=["find news"],
         )
-        host.sync([("telegram.only", telegram_only), ("denied", denied)])
+        allowed = _tool(
+            "mail.send",
+            summary="Send email messages",
+            intents=["send email"],
+            examples=["send a confirmation"],
+        )
+        host.sync(
+            [
+                ("telegram.only", telegram_only),
+                ("denied", denied),
+                ("mail.send", allowed),
+            ]
+        )
         policy = SimpleNamespace(
             deny_capabilities={"denied"},
             deny_scopes=set(),
@@ -1134,6 +1244,14 @@ class ToolRoutingTests(unittest.IsolatedAsyncioTestCase):
             policy=policy,
         )
         self.assertEqual(turn.active_ids, [TOOL_SEARCH_ID])
+        self.assertEqual(
+            host.object_namespaces(
+                session_id="s1",
+                turn_id="t1",
+                channel="console",
+            ),
+            ["mail"],
+        )
 
     async def test_inactive_tool_call_is_rejected(self):
         host = _host()

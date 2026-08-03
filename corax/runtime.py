@@ -1740,6 +1740,11 @@ class CoraxRuntime:
                 {
                     "execution_mode": "object",
                     "object_facade": facade,
+                    "object_namespaces": self.tool_routing.object_namespaces(
+                        session_id=session_id,
+                        turn_id=turn_id,
+                        channel=channel,
+                    ),
                     "tool_descriptors": [],
                 }
             )

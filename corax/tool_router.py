@@ -68,8 +68,8 @@ _SEARCH_SPEC = {
     "id": TOOL_SEARCH_ID,
     "model_name": "tool_search",
     "description": (
-        "Find and activate additional tools for the current turn. "
-        "Use when the visible tools are insufficient."
+        "Find and activate tools for one missing capability family. "
+        "Repeat for each independent need when the visible tools are insufficient."
     ),
     "input_schema": {
         "type": "object",
@@ -221,6 +221,24 @@ def _operations(schema: Mapping[str, Any]) -> tuple[str, ...]:
         return ()
     values = operation.get("enum")
     return _strings(values)
+
+
+def _argument_terms(schema: Mapping[str, Any]) -> tuple[str, ...]:
+    properties = schema.get("properties")
+    if not isinstance(properties, Mapping):
+        return ()
+    result = []
+    for raw_name, raw_schema in list(properties.items())[:32]:
+        name = " ".join(str(raw_name).split())[:64]
+        if not name:
+            continue
+        description = (
+            " ".join(str(raw_schema.get("description", "")).split())[:128]
+            if isinstance(raw_schema, Mapping)
+            else ""
+        )
+        result.append(f"{name}: {description}" if description else name)
+    return tuple(result)
 
 
 def _facade_group(capability_id: str) -> str:
@@ -511,6 +529,7 @@ class ToolCatalog:
             operations = _strings(routing.get("operations")) or _operations(
                 input_schema
             )
+            arguments = _argument_terms(input_schema)
             channels = _strings(routing.get("channels"))
             permission_level = _value(getattr(item, "permission_level", ""))
             required_scopes = _strings(getattr(item, "required_scopes", ()))
@@ -522,6 +541,7 @@ class ToolCatalog:
             routing_text = "\n".join(
                 (
                     f"Tool: {extension_id}",
+                    f"Namespace: {_facade_group(extension_id)}",
                     f"Title: {title}",
                     f"Summary: {summary}",
                     f"Domains: {', '.join(domains)}",
@@ -529,6 +549,7 @@ class ToolCatalog:
                     f"Intents: {'; '.join(intents)}",
                     f"Examples: {'; '.join(examples)}",
                     f"Operations: {', '.join(operations)}",
+                    f"Arguments: {'; '.join(arguments)}",
                 )
             )
             schema_hash = _json_hash(input_schema)
@@ -706,16 +727,8 @@ class EmbeddingToolRouter:
                 ),
             )[:limit]
             fallback = ""
-            lexical = self._lexical_rank(query, records)
-            if ranked:
-                selected_ids = {record.id for record, _ in ranked}
-                if len(ranked) < limit:
-                    for item in lexical:
-                        if item[0].id not in selected_ids:
-                            ranked.append(item)
-                            fallback = "hybrid"
-                            break
-            else:
+            if not ranked:
+                lexical = self._lexical_rank(query, records)
                 lexical_ids = {record.id for record, _ in lexical}
                 ranked = [
                     item
@@ -1176,6 +1189,24 @@ class ToolRoutingHost:
             turn.exposed_object_methods = methods
         return result_facade, methods
 
+    def object_namespaces(
+        self,
+        *,
+        session_id: str,
+        turn_id: str,
+        channel: str,
+    ) -> list[str]:
+        """Return compact discovery hints from this turn's visible facade map."""
+
+        turn = self._turn(session_id=session_id, channel=channel)
+        if turn.turn_id != turn_id:
+            return []
+        # ponytail: mirror the facade group cap; raise both only when a real
+        # catalog needs more than sixteen simultaneous discovery hints.
+        return sorted(
+            {alias.split(".", 1)[0] for alias in turn.object_methods.values()}
+        )[:_MAX_OBJECT_FACADE_GROUPS]
+
     def resolve_object_method(
         self,
         method: str,
@@ -1285,18 +1316,33 @@ class ToolRoutingHost:
         )
         turn.catalog_version = self.catalog.version
         found = bool(ranked)
+        blocked = [
+            record.id for record, _ in ranked if record.id not in turn.active_ids
+        ]
+        if blocked:
+            message = (
+                "Some matching tools could not be activated within the turn "
+                "limits. Do not call them; use active methods or report the "
+                "missing capability."
+            )
+        elif activated:
+            message = (
+                "Matching tools were activated for this capability need. "
+                "Search again for every other missing capability, then use "
+                "the appended schemas."
+            )
+        elif found:
+            message = "Matching tools are already active for this turn."
+        else:
+            message = (
+                "No matching tool is available in this environment. "
+                "Tell the user that this capability is unavailable and "
+                "do not repeat tool.search with synonyms."
+            )
         return {
             "ok": True,
             "found": found,
-            "message": (
-                "Matching tools were activated. Use their exact schemas."
-                if found
-                else (
-                    "No matching tool is available in this environment. "
-                    "Tell the user that this capability is unavailable and "
-                    "do not repeat tool.search with synonyms."
-                )
-            ),
+            "message": message,
             "matches": [
                 {
                     "id": record.id,
