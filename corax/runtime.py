@@ -3108,6 +3108,10 @@ class CoraxRuntime:
     def _apply_sandbox_environment(self) -> None:
         os.environ["CORAX_SHELL_REQUIRE_SANDBOX"] = "true"
         os.environ["CORAX_SANDBOX_WORKSPACE"] = str(self.workspace_path)
+        self._set_default_environment(
+            "CORAX_FILESYSTEM_EXPORT_ROOT",
+            str(Path.home() / "Desktop"),
+        )
 
     def _apply_observability_environment(self) -> None:
         self._set_default_environment(

@@ -62,6 +62,11 @@ Set standard Docker `DOCKER_HOST=ssh://user@host` to run the isolated Python
 container on a Docker daemon reachable directly over the LAN. No Docker TCP
 API or host bind mount is required.
 
+`CORAX_FILESYSTEM_EXPORT_ROOT` selects the filesystem capability's one-way
+artifact destination. Corax defaults it to `~/Desktop`; an operator-provided
+environment value wins. Export does not grant read, list, edit, or delete
+access outside the normal workspace.
+
 Tool extensions may add an optional `routing` object to `extension.json`.
 Useful fields are `title`, `summary`, `domains`, `tags`, `intents`,
 `examples`, `anti_examples`, `operations`, `channels`, `always_available`,
