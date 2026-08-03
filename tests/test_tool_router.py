@@ -142,6 +142,95 @@ class ToolRoutingTests(unittest.IsolatedAsyncioTestCase):
             {spec["id"] for spec in host.all_specs()},
         )
 
+    async def test_mixed_web_and_absolute_file_write_exposes_both_facades(self):
+        class WebDominantEmbeddings(FakeEmbeddings):
+            async def embed(self, texts, *, input_type):
+                if input_type == "query":
+                    return [(0.0, 1.0, 0.0) for _ in texts]
+                return [
+                    (0.0, 1.0, 0.0)
+                    if "Tool: web.search" in text
+                    else (1.0, 0.0, 0.0)
+                    for text in texts
+                ]
+
+        filesystem = _tool(
+            "filesystem",
+            summary="Read and write workspace files",
+            intents=["local file operations"],
+            examples=["create /Users/me/Desktop/report.md"],
+        )
+        filesystem.input_schema = {
+            "type": "object",
+            "properties": {
+                "operation": {"type": "string", "enum": ["write"]},
+                "path": {"type": "string"},
+                "content": {"type": "string"},
+            },
+            "required": ["operation", "path", "content"],
+        }
+        web = _tool(
+            "web.search",
+            summary="Search current information on the web",
+            intents=["internet research and current news"],
+            examples=["найди последние новости"],
+        )
+        web.input_schema = {
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+        }
+        host = ToolRoutingHost(
+            ToolRoutingConfig(
+                dimension=3,
+                top_k=4,
+                max_active_tools=6,
+                max_schema_bytes=20_000,
+                min_similarity=0.2,
+            ),
+            client=WebDominantEmbeddings(),
+        )
+        host.sync(
+            [
+                ("filesystem", filesystem),
+                ("web.search", web),
+                (
+                    "weak.export",
+                    _tool(
+                        "weak.export",
+                        summary="Export a Desktop md artifact",
+                        intents=[],
+                        examples=[],
+                    ),
+                ),
+            ]
+        )
+
+        turn = await host.begin_turn(
+            "Найди через web.search последнюю новость и запиши сводку в "
+            "/Users/aleksandrbogdanov/Desktop/corax-smoke.md",
+            session_id="mixed",
+            turn_id="mixed-1",
+            channel="console",
+        )
+        facade, mapping = host.object_facade(
+            session_id="mixed",
+            turn_id="mixed-1",
+            channel="console",
+            publish=True,
+        )
+
+        self.assertEqual(
+            turn.active_ids,
+            [TOOL_SEARCH_ID, "web.search", "filesystem"],
+        )
+        self.assertIn("search(query: str) -> dict", facade["web"])
+        self.assertIn("write(path: str, content: str) -> dict", facade["files"])
+        self.assertNotIn("weak.export", turn.active_ids)
+        self.assertNotIn("weak", facade)
+        self.assertEqual(mapping["files.write"]["capability"], "filesystem")
+        self.assertEqual(host.router.last_route["fallback"], "hybrid")
+
     async def test_object_facade_keeps_capability_ids_in_host_mapping(self):
         host = _host()
         await host.begin_turn(

@@ -706,10 +706,17 @@ class EmbeddingToolRouter:
                 ),
             )[:limit]
             fallback = ""
-            if not ranked:
-                lexical_ids = {
-                    record.id for record, _ in self._lexical_rank(query, records)
-                }
+            lexical = self._lexical_rank(query, records)
+            if ranked:
+                selected_ids = {record.id for record, _ in ranked}
+                if len(ranked) < limit:
+                    for item in lexical:
+                        if item[0].id not in selected_ids:
+                            ranked.append(item)
+                            fallback = "hybrid"
+                            break
+            else:
+                lexical_ids = {record.id for record, _ in lexical}
                 ranked = [
                     item
                     for item in self._embedding_rank(
