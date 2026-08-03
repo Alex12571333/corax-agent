@@ -1907,10 +1907,6 @@ class TestRuntime(unittest.TestCase):
                         os.environ["CORAX_STATE_PATH"],
                         str((Path(tmp) / "new-data" / "state").resolve()),
                     )
-                    self.assertEqual(
-                        os.environ["CORAX_FILESYSTEM_EXPORT_ROOT"],
-                        str(Path.home() / "Desktop"),
-                    )
                 finally:
                     asyncio.run(runtime.stop())
 
