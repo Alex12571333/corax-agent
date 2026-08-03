@@ -948,7 +948,7 @@ async def _run_console_chat(
             host_prompt_assembly=host_prompt_assembly,
             load_state=load_state,
             save_state=save_state,
-            version=CORAX_VERSION,
+            version=os.environ.get("CORAX_RELEASE_VERSION", CORAX_VERSION),
             workspace=str(runtime.workspace_path),
             security=runtime.security_mode(),
             memory=app.config.extensions.bindings.get("memory", "memory.none"),
