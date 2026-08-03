@@ -153,6 +153,7 @@ class TestRuntime(unittest.TestCase):
                     {
                         "messages": [{"role": "user", "content": "echo this"}],
                         "_corax_recent_files": ["report.txt"],
+                        "_corax_final_response_retry": True,
                     },
                     session_id="s1",
                     turn_id="t1",
@@ -177,7 +178,11 @@ class TestRuntime(unittest.TestCase):
             prepared["_corax_prompt_context"]["recent_files"],
             ["report.txt"],
         )
+        self.assertTrue(
+            prepared["_corax_prompt_context"]["final_response_retry"]
+        )
         self.assertNotIn("_corax_recent_files", prepared)
+        self.assertNotIn("_corax_final_response_retry", prepared)
 
     def test_disabled_prompt_runtime_uses_selected_legacy_tool_schemas(self) -> None:
         class OfflineEmbeddings:

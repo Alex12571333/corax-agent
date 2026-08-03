@@ -1662,6 +1662,9 @@ class CoraxRuntime:
         hinted_text = str(data.pop("_corax_user_text", "") or "")
         recent_files = data.pop("_corax_recent_files", [])
         tool_failure = bool(data.pop("_corax_tool_failure", False))
+        final_response_retry = bool(
+            data.pop("_corax_final_response_retry", False)
+        )
         data.pop("_corax_turn_id", None)
         has_turn = self.tool_routing.has_turn(
             session_id=session_id,
@@ -1709,6 +1712,7 @@ class CoraxRuntime:
             "turn_id": turn_id,
             "user_text": hinted_text or self._last_user_text(data),
             "tool_failure": tool_failure,
+            "final_response_retry": final_response_retry,
             "recent_files": (
                 [str(path)[:1024] for path in recent_files[:20]]
                 if isinstance(recent_files, list)

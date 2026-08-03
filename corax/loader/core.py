@@ -34,6 +34,21 @@ from ..config import AgentConfig
 class KernelInvocationError(RuntimeError):
     """A capability invoked through the kernel did not complete successfully."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        model_error: dict[str, Any] | None = None,
+    ) -> None:
+        self.model_error = (
+            {"code": model_error["code"]}
+            if isinstance(model_error, dict)
+            and set(model_error) == {"code"}
+            and isinstance(model_error.get("code"), str)
+            else None
+        )
+        super().__init__(message)
+
 
 class ConfirmationRequired(KernelInvocationError):
     """A kernel task is parked until an operator approves or denies it."""
@@ -149,9 +164,15 @@ def _echo_wrapper_class(ac: Any) -> type:
                 if result.is_success:
                     result.state_patch[key] = result.payload
                 elif result.error is not None:
+                    error_code = (
+                        result.error.code
+                        if isinstance(result.error.code, ac.ErrorCode)
+                        else ac.ErrorCode.CAPABILITY_FAILED
+                    )
                     result.state_patch[key] = {
                         "_error": result.error.message,
                         "_details": result.error.details,
+                        "_model_error": {"code": error_code.value},
                     }
             return result
 
@@ -423,7 +444,12 @@ class RunningCore:
                 if echoed.get("_details"):
                     detail += f" {echoed['_details']}"
             raise KernelInvocationError(
-                f"capability {capability_id!r} task ended {task.status.value}{detail}"
+                f"capability {capability_id!r} task ended {task.status.value}{detail}",
+                model_error=(
+                    echoed.get("_model_error")
+                    if isinstance(echoed, dict)
+                    else None
+                ),
             )
         return dict(echoed) if isinstance(echoed, dict) else {}
 

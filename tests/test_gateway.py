@@ -1979,7 +1979,11 @@ class EchoWrapperTests(unittest.IsolatedAsyncioTestCase):
                 x = request.input.get("x", 0)
                 if x < 0:  # schema-valid, but the capability rejects it
                     return ac.Result.fail(
-                        ac.CoreError(ac.ErrorCode.INVALID_INPUT, "x must be non-negative"),
+                        ac.CoreError(
+                            ac.ErrorCode.INVALID_INPUT,
+                            "x must be non-negative",
+                            details={"token": "must-not-reach-the-model"},
+                        ),
                         session_id=request.session_id, task_id=request.task_id,
                     )
                 return ac.Result.ok({"doubled": x * 2}, session_id=request.session_id,
@@ -1995,6 +1999,14 @@ class EchoWrapperTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(KernelInvocationError) as ctx:
                 await kernel.invoke("fake.tool", {"x": -1}, wait_timeout=10)
             self.assertIn("x must be non-negative", str(ctx.exception))  # error echoed too
+            self.assertEqual(
+                ctx.exception.model_error,
+                {"code": "invalid_input"},
+            )
+            self.assertNotIn(
+                "must-not-reach-the-model",
+                repr(ctx.exception.model_error),
+            )
 
 
 if __name__ == "__main__":
