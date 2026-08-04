@@ -382,6 +382,95 @@ class TestRuntime(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             asyncio.run(run(Path(tmp)))
 
+    def test_object_discovery_requires_a_fresh_program(self) -> None:
+        budget = SimpleNamespace(
+            remaining=lambda: {
+                "model_calls": 20,
+                "tool_calls": 40,
+                "python_executions": 10,
+                "wall_time_seconds": 600.0,
+                "object_bytes": 100_000_000,
+            }
+        )
+        objects = SimpleNamespace(
+            create_workspace=mock.AsyncMock(),
+            get_workspace=mock.AsyncMock(
+                return_value=SimpleNamespace(facts={}, budget=budget)
+            ),
+            update_workspace=mock.AsyncMock(),
+        )
+
+        class Sandbox:
+            async def execute_python(self, _code, *, tool_handler, **_kwargs):
+                try:
+                    await tool_handler("tools.search", {"query": "web"})
+                except Exception as exc:
+                    return {
+                        "facade_refresh_required": getattr(
+                            exc, "facade_refresh_required", False
+                        ),
+                        "activated": list(getattr(exc, "activated", ())),
+                        "calls": 1,
+                    }
+                raise AssertionError("stale object program continued")
+
+        turns = iter(
+            (
+                SimpleNamespace(active_ids=["tool.search"]),
+                SimpleNamespace(active_ids=["tool.search", "web.search"]),
+            )
+        )
+
+        async def run() -> None:
+            with (
+                mock.patch.object(
+                    self.runtime,
+                    "object_execution_available",
+                    return_value=True,
+                ),
+                mock.patch.object(
+                    self.runtime,
+                    "active_object_runtime",
+                    return_value=objects,
+                ),
+                mock.patch.object(
+                    self.runtime,
+                    "active_sandbox_executor",
+                    return_value=Sandbox(),
+                ),
+                mock.patch.object(
+                    self.runtime.tool_routing,
+                    "resolve_object_method",
+                    return_value=("tool.search", {}),
+                ),
+                mock.patch.object(
+                    self.runtime.tool_routing,
+                    "current_turn",
+                    side_effect=lambda **_kwargs: next(turns),
+                ),
+                mock.patch.object(
+                    self.runtime,
+                    "invoke_turn_tool",
+                    new=mock.AsyncMock(
+                        return_value={
+                            "ok": True,
+                            "preview": "x" * 4_000,
+                        }
+                    ),
+                ),
+            ):
+                result = await self.runtime.execute_object_code(
+                    {"code": "return {'done': True}"},
+                    kernel=object(),
+                    session_id="session-refresh",
+                    turn_id="turn-refresh",
+                    channel="console",
+                )
+            self.assertEqual(result["status"], "facade_refreshed")
+            self.assertEqual(result["activated"], ["web.search"])
+
+        asyncio.run(run())
+
     @unittest.skipUnless(HAS_AGENT_CORE and HAS_AGENT_SDK, "agent runtime unavailable")
     def test_object_program_emits_inner_tools_and_recovers_retry(self) -> None:
         if not all(

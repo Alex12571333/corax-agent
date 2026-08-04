@@ -89,6 +89,13 @@ _CONTEXT_DEFAULT_OUTPUT_TOKENS = 4_096
 _CONTEXT_HOST_RESERVE_TOKENS = 1_024
 
 
+class _ObjectFacadeRefresh(RuntimeError):
+    def __init__(self, activated: list[str]) -> None:
+        self.facade_refresh_required = True
+        self.activated = tuple(activated)
+        super().__init__("object facade refresh required")
+
+
 def _context_reserved_tokens(max_tokens: Any) -> int:
     output_tokens = (
         max_tokens
@@ -1941,6 +1948,16 @@ class CoraxRuntime:
                 turn_id=turn_id,
                 channel=channel,
             )
+            active_before = (
+                frozenset(
+                    self.tool_routing.current_turn(
+                        session_id=session_id,
+                        channel=channel,
+                    ).active_ids
+                )
+                if capability == TOOL_SEARCH_ID
+                else frozenset()
+            )
             await objects.update_workspace(
                 task_id,
                 session_id=session_id,
@@ -2025,6 +2042,16 @@ class CoraxRuntime:
                     ),
                 },
             )
+            if capability == TOOL_SEARCH_ID:
+                turn = self.tool_routing.current_turn(
+                    session_id=session_id,
+                    channel=channel,
+                )
+                activated = [
+                    item for item in turn.active_ids if item not in active_before
+                ]
+                if activated:
+                    raise _ObjectFacadeRefresh(activated)
             return result
 
         workspace = await objects.get_workspace(task_id, session_id=session_id)
@@ -2065,6 +2092,38 @@ class CoraxRuntime:
             )
             raise
         elapsed = max(0.0, time.monotonic() - started)
+        if result.get("facade_refresh_required"):
+            activated = result.get("activated")
+            if (
+                not isinstance(activated, list)
+                or not activated
+                or not all(isinstance(item, str) for item in activated)
+            ):
+                raise RuntimeError("object runner returned an invalid facade refresh")
+            await objects.update_workspace(
+                task_id,
+                session_id=session_id,
+                patch={
+                    "status": "running",
+                    "facts": {"runner_calls": int(result.get("calls", 0))},
+                    "usage": {
+                        "wall_time_seconds": min(elapsed, remaining_time),
+                    },
+                },
+            )
+            return {
+                "ok": True,
+                "status": "facade_refreshed",
+                "facade_refresh_required": True,
+                "activated": activated,
+                "calls": int(result.get("calls", 0)),
+                "task_id": task_id,
+                "message": (
+                    "The object facade was refreshed. Start a new object.run "
+                    "and continue with the appended methods; do not repeat "
+                    "these searches."
+                ),
+            }
         if result.get("approval_required"):
             approval_task_id = result.get("task_id")
             if (
